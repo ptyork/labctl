@@ -1,0 +1,524 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import pytest
+from conftest import MakeRepo, git
+
+from labctl import collect as collect_module
+from labctl.bundle import Desired
+from labctl.collect import (
+    _READ_NODE,
+    MARK,
+    UNREAD,
+    Collected,
+    OnNode,
+    Record,
+    _collect_baseline,
+    _collect_remote,
+    collect,
+    current_state,
+    data_names,
+    drift_changes,
+    parse_node_output,
+)
+from labctl.compose import ComposeError, reduce_stacks
+from labctl.envfile import CompiledEnv
+from labctl.remote import Remote, Unreachable
+from labctl.repo import TagInfo
+from labctl.runtime import Container
+from labctl.settings import Secrets, Settings
+from labctl.state import Dirs, NodeState, Scope, Service, Stack
+
+HOME = "/home/paul/docker"
+APPDATA = "/home/paul/docker/app_data"
+RECORD_DOC = Record(
+    "2026-10-30T12:00:00",
+    Dirs(HOME, APPDATA),
+    (Stack("homelab-cirdan", ("docker-compose.yml",)),),
+    {"docker-compose.yml": "aaa111", "apps/plex.yml": "bbb222", ".env": "eee555"},
+)
+
+
+def node_output(applied: Record | None = None, projects: list[dict[str, str]] | None = None) -> str:
+    lines = [
+        f"{MARK} pointer",
+        HOME,
+        f"{MARK} applied",
+        json.dumps(applied.to_json()) if applied else "",
+        f"{MARK} names",
+        "file docker-compose.yml",
+        "dir apps",
+        "file stack.yml",
+        "data old_config",
+        f"{MARK} files",
+        "aaa111  docker-compose.yml",
+        "bbb222  apps/plex.yml",
+        "ccc333  apps/with space.yml",
+        f"{UNREAD} stack.yml",
+        f"{MARK} projects",
+        json.dumps(projects or []),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def test_parse_node_without_deploy_dir() -> None:
+    on_node = parse_node_output(f"{MARK} pointer\n/old/home\n{MARK} nohome\n", HOME)
+    assert (on_node.exists, on_node.pointer) == (False, "/old/home")
+
+
+def test_parse_node_output() -> None:
+    projects = [
+        {
+            "Name": "homelab-cirdan",
+            "Status": "running(4)",
+            "ConfigFiles": f"{HOME}/a.yml,{HOME}/b.yml",
+        },
+        {"Name": "elsewhere", "Status": "running(1)", "ConfigFiles": "/opt/other/compose.yml"},
+    ]
+    on_node = parse_node_output(node_output(RECORD_DOC, projects), HOME)
+    assert on_node == OnNode(
+        RECORD_DOC,
+        {
+            "docker-compose.yml": "aaa111",
+            "apps/plex.yml": "bbb222",
+            "apps/with space.yml": "ccc333",
+            "stack.yml": UNREAD,
+        },
+        {"homelab-cirdan": ("a.yml", "b.yml")},
+        pointer=HOME,
+        names={
+            "docker-compose.yml": "file",
+            "apps": "dir",
+            "stack.yml": "file",
+            "old_config": "data",
+        },
+    )
+
+
+def test_the_read_script_lists_everything_but_data(tmp_path: Path) -> None:
+    """The script itself, run here on a folder laid out like a DEPLOY_DIR."""
+    home = tmp_path / "docker"
+    for path, text in {
+        "docker-compose.yml": "name: x\n",
+        "apps/plex.yml": "services: {}\n",
+        "stack.yml": "name: old\n",
+        "old/notes.txt": "hi\n",
+        "app_data/plex/db": "data\n",
+        ".labctl/applied.json": "",
+        ".labctl/managed": "docker-compose.yml\n",
+    }.items():
+        (home / path).parent.mkdir(parents=True, exist_ok=True)
+        (home / path).write_text(text)
+    (home / "empty").mkdir()
+    env = {**os.environ, "HOME": str(tmp_path)}
+    output = subprocess.run(
+        ["sh", "-c", _READ_NODE, "sh", str(home), "apps", "--", "app_data"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    ).stdout
+    on_node = parse_node_output(output, str(home))
+    assert on_node.names == {
+        "apps": "dir",
+        "docker-compose.yml": "file",
+        "empty": "dir",
+        "old": "dir",
+        "stack.yml": "file",
+    }
+    digest = hashlib.sha256(b"name: x\n").hexdigest()
+    assert on_node.files == {
+        "apps/plex.yml": hashlib.sha256(b"services: {}\n").hexdigest(),
+        "docker-compose.yml": digest,  # in .labctl/managed
+        "old/notes.txt": UNREAD,
+        "stack.yml": UNREAD,
+    }
+
+
+def test_a_service_in_two_stacks_belongs_to_the_one_that_runs() -> None:
+    def config(name: str) -> tuple[Stack, dict[str, Any]]:
+        return Stack(name, (f"{name}.yml",)), {"services": {"dozzle": {"image": "dozzle"}}}
+
+    resolved = [config("homelab-cirdan"), config("stack1")]
+    state = reduce_stacks("cirdan", resolved, APPDATA, running={"stack1"})
+    assert state.services["dozzle"].stack == "stack1"
+    assert set(state.stacks) == {"homelab-cirdan", "stack1"}
+    state = reduce_stacks("cirdan", resolved, APPDATA, running={"homelab-cirdan"})
+    assert state.services["dozzle"].stack == "homelab-cirdan"
+    for running in (set(), {"homelab-cirdan", "stack1"}, None):
+        with pytest.raises(ComposeError, match="is in two stacks"):
+            reduce_stacks("cirdan", resolved, APPDATA, running=running)
+
+
+def test_record_round_trip() -> None:
+    assert Record.from_json(json.loads(json.dumps(RECORD_DOC.to_json()))) == RECORD_DOC
+    tracked = replace(RECORD_DOC, commit="abc1234", tag="applied/cirdan/20261030-120000")
+    assert Record.from_json(json.loads(json.dumps(tracked.to_json()))) == tracked
+    version_1 = {k: v for k, v in RECORD_DOC.to_json().items() if k not in ("commit", "tag")}
+    assert Record.from_json({**version_1, "version": 1}) == RECORD_DOC
+    # Written before DOCKER_HOME was renamed DEPLOY_DIR.
+    old = {k: v for k, v in RECORD_DOC.to_json().items() if k != "deploy_dir"}
+    old["docker_home"] = RECORD_DOC.dirs.deploy_dir
+    assert Record.from_json(old) == RECORD_DOC
+
+
+def test_drift_is_edits_to_the_files_apply_wrote() -> None:
+    """Anything else in DEPLOY_DIR (a stack started by hand) is not drift: it is part of the
+    node's current state, and the plan shows what apply does with it."""
+    on_node = OnNode(
+        RECORD_DOC,
+        {
+            "docker-compose.yml": "aaa111",
+            "apps/plex.yml": "edited",
+            "apps/new.yml": "fff666",
+            "handmade.yml": UNREAD,
+        },
+        {"homelab-cirdan": ("docker-compose.yml",), "handmade": ("handmade.yml",)},
+    )
+    assert drift_changes(RECORD_DOC, on_node) == (
+        ".env: removed on node",
+        "apps/new.yml: added on node",
+        "apps/plex.yml: changed on node",
+    )
+    clean = OnNode(RECORD_DOC, dict(RECORD_DOC.manifest), {"homelab-cirdan": ("x",)})
+    assert drift_changes(RECORD_DOC, clean) == ()
+
+
+@pytest.fixture
+def settings(tmp_path: Path) -> Settings:
+    return Settings(lab_config=tmp_path / "repo", config_dir=tmp_path / "config")
+
+
+def desired_for(bundle: Path, home: str = HOME, files: dict[str, str] | None = None) -> Desired:
+    env = CompiledEnv(values={"DEPLOY_DIR": home, "APPDATA_DIR": APPDATA})
+    state = NodeState.of("cirdan", stacks=[Stack("homelab-cirdan", ("docker-compose.yml",))])
+    return Desired("cirdan", bundle, env, {}, state, files or {})
+
+
+@pytest.fixture
+def from_node(monkeypatch: pytest.MonkeyPatch) -> NodeState:
+    """The current state, as if downloaded from the node and resolved."""
+    recorded = NodeState.of("cirdan", Service("plex"))
+    monkeypatch.setattr(collect_module, "fetch_stack_files", lambda *args: None)
+    monkeypatch.setattr(collect_module, "current_state", lambda *args: recorded)
+    return recorded
+
+
+def test_the_node_is_the_record(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings, tmp_path: Path, from_node: NodeState
+) -> None:
+    on_node = OnNode(RECORD_DOC, dict(RECORD_DOC.manifest))
+    monkeypatch.setattr(collect_module, "read_node", lambda r, h, n, d: on_node)
+    desired = desired_for(Path("/unused"))
+
+    result = Collected(desired={"cirdan": desired}, recorded={})
+    _collect_remote(result, settings, "cirdan", desired, tmp_path)
+    assert result.recorded == {"cirdan": from_node}
+    assert result.reports[0].detail == "applied 2026-10-30T12:00:00 (before git tracking)"
+    assert result.untracked == {"cirdan"}  # apply records a commit there, even with no changes
+    assert not result.drift
+
+    on_node = OnNode(RECORD_DOC, {**RECORD_DOC.manifest, "apps/plex.yml": "edited"})
+    result = Collected(desired={"cirdan": desired}, recorded={})
+    _collect_remote(result, settings, "cirdan", desired, tmp_path / "again")
+    assert result.drift
+
+
+def test_changed_deploy_dir_is_found_through_the_node_pointer(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings, tmp_path: Path, from_node: NodeState
+) -> None:
+    """The repo moved DEPLOY_DIR; the node still has its files (and applied.json) at the old
+    path, which its ~/.labctl-home says."""
+    new = "/srv/docker"
+    reads: list[str] = []
+
+    def read_node(remote: object, home: str, names: object, data: object) -> OnNode:
+        reads.append(home)
+        if home == HOME:
+            return OnNode(RECORD_DOC, dict(RECORD_DOC.manifest), pointer=HOME)
+        return OnNode(None, {}, exists=False, pointer=HOME)
+
+    monkeypatch.setattr(collect_module, "read_node", read_node)
+    desired = desired_for(Path("/unused"), home=new)
+
+    result = Collected(desired={"cirdan": desired}, recorded={})
+    _collect_remote(result, settings, "cirdan", desired, tmp_path)
+    assert reads == [new, HOME]
+    assert result.recorded == {"cirdan": from_node}
+    assert result.recorded_dirs["cirdan"] == Dirs(HOME, APPDATA)
+    assert "at the old DEPLOY_DIR /home/paul/docker" in result.reports[0].detail
+
+
+def test_the_pointer_is_not_followed_to_another_nodes_record(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings, tmp_path: Path, from_node: NodeState
+) -> None:
+    """Two nodes on one host share the ssh user's ~/.labctl-home. A new node (ghost) whose
+    DEPLOY_DIR does not exist yet must not take palantir's DEPLOY_DIR for its own old one (and
+    plan to move it, taking palantir's stacks down)."""
+    palantirs = replace(RECORD_DOC, tag="applied/palantir/20261103-212146")
+
+    def read_node(remote: object, home: str, names: object, data: object) -> OnNode:
+        if home == HOME:
+            return OnNode(palantirs, dict(RECORD_DOC.manifest), pointer=HOME)
+        return OnNode(None, {}, exists=False, pointer=HOME)
+
+    monkeypatch.setattr(collect_module, "read_node", read_node)
+    desired = replace(desired_for(Path("/unused"), home="/home/paul/docker-ghost"), node="ghost")
+    result = Collected(desired={"ghost": desired}, recorded={})
+    _collect_remote(result, settings, "ghost", desired, tmp_path)
+    assert result.recorded["ghost"] == NodeState.of("ghost")
+    assert result.recorded_dirs["ghost"] == desired.dirs  # no move
+    assert result.reports[0].source == "first"
+
+    # Its own record (by its node field, or its tag; or an older record that does not say) is.
+    for own in (replace(palantirs, node="ghost", tag=""), replace(RECORD_DOC, tag="")):
+        palantirs = own
+        result = Collected(desired={"ghost": desired}, recorded={})
+        _collect_remote(result, settings, "ghost", desired, tmp_path / own.node)
+        assert result.recorded_dirs["ghost"] == Dirs(HOME, APPDATA)
+
+
+def test_never_applied_is_what_is_there_now(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings, tmp_path: Path, from_node: NodeState
+) -> None:
+    """No applied.json: the node is planned against what its DEPLOY_DIR has, nothing when it
+    does not exist; a first apply is an ordinary apply."""
+    monkeypatch.setattr(collect_module, "read_node", lambda r, h, n, d: OnNode(None, {}, {}))
+    desired = desired_for(Path("/unused"))
+    result = Collected(desired={"cirdan": desired}, recorded={})
+    _collect_remote(result, settings, "cirdan", desired, tmp_path)
+    assert result.recorded["cirdan"] == from_node
+    assert result.reports[0].source == "first"
+    assert "1 services in /home/paul/docker" in result.reports[0].detail
+
+    absent = OnNode(None, {}, exists=False)
+    monkeypatch.setattr(collect_module, "read_node", lambda r, h, n, d: absent)
+    result = Collected(desired={"cirdan": desired}, recorded={})
+    _collect_remote(result, settings, "cirdan", desired, tmp_path / "again")
+    assert result.recorded["cirdan"] == NodeState.of("cirdan")
+    assert result.reports[0].source == "first"
+
+
+def test_an_unreachable_node_is_planned_as_skipped(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings, make_repo: MakeRepo
+) -> None:
+    repo = make_repo(
+        settings.lab_config,
+        {f"nodes/{node}/docker-compose.yml": "services: {}\n" for node in ("cirdan", "frodo")},
+    )
+    on_node = OnNode(RECORD_DOC, dict(RECORD_DOC.manifest))
+
+    def read_node(remote: Remote, home: str, names: object, data: object) -> OnNode:
+        if remote.host == "frodo":
+            raise Unreachable("frodo: ssh: connect to host frodo port 22: No route to host")
+        return on_node
+
+    monkeypatch.setattr(collect_module, "resolve_desired", lambda s, node, *a: desired_for(Path()))
+    monkeypatch.setattr(collect_module, "read_node", read_node)
+    monkeypatch.setattr(collect_module, "fetch_stack_files", lambda *args: None)
+    monkeypatch.setattr(collect_module, "current_state", lambda *a: NodeState.of("cirdan"))
+
+    with collect(settings, Scope(), Secrets(), None, repo) as result:
+        assert result.errors == []
+        assert result.unreachable == ("frodo",)
+        assert result.scope == Scope(frozenset({"frodo"}))
+        assert result.recorded["frodo"] is None  # no apply tag: the planner assumes the repo
+        (report,) = [r for r in result.reports if r.node == "frodo"]
+        assert (
+            report.detail == "unreachable (ssh: connect to host frodo port 22: No route to "
+            "host); no apply tag"
+        )
+
+
+TRACKED = replace(RECORD_DOC, tag="applied/cirdan/20261030-120000")
+
+
+def test_a_missing_apply_tag_is_recreated_from_the_record(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    tmp_path: Path,
+    from_node: NodeState,
+    make_repo: MakeRepo,
+) -> None:
+    repo = make_repo(settings.lab_config, {"nodes/cirdan/docker-compose.yml": "services: {}\n"})
+    head = repo.head()
+    on_node = OnNode(
+        replace(TRACKED, commit=head),
+        dict(RECORD_DOC.manifest),
+        {"stack1": ("a",), "stack2": ("b",)},  # stack2's containers are stopped
+        containers=(
+            Container("s1", "running", project="stack1"),
+            Container("s2", "exited", project="stack2"),
+        ),
+    )
+    monkeypatch.setattr(collect_module, "read_node", lambda r, h, n, d: on_node)
+    desired = desired_for(Path("/unused"))
+    result = Collected(desired={"cirdan": desired}, recorded={})
+    _collect_remote(result, settings, "cirdan", desired, tmp_path, repo=repo, base=head)
+    assert result.reports[0].detail == f"applied 2026-10-30T12:00:00 from {head[:7]}"
+    assert result.repo_notices == [] and result.untracked == set()
+    latest = repo.last_applied("cirdan")
+    assert latest is not None and (latest.tag, latest.commit) == (TRACKED.tag, head)
+    assert latest.info is not None and latest.info.stacks_up == ("stack1",)
+    assert latest.info.dirs == RECORD_DOC.dirs
+
+
+def test_the_nodes_commit_is_checked_against_the_repo(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    tmp_path: Path,
+    from_node: NodeState,
+    make_repo: MakeRepo,
+) -> None:
+    repo = make_repo(settings.lab_config, {"nodes/cirdan/docker-compose.yml": "services: {}\n"})
+    first = repo.head()
+    (settings.lab_config / "apps.yml").write_text("services: {}\n")
+    second = repo.commit("add apps")
+    git(settings.lab_config, "reset", "-q", "--hard", first)
+    desired = desired_for(Path("/unused"))
+
+    def notices(commit: str) -> list[str]:
+        on_node = OnNode(replace(TRACKED, commit=commit), dict(RECORD_DOC.manifest))
+        monkeypatch.setattr(collect_module, "read_node", lambda r, h, n, d: on_node)
+        result = Collected(desired={"cirdan": desired}, recorded={})
+        _collect_remote(
+            result, settings, "cirdan", desired, tmp_path / commit, repo=repo, base=first
+        )
+        untracked[:] = sorted(result.untracked)
+        return result.repo_notices
+
+    untracked: list[str] = []
+
+    # Applied from a commit this branch does not have: applying reverts it.
+    assert notices(second) == [
+        f"cirdan was applied from {second[:7]}, which {first[:7]} does not contain; applying it "
+        "undoes: add apps"
+    ]
+    # Applied from a commit this clone has never seen.
+    assert notices("0" * 40) == [
+        "cirdan was applied from 0000000, which this clone does not have (git fetch, or pull); "
+        "planned against the node as it is, and apply records the commit planned"
+    ]
+    assert untracked == ["cirdan"]  # recorded again, even with nothing to change
+
+
+def test_a_node_not_named_is_planned_as_of_its_apply_tag(
+    settings: Settings, tmp_path: Path, make_repo: MakeRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(settings.lab_config, {"nodes/frodo/docker-compose.yml": "services: {}\n"})
+    applied_at = repo.head()
+    (settings.lab_config / "later.txt").write_text("x\n")
+    repo.commit("later")
+    info = TagInfo("2026-11-01T10:00:00", "me@here", "0.1.0", ("stack1",), Dirs(HOME, APPDATA))
+    repo.tag_applied("frodo", "20261101-100000", applied_at, info)
+    built: list[tuple[str, Path | None, bool]] = []
+
+    def resolve(
+        s: Settings,
+        node: str,
+        secrets: Secrets,
+        work: Path,
+        prompt: object,
+        tree: Path,
+        baseline: bool,
+    ) -> Desired:
+        built.append((node, tree, baseline))
+        assert secrets == Secrets() and prompt is None  # no secrets, no questions
+        return desired_for(tree)
+
+    monkeypatch.setattr(collect_module, "resolve_desired", resolve)
+    monkeypatch.setattr(collect_module, "reduce_stacks", lambda n, r, a, running: running)
+    result = Collected(desired={}, recorded={}, base=repo.head())
+    _collect_baseline(result, settings, "frodo", repo, tmp_path, "not named")
+    assert result.errors == []
+    assert result.recorded["frodo"] == ("stack1",)  # running: the tag's Stacks-Up
+    assert result.recorded_dirs["frodo"] == Dirs(HOME, APPDATA)
+    ((node, tree, baseline),) = built
+    assert baseline and tree is not None
+    assert (tree / "nodes/frodo/docker-compose.yml").is_file() and not (tree / "later.txt").exists()
+    assert result.reports[0].source == "tag"
+    assert result.reports[0].detail == (
+        f"not named; as of applied/frodo/20261101-100000 ({applied_at[:7]}, 1 commit behind); "
+        "drift not checked"
+    )
+
+
+def test_data_names_come_from_the_repo(tmp_path: Path) -> None:
+    env = CompiledEnv(
+        values={
+            "DEPLOY_DIR": HOME,
+            "APPDATA_DIR": APPDATA,
+            "LOGS_DIR": f"{HOME}/logs",
+            "TEMP_DIR": "/tmp",
+            "TZ": "Europe/London",
+        }
+    )
+    configs = {
+        "homelab-cirdan": {
+            "services": {
+                "proxy": {
+                    "volumes": [
+                        {"type": "bind", "source": f"{HOME}/certs/live"},
+                        {"type": "bind", "source": f"{HOME}/apps/proxy.conf"},  # the bundle's
+                        {"type": "volume", "source": "cache"},
+                    ]
+                }
+            }
+        }
+    }
+    desired = Desired("cirdan", tmp_path, env, configs, NodeState.of("cirdan"), {"apps/a.yml": "x"})
+    assert data_names(desired) == ("app_data", "certs", "logs")
+
+
+# ── Reading stacks from a node's files (real compose) ─────────────────────────
+
+docker = pytest.mark.skipif(shutil.which("docker") is None, reason="needs the docker CLI")
+
+
+def write_tree(root: Path, files: dict[str, str]) -> None:
+    for path, text in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text(text)
+
+
+APPS = {
+    "apps/dozzle.yml": "services:\n  dozzle:\n    image: amir20/dozzle\n",
+    "apps/fileflows.yml": "services:\n  fileflows:\n    image: revenz/fileflows\n",
+}
+STACK1 = "name: homelab-cirdan-stack1\ninclude:\n  - apps/dozzle.yml\n"
+STACK2 = "name: homelab-cirdan-stack2\ninclude:\n  - apps/fileflows.yml\n"
+
+
+@docker
+def test_every_stack_file_in_deploy_dir_is_a_stack(settings: Settings, tmp_path: Path) -> None:
+    """Stacks started by hand, before labctl: each file is a stack, running or not."""
+    folder = tmp_path / "docker"
+    write_tree(folder, {**APPS, "stack.yml": STACK1, "stack2.yml": STACK2, "notes.txt": "x"})
+    state = current_state(
+        settings,
+        "cirdan",
+        folder,
+        Dirs(HOME, APPDATA),
+        {"homelab-cirdan-stack1": ("stack.yml",)},
+    )
+    assert {name: s.stack for name, s in state.services.items()} == {
+        "dozzle": "homelab-cirdan-stack1",
+        "fileflows": "homelab-cirdan-stack2",
+    }
+    assert set(state.stacks) == {"homelab-cirdan-stack1", "homelab-cirdan-stack2"}
+
+
+@docker
+def test_a_running_stack_without_its_file_is_an_error(settings: Settings, tmp_path: Path) -> None:
+    folder = tmp_path / "docker"
+    write_tree(folder, APPS)
+    with pytest.raises(ComposeError, match="its files \\(gone.yml\\) are not in DEPLOY_DIR"):
+        current_state(settings, "cirdan", folder, Dirs(HOME, APPDATA), {"x": ("gone.yml",)})

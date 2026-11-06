@@ -1,0 +1,45 @@
+{
+    "APPDATA_DIR": {
+        "Name": "APPDATA_DIR",
+        "DefaultValue": "",
+        "PresenceValue": "",
+        "Required": false
+    },
+    "DATA_DIR": {
+        "Name": "DATA_DIR",
+        "DefaultValue": "",
+        "PresenceValue": "",
+        "Required": false
+    },
+    "LOGS_DIR": {
+        "Name": "LOGS_DIR",
+        "DefaultValue": "",
+        "PresenceValue": "",
+        "Required": false
+    },
+    "PGID": {
+        "Name": "PGID",
+        "DefaultValue": "",
+        "PresenceValue": "",
+        "Required": false
+    },
+    "PUID": {
+        "Name": "PUID",
+        "DefaultValue": "",
+        "PresenceValue": "",
+        "Required": false
+    },
+    "TEMP_DIR": {
+        "Name": "TEMP_DIR",
+        "DefaultValue": "",
+        "PresenceValue": "",
+        "Required": false
+    },
+    "TZ": {
+        "Name": "TZ",
+        "DefaultValue": "",
+        "PresenceValue": "",
+        "Required": false
+    }
+}
+

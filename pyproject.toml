@@ -1,0 +1,71 @@
+[project]
+name = "labctl"
+version = "0.1.0"
+description = "CLI tool for homelab management"
+authors = [{ name = "Paul York" }]
+requires-python = ">=3.12,<4.0"
+readme = "README.md"
+license = "MIT"
+dependencies = [
+    "click>=8.3.0",
+    "rich>=14.0.0",
+    "craftable",
+    "get-rich",
+    "git-wrap",
+    "tzdata>=2024.1",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+labctl = "labctl.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.0",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.14.8",
+    "mypy>=1.18.2",
+    "types-pyyaml>=6.0.12.20261030",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.uv.sources]
+craftable = { path = "../../craftable", editable = true }
+get-rich = { path = "../../get_rich", editable = true }
+git-wrap = { path = "../../git_wrap", editable = true }
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = ["src"]
+strict = true
+packages = ["labctl"]
+
+[[tool.mypy.overrides]]
+module = ["craftable", "get_rich"]
+ignore_missing_imports = true
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/labctl",
+]
+
+[tool.hatch.build.targets.wheel]
+include = [
+    "src/labctl",
+]
+
+[tool.hatch.build.targets.wheel.sources]
+"src/labctl" = "labctl"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

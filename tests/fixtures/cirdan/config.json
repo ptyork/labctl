@@ -1,0 +1,205 @@
+{
+  "name": "homelab-cirdan",
+  "networks": {
+    "reverse_proxy": {
+      "driver": "bridge",
+      "ipam": {},
+      "name": "reverse_proxy"
+    }
+  },
+  "services": {
+    "dockerproxy": {
+      "command": null,
+      "container_name": "dockerproxy",
+      "entrypoint": null,
+      "environment": {
+        "CONTAINERS": "<redacted>",
+        "PGID": "<redacted>",
+        "POST": "<redacted>",
+        "PUID": "<redacted>",
+        "SERVICES": "<redacted>",
+        "TASKS": "<redacted>",
+        "TZ": "<redacted>"
+      },
+      "image": "ghcr.io/tecnativa/docker-socket-proxy:latest",
+      "networks": {
+        "reverse_proxy": null
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "protocol": "tcp",
+          "published": "2375",
+          "target": 2375
+        }
+      ],
+      "restart": "unless-stopped",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "volumes": [
+        {
+          "bind": {},
+          "read_only": true,
+          "source": "/var/run/docker.sock",
+          "target": "/var/run/docker.sock",
+          "type": "bind"
+        }
+      ]
+    },
+    "dozzle-agent": {
+      "command": [
+        "agent"
+      ],
+      "container_name": "dozzle-agent-frodo",
+      "entrypoint": null,
+      "environment": {
+        "PGID": "<redacted>",
+        "PUID": "<redacted>",
+        "TZ": "<redacted>"
+      },
+      "image": "amir20/dozzle:latest",
+      "networks": {
+        "reverse_proxy": null
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "protocol": "tcp",
+          "published": "7007",
+          "target": 7007
+        }
+      ],
+      "restart": "always",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "volumes": [
+        {
+          "bind": {},
+          "read_only": true,
+          "source": "/var/run/docker.sock",
+          "target": "/var/run/docker.sock",
+          "type": "bind"
+        }
+      ]
+    },
+    "fileflows": {
+      "command": null,
+      "container_name": "fileflows",
+      "devices": [
+        {
+          "permissions": "rwm",
+          "source": "/dev/dri",
+          "target": "/dev/dri"
+        }
+      ],
+      "entrypoint": null,
+      "environment": {
+        "PGID": "<redacted>",
+        "PUID": "<redacted>",
+        "TZ": "<redacted>",
+        "TempPathHost": "<redacted>"
+      },
+      "group_add": [
+        "109",
+        "44"
+      ],
+      "image": "revenz/fileflows",
+      "networks": {
+        "reverse_proxy": null
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "protocol": "tcp",
+          "published": "5000",
+          "target": 5000
+        }
+      ],
+      "restart": "unless-stopped",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "volumes": [
+        {
+          "bind": {},
+          "read_only": true,
+          "source": "/var/run/docker.sock",
+          "target": "/var/run/docker.sock",
+          "type": "bind"
+        },
+        {
+          "bind": {},
+          "source": "/home/paul/docker/app_data/fileflows/data",
+          "target": "/app/Data",
+          "type": "bind"
+        },
+        {
+          "bind": {},
+          "source": "/home/paul/docker/logs/fileflows",
+          "target": "/app/Logs",
+          "type": "bind"
+        },
+        {
+          "bind": {},
+          "source": "/fileflows",
+          "target": "/temp",
+          "type": "bind"
+        },
+        {
+          "bind": {},
+          "source": "/Videos/TV",
+          "target": "/media/tvshows",
+          "type": "bind"
+        },
+        {
+          "bind": {},
+          "source": "/Videos/Movies",
+          "target": "/media/movies",
+          "type": "bind"
+        }
+      ]
+    },
+    "portainer-agent": {
+      "command": null,
+      "container_name": "portainer-agent",
+      "entrypoint": null,
+      "environment": {
+        "PGID": "<redacted>",
+        "PUID": "<redacted>",
+        "TZ": "<redacted>"
+      },
+      "image": "portainer/agent",
+      "networks": {
+        "reverse_proxy": null
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "protocol": "tcp",
+          "published": "9001",
+          "target": 9001
+        }
+      ],
+      "restart": "always",
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "volumes": [
+        {
+          "bind": {},
+          "source": "/var/run/docker.sock",
+          "target": "/var/run/docker.sock",
+          "type": "bind"
+        },
+        {
+          "bind": {},
+          "source": "/var/lib/docker/volumes",
+          "target": "/var/lib/docker/volumes",
+          "type": "bind"
+        }
+      ]
+    }
+  }
+}
