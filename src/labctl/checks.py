@@ -8,6 +8,9 @@
 - Moves (relocated roots, renamed data): the source should exist; the target must not hold data
   (a renamed directory's target may be archived with --replace-stale). Sizes and filesystems show
   whether a root move is a rename or a copy.
+- Free space: what is copied onto a filesystem (migrates, restores from another node or into a
+  volume, volume renames, moves across filesystems) must fit in what is free there. Copies are made
+  in full before anything is archived or deleted, so the whole size counts.
 """
 
 from __future__ import annotations
@@ -55,6 +58,20 @@ for arg in "$@"; do
     dev=$(stat -c %d "$d" 2>/dev/null)
   fi
   printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "$p" "$kind" "$size" "$newest" "$dev"
+done
+"""
+
+
+# Free space: for each path, the filesystem holding it (or its nearest existing parent): bytes
+# available and mount point. DOCKER stands for Docker's root dir, where volumes live.
+DOCKER = "@docker"
+_FREE = """\
+for p in "$@"; do
+  d=$p
+  if [ "$p" = @docker ]; then d=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null); fi
+  while [ -n "$d" ] && [ ! -e "$d" ] && [ "$d" != / ]; do d=$(dirname "$d"); done
+  [ -n "$d" ] || continue
+  df -PB1 "$d" 2>/dev/null | awk -v p="$p" 'NR == 2 {printf "%s\\t%s\\t%s\\n", p, $4, $6}'
 done
 """
 
@@ -204,7 +221,150 @@ def check_paths(
     }
     for op in operations:
         findings.extend(_findings_for(op, desired, recorded, planned, replace_stale))
+    needed = space_needed(operations, moves, desired, recorded, results, planned)
+    for node, destinations in sorted(needed.items()):
+        try:
+            free = probe_free(node_remote(node), sorted(destinations))
+        except RemoteError as exc:
+            findings.append(Finding(Level.BLOCK, node, "", f"free space check failed: {exc}"))
+            continue
+        findings.extend(space_findings(node, destinations, free))
     return findings, results
+
+
+##########################################################################
+
+# Free space
+
+##########################################################################
+
+# node -> destination (a path, or DOCKER) -> (bytes copied there, what for)
+Needed = dict[str, dict[str, tuple[int, tuple[str, ...]]]]
+
+
+def space_needed(
+    operations: Sequence[Operation],
+    moves: Sequence[Move],
+    desired: Mapping[str, Desired],
+    recorded: Mapping[str, NodeState | None],
+    results: Mapping[str, Mapping[str, PathInfo]],
+    planned: Mapping[str, Mapping[str, PathInfo]],
+) -> Needed:
+    """
+    What each copy the plan makes puts on each node, by destination: migrates (bind data into the
+    target's APPDATA_DIR, volumes into Docker's root), restores from another node or into a volume,
+    volume renames, and moves across filesystems. Renames on one filesystem need nothing. Sizes
+    not known (unreadable, not measured) count as nothing.
+
+    Args:
+        operations (Sequence[Operation]):
+            The plan's operations.
+        moves (Sequence[Move]):
+            The plan's moves.
+        desired (Mapping[str, Desired]):
+            Every node's bundle.
+        recorded (Mapping[str, NodeState | None]):
+            Every node's state after the moves.
+        results (Mapping[str, Mapping[str, PathInfo]]):
+            The probe, by current path.
+        planned (Mapping[str, Mapping[str, PathInfo]]):
+            The probe, by post-move path (volumes by key).
+
+    Returns:
+        Needed:
+            Per node and destination: the bytes, and what they are for.
+    """
+    needed: dict[str, dict[str, tuple[int, tuple[str, ...]]]] = {}
+
+    def add(node: str, destination: str, size: int | None, label: str) -> None:
+        if not size:
+            return
+        total, labels = needed.setdefault(node, {}).get(destination, (0, ()))
+        needed[node][destination] = (total + size, labels + (() if label in labels else (label,)))
+
+    for op in operations:
+        match op:
+            case Migrate(_, source, target, _, added):
+                label = ", ".join(added)
+                root = desired[target].dirs.appdata_dir
+                paths = migrate_source_paths(op, desired, recorded)
+                for path in paths:
+                    if not any(other != path and path.startswith(other + "/") for other in paths):
+                        add(target, root, _size(planned, source, path), label)
+                for key in op.source_data:
+                    if is_volume(key):
+                        add(target, DOCKER, _size(planned, source, key), label)
+            case Restore(service, node, source, entries=entries, size=size):
+                volume = any(is_volume(key) for _, key in entries)
+                if source != node or volume:
+                    add(node, DOCKER if volume else desired[node].dirs.appdata_dir, size, service)
+            case _:
+                pass
+    for move, source, target in move_paths(moves):
+        if move.carried:
+            continue
+        label = ", ".join(move.services) or f"{move.kind} {move.old} → {move.new}"
+        if move.kind == VOLUME:
+            root = desired[move.node].dirs.appdata_dir
+            size = _size(results, move.node, data_spec(root, move.old))
+            add(move.node, DOCKER if is_volume(move.new) else root, size, label)
+            continue
+        src = results.get(move.node, {}).get(source)
+        dst = results.get(move.node, {}).get(target)
+        if src and dst and src.device and dst.device and src.device != dst.device:
+            add(move.node, target, src.size, label)
+    return needed
+
+
+def _size(results: Mapping[str, Mapping[str, PathInfo]], node: str, path: str) -> int | None:
+    info = results.get(node, {}).get(path)
+    return info.size if info and info.has_data else None
+
+
+def probe_free(remote: Remote, destinations: Sequence[str]) -> dict[str, tuple[int, str]]:
+    """Each destination's free bytes and mount point (DOCKER: Docker's root dir)."""
+    return parse_free(remote.run_script(_FREE, *destinations))
+
+
+def parse_free(output: str) -> dict[str, tuple[int, str]]:
+    """_FREE's output: destination -> (bytes available, mount point)."""
+    free: dict[str, tuple[int, str]] = {}
+    for line in output.splitlines():
+        fields = line.split("\t")
+        if len(fields) == 3 and fields[1].isdigit():
+            free[fields[0]] = (int(fields[1]), fields[2])
+    return free
+
+
+def space_findings(
+    node: str,
+    destinations: Mapping[str, tuple[int, tuple[str, ...]]],
+    free: Mapping[str, tuple[int, str]],
+) -> list[Finding]:
+    """A blocking finding for each filesystem the copies onto it do not fit on (destinations on
+    one filesystem add up). A destination whose space could not be read is not judged."""
+    by_mount: dict[str, tuple[int, int, tuple[str, ...]]] = {}
+    for destination, (size, labels) in destinations.items():
+        if destination not in free:
+            continue
+        available, mount = free[destination]
+        total, _, seen = by_mount.get(mount, (0, available, ()))
+        by_mount[mount] = (
+            total + size,
+            available,
+            seen + tuple(x for x in labels if x not in seen),
+        )
+    return [
+        Finding(
+            Level.BLOCK,
+            node,
+            ", ".join(labels),
+            f"not enough free space on {mount}: the copies need {human_size(need)}, "
+            f"{human_size(available)} is free",
+        )
+        for mount, (need, available, labels) in sorted(by_mount.items())
+        if need > available
+    ]
 
 
 def move_paths(moves: Sequence[Move]) -> list[tuple[Move, str, str]]:

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 
+from craftable import get_table
 from rich.markup import escape
 
 from labctl.bundle import NO_SERVICES
@@ -44,7 +45,8 @@ from labctl.planner import (
     UnknownNode,
     Update,
 )
-from labctl.runtime import DEFER, Conflict, Runtime, TakeDown
+from labctl.ports import PortMove
+from labctl.runtime import DEFER, Conflict, Port, Runtime, TakeDown
 from labctl.state import NodeState, Scope, Service, is_volume
 
 
@@ -80,9 +82,9 @@ def render_nodes(collected: Collected) -> None:
 def render_problems(
     problems: tuple[Problem, ...],
     placeholders: dict[str, tuple[str, ...]],
-    port_clashes: list[str] | None = None,
+    lab_problems: list[str] | None = None,
 ) -> None:
-    if not (problems or placeholders or port_clashes):
+    if not (problems or placeholders or lab_problems):
         return
     console.print("\n[bold]Problems (block apply)[/]")
     for problem in problems:
@@ -105,8 +107,8 @@ def render_problems(
                 )
     for node, names in sorted(placeholders.items()):
         console.print(f"  [red]✗[/] {node}: no value for {', '.join(names)}")
-    for clash in port_clashes or ():
-        console.print(f"  [red]✗[/] {escape(clash)}")
+    for line in lab_problems or ():
+        console.print(f"  [red]✗[/] {escape(line)}")
 
 
 def not_a_stack(node: str, file: str, why: str) -> str:
@@ -345,8 +347,6 @@ def render_runtime(runtime: Runtime) -> None:
         console.print(f"  [yellow]![/] {escape(describe(conflict))} → {escape(then)}")
         for note in conflict.take_down.data if conflict.take_down else ():
             console.print(f"      [yellow]![/] {escape(note)}")
-    for down in runtime.stuck:
-        console.print(f"  [red]✗[/] {escape(_project(down))}")
     for blocked in runtime.blocked:
         console.print(f"      [red]✗[/] {escape(blocked)}")
     if runtime.later:
@@ -398,9 +398,14 @@ def choice_label(conflict: Conflict, choice: str, short: bool = False, done: boo
             return f"{names} created, not started (labctl node up starts it once the port is free)"
         return f"don't start {names}" if short else f"Don't start {names} (created, not started)"
     if conflict.take_down:
+        back = (
+            "its files are gone: not brought back"
+            if conflict.take_down.missing
+            else ("undo brings it back")
+        )
         if done:
-            return "taken down (undo brings it back)"
-        return "take it down" if short else "Take it down (undo brings it back)"
+            return f"taken down ({back})"
+        return "take it down" if short else f"Take it down ({back})"
     stop = conflict.stop
     rename = bool(stop and stop.rename)
     if done:
@@ -426,6 +431,47 @@ def _project(down: TakeDown) -> str:
         f"{down.node}: compose project {down.project} runs from {down.working_dir} "
         f"({services}; {likely})"
     )
+
+
+def render_port_moves(moves: Sequence[PortMove], heading: str) -> None:
+    """The services whose published ports change node or port, in a table: before and after."""
+    if not moves:
+        return
+
+    def where(side: tuple[tuple[str, tuple[Port, ...]], ...]) -> str:
+        return "; ".join(f"{node} {', '.join(map(str, ports))}" for node, ports in side) or "none"
+
+    rows = [[move.service, where(move.before), where(move.after)] for move in moves]
+    console.print(f"\n[bold]{heading}[/]")
+    console.print(
+        get_table(
+            rows,
+            header_row=["Service", "Before", "After"],
+            postprocessors=[lambda value, text, row, col: escape(text)] * 3,
+        )
+    )
+
+
+def render_gone(collected: Collected, scope: Scope) -> list[str]:
+    """Projects running from DEPLOY_DIR whose files are gone, on the named nodes. Returns the ones
+    apply takes down for good (no stack of the lab config has their name), for its question."""
+    lines, trash = [], []
+    for node, names in sorted(collected.gone.items()):
+        if not scope.in_scope(node) or node not in collected.desired:
+            continue
+        stacks = collected.desired[node].state.stacks
+        for name in names:
+            if name in stacks:
+                then = f"the lab config's {name} takes its containers over"
+            else:
+                then = "taken down (nothing could bring it back)"
+                trash.append(f"{node}/{name}")
+            lines.append(f"  [yellow]![/] {node}: project {escape(name)}'s files are gone → {then}")
+    if lines:
+        console.print("\n[bold]Projects whose files are gone[/]")
+        for line in lines:
+            console.print(line)
+    return trash
 
 
 def render_moves(plan: Plan, probes: dict[str, dict[str, PathInfo]], verbose: bool = False) -> None:

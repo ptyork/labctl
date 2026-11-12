@@ -12,6 +12,7 @@ import pytest
 from labctl import checks
 from labctl.bundle import Desired
 from labctl.checks import (
+    DOCKER,
     Finding,
     Level,
     PathInfo,
@@ -19,14 +20,17 @@ from labctl.checks import (
     check_paths,
     human_size,
     key_label,
+    parse_free,
     parse_probe,
     parse_size,
     parse_volumes,
+    space_findings,
+    space_needed,
 )
 from labctl.compose import reduce_config
 from labctl.envfile import CompiledEnv
 from labctl.moves import APPDATA, DATA, Move
-from labctl.planner import Add, Migrate, Update
+from labctl.planner import Add, Migrate, Restore, Update
 from labctl.remote import Remote
 from labctl.state import NodeState, Service
 
@@ -80,6 +84,7 @@ def fake_probe(monkeypatch: pytest.MonkeyPatch) -> FakeProbe:
         return {p: fake.answers[remote.host].get(p, PathInfo("missing")) for p, mode in paths}
 
     monkeypatch.setattr(checks, "probe", probe)
+    monkeypatch.setattr(checks, "probe_free", lambda remote, paths: {})  # space not judged
     return fake
 
 
@@ -286,3 +291,72 @@ def test_archive_names_and_labels() -> None:
     )
     assert key_label("plex") == "plex/"
     assert key_label("volume:homelab-frodo_db") == "volume homelab-frodo_db"
+
+
+# ── Free space ─────────────────────────────────────────────────────────────────
+
+
+def test_what_the_copies_need_on_each_node() -> None:
+    want = {"a": desired("a", ROOT_B), "b": desired("b", ROOT_B)}
+    have: dict[str, NodeState | None] = {
+        "a": NodeState.of("a", Service("plex", ("plexms", "plexms/cache"), ("vol",), "p"))
+    }
+    plex = Migrate(("plexms", "volume:vol"), "a", "b", ("plex",), ("plex",))
+    restore = Restore("sonarr", "b", "a", "x", ROOT_B, (("sonarr-x", "sonarr"),), size=300)
+    same_node = Restore("radarr", "a", "a", "x", ROOT_B, (("radarr-x", "radarr"),), size=9)
+    planned = {
+        "a": {
+            f"{ROOT_B}/plexms": PathInfo("dir", size=5000),
+            f"{ROOT_B}/plexms/cache": PathInfo("dir", size=4000),  # inside plexms: counted once
+            "volume:vol": PathInfo("dir", size=70),
+        }
+    }
+    across = Move("b", APPDATA, ROOT_B, "/big/appdata", ROOT_B, "/big/appdata")
+    results = {
+        "b": {
+            ROOT_B: PathInfo("dir", size=800, device="1"),
+            "/big/appdata": PathInfo("missing", device="2"),  # another filesystem: a copy
+        }
+    }
+    needed = space_needed([plex, restore, same_node], [across], want, have, results, planned)
+    assert needed == {
+        "b": {
+            ROOT_B: (5300, ("plex", "sonarr")),
+            DOCKER: (70, ("plex",)),
+            "/big/appdata": (800, (f"APPDATA_DIR {ROOT_B} → /big/appdata",)),
+        }
+    }
+    results["b"]["/big/appdata"] = PathInfo("missing", device="1")  # one filesystem: a rename
+    assert "/big/appdata" not in space_needed([], [across], want, have, results, planned).get(
+        "b", {}
+    )
+
+
+def test_copies_onto_one_filesystem_add_up() -> None:
+    free = parse_free("/srv/appdata\t1000\t/srv\n@docker\t1000\t/srv\n/big\t50\t/big\nbad\n")
+    destinations = {
+        "/srv/appdata": (600, ("plex",)),
+        DOCKER: (500, ("db",)),
+        "/big": (10, ("x",)),
+        "/unread": (10**12, ("y",)),  # its space could not be read: not judged
+    }
+    (finding,) = space_findings("b", destinations, free)
+    assert finding.level is Level.BLOCK and finding.service == "plex, db"
+    assert (
+        finding.message == "not enough free space on /srv: the copies need 1.1 KB, 1000 B is free"
+    )
+
+
+def test_a_migrate_that_does_not_fit_blocks(
+    fake_probe: FakeProbe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_probe["frodo"][f"{ROOT_A}/plexms"] = PathInfo("dir", size=2 * 1024**3)
+    monkeypatch.setattr(
+        checks, "probe_free", lambda remote, paths: {p: (1024**3, "/srv") for p in paths}
+    )
+    findings, _ = check_paths([PLEX_MOVE], DESIRED, RECORDED)
+    assert (
+        Level.BLOCK,
+        "cirdan",
+        "not enough free space on /srv: the copies need 2.0 GB, 1.0 GB is free",
+    ) in messages(findings)

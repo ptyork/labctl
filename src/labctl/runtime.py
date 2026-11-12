@@ -22,14 +22,14 @@ the way of what apply starts. Each of those is a conflict, and each needs an ans
   (created, not started: `labctl node up` starts them once the port is free);
 - a container named like a service's container_name: stop it (and rename it);
 - a compose project elsewhere with the name of one of the node's stacks: take it down (its files
-  bring it back on undo). Usually the same stack moving into DEPLOY_DIR; rarely an unrelated one;
+  bring it back on undo; when they are gone it is trash, taken down by name for good). Usually the
+  same stack moving into DEPLOY_DIR; rarely an unrelated one;
 - a port held outside Docker (a host service, or a container on the host network): don't start
   the services publishing it, so a replacement can be phased in.
 
 Leaving a conflict as it is is no answer: `up` would fail on it. A terminal is asked about each
 (cancel stops the apply); flags answer them all (Answers); with neither, apply stops.
-Two it cannot resolve: a project from elsewhere whose files are gone (nothing could bring it back
-on undo), and a network whose definition changes (compose removes and recreates it) with
+One it cannot resolve: a network whose definition changes (compose removes and recreates it) with
 containers of other stacks attached. Docker refuses to remove it, and `up` would fail with the
 stack already stopped; the plan stops and says how to free it.
 Pure functions only; collect.py runs the commands.
@@ -394,7 +394,6 @@ class Runtime:
     # Every conflict, and the answers: (key, STOP or DEFER).
     in_the_way: tuple[Conflict, ...] = ()
     answered: tuple[tuple[str, str], ...] = ()
-    stuck: tuple[TakeDown, ...] = ()  # projects from elsewhere whose files are gone
     networks: tuple[NetworkInUse, ...] = ()
     # Conflicts of stacks that stay down (or nodes apply does not change): shown, nothing done.
     later: tuple[str, ...] = field(default=(), compare=False)
@@ -421,15 +420,7 @@ class Runtime:
     @property
     def blocked(self) -> tuple[str, ...]:
         """Conflicts apply cannot resolve."""
-        return (
-            *(
-                f"{down.node}: project {down.project} runs from {down.working_dir}, but its files "
-                f"are gone ({', '.join(down.missing)}): nothing could bring it back on undo; take "
-                "it down by hand"
-                for down in self.stuck
-            ),
-            *(str(network) for network in self.networks),
-        )
+        return tuple(str(network) for network in self.networks)
 
     def for_node(self, node: str) -> NodeRuntime:
         return NodeRuntime(
@@ -517,7 +508,6 @@ def analyse(
     stacks: list[StackRun] = []
     stops: dict[tuple[str, str], Stop] = {}
     take_down: list[TakeDown] = []
-    stuck: list[TakeDown] = []
     defers: list[Defer] = []
     # The services a container in the way holds a port of: what not starting them means.
     held_by: dict[tuple[str, str], list[Defer]] = {}
@@ -615,7 +605,7 @@ def analyse(
                 _data_moved(want, found, in_repo),
             )
             if route(project, f"compose project {project} also runs from {down.working_dir}"):
-                (stuck if down.missing else take_down).append(down)
+                take_down.append(down)
 
         # Containers in the way of a service, and ports held outside Docker.
         loose = [other for other in others if other.project not in foreign]
@@ -711,7 +701,6 @@ def analyse(
     runtime = Runtime(
         stacks=tuple(stacks),
         in_the_way=in_the_way,
-        stuck=tuple(stuck),
         networks=tuple(networks),
         later=tuple(later),
         unmanaged=unmanaged,

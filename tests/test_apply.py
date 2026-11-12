@@ -11,7 +11,15 @@ from typing import Any
 
 import pytest
 
-from labctl.apply import ApplyError, Executor, Node, NodeWork, RollbackFailed, node_work
+from labctl.apply import (
+    ApplyError,
+    Executor,
+    Node,
+    NodeWork,
+    RollbackFailed,
+    _migrate_and_move,
+    node_work,
+)
 from labctl.bundle import Desired, Location, manifest, resolve_stacks
 from labctl.collect import HOME_POINTER, RECORD, Collected, NodeReport, Record, current_state
 from labctl.envfile import CompiledEnv
@@ -1032,3 +1040,14 @@ def test_originals_are_deleted_only_after_everything_applied(
     executor.run({"cirdan": Moving()}, [work(tmp_path)], Plan())  # type: ignore[dict-item]
     assert deleted == ["now"]
     assert any("still there: busy" in line for line in said)
+
+
+def test_a_migrate_and_a_move_on_one_node_say_how_to_split_them() -> None:
+    plex = Migrate(("plexms",), "frodo", "bilbo", ("plex",), ("plex",))
+    move = Move("frodo", DATA, "sonarr", "sonarr-new", "sonarr", "sonarr-new", ("sonarr",))
+    message = _migrate_and_move("frodo", [plex], (move,))
+    assert message == (
+        "frodo: plex migrate (frodo → bilbo) while frodo also moves data (sonarr → sonarr-new); "
+        "labctl does one per apply. Keep plex where it is in the lab config, apply the move, then "
+        "migrate in a second apply"
+    )

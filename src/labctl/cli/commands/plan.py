@@ -48,9 +48,11 @@ from labctl.cli.render import (
     render_drift,
     render_files,
     render_findings,
+    render_gone,
     render_moves,
     render_nodes,
     render_notices,
+    render_port_moves,
     render_problems,
     render_repo_notices,
     render_runtime,
@@ -62,6 +64,7 @@ from labctl.collect import Collected, collect
 from labctl.compose import ComposeError
 from labctl.console import console
 from labctl.envfile import EnvError
+from labctl.links import split_links
 from labctl.moves import (
     MovePlan,
     plan_moves,
@@ -72,7 +75,7 @@ from labctl.planner import (
     Remove,
     make_plan,
 )
-from labctl.ports import lab_clashes
+from labctl.ports import PortMove, lab_clashes, moved_ports
 from labctl.progress import Progress
 from labctl.remote import Remote, RemoteError, node_remote
 from labctl.repo import ConfigRepo, RepoError, TagInfo
@@ -203,6 +206,7 @@ def _run(
                 commit_message, repo, planned.base, planned.tree, options.nodes, message, not yes
             ),
         )
+        render_port_moves(planned.port_moves, "Published ports that changed")
         return False
     except (ComposeError, EnvError, ApplyError, RemoteError, RepoError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -394,6 +398,7 @@ class Planned:
     tree: str | None = None  # the snapshot planned (None: plan, the working tree)
     base: str = ""  # HEAD when planned: the snapshot is committed on it
     options: Options | None = None  # with the restore choices made
+    port_moves: tuple[PortMove, ...] = ()  # shown again once applied
 
 
 def _files(collected: Collected) -> object:
@@ -516,18 +521,19 @@ def _plan_and_render(
         n: d.env.placeholders for n, d in collected.desired.items() if d.env.placeholders
     }
 
-    # Two of a node's services publishing one port: `up` would fail on it.
-    port_clashes = [
-        clash
-        for node, bundle in sorted(collected.desired.items())
-        if scope.in_scope(node)
-        for clash in lab_clashes(bundle)
+    # The lab config's own: two of a node's services publishing one port, and a service linked
+    # to a container the lab config runs on another node. `up` would fail on either.
+    named = [node for node in sorted(collected.desired) if scope.in_scope(node)]
+    lab_problems = [
+        *(clash for node in named for clash in lab_clashes(collected.desired[node])),
+        *split_links(collected.desired, named),
     ]
-    render_problems(plan.problems, placeholders, port_clashes)
+    render_problems(plan.problems, placeholders, lab_problems)
     render_drift(collected)
     files_changed = render_files(collected, scope, options.verbose)
     render_stacks(plan, collected, runtime, work_nodes, probes, options.verbose)
     render_moves(plan, probes, options.verbose)
+    trash = render_gone(collected, scope)
     for note in restores.notes:
         console.print(f"  [cyan]i[/] {escape(note)}")
     for error in restores.errors:
@@ -543,9 +549,15 @@ def _plan_and_render(
     render_repo_notices(repo_notices)
     render_findings(findings)
     render_runtime(runtime)
+    port_moves = moved_ports(
+        {node: d.state for node, d in collected.desired.items()},
+        collected.recorded,
+        work_nodes,
+    )
+    render_port_moves(port_moves, "Published ports that change")
 
     reasons = []
-    if plan.problems or placeholders or restores.errors or port_clashes:
+    if plan.problems or placeholders or restores.errors or lab_problems:
         reasons.append("problems above")
     blocking = [finding for finding in findings if finding.level is Level.BLOCK]
     if blocking:
@@ -554,7 +566,7 @@ def _plan_and_render(
         reasons.append("conflicts apply cannot resolve")
     if computed.works is None:
         console.print(f"\n[red]✗[/] {escape(computed.work_error)}")
-        reasons.append("not supported yet")
+        reasons.append("a migrate and a move on one node")
     render_summary(plan, files_changed, reasons, runtime.conflicts)
     at = "the commit applied" if collected.tree else "HEAD"
     for work in computed.works or ():
@@ -575,6 +587,8 @@ def _plan_and_render(
         confirm.append("remote storage newly shared between nodes")
     if collected.drift:
         confirm.append("node edits to discard")
+    if trash:
+        confirm.append(f"{', '.join(trash)} taken down for good (files gone)")
     first = [work.node for work in computed.works or () if _source(collected, work.node) == "first"]
     if first:
         confirm.append(f"a first apply on {', '.join(first)}")
@@ -595,6 +609,7 @@ def _plan_and_render(
         collected.tree,
         collected.base,
         options,
+        tuple(port_moves),
     )
 
 

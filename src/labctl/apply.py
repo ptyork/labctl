@@ -191,6 +191,25 @@ class NodeWork:
     # Nothing to change, but the node's record names no commit yet: only the record is written.
     record_only: bool = False
     old_services: Mapping[str, Service] = field(default_factory=dict)  # as recorded (sidecars)
+    # Projects running from DEPLOY_DIR whose files are gone and that no stack of the bundle has:
+    # taken down by name, for good (nothing could bring them back).
+    trash: tuple[str, ...] = ()
+
+
+def _migrate_and_move(node: str, migrates: list[Migrate], moves: tuple[Move, ...]) -> str:
+    """Why a migrate and a move on one node are refused, and how to do them in two applies."""
+    services = ", ".join(sorted({s for m in migrates for s in (*m.removed, *m.added)}))
+    ways = ", ".join(
+        f"{m.source} → {m.target}" for m in sorted(migrates, key=lambda m: (m.source, m.target))
+    )
+    what = "; ".join(
+        f"{move.old} → {move.new}" for move in moves if move.node == node and not move.carried
+    )
+    return (
+        f"{node}: {services} migrate ({ways}) while {node} also moves data ({what}); labctl does "
+        f"one per apply. Keep {services} where {'it is' if ',' not in services else 'they are'} "
+        "in the lab config, apply the move, then migrate in a second apply"
+    )
 
 
 def node_work(plan: Plan, collected: Collected, scope: Scope) -> list[NodeWork]:
@@ -212,7 +231,7 @@ def node_work(plan: Plan, collected: Collected, scope: Scope) -> list[NodeWork]:
 
     Raises:
         ApplyError:
-            A migrate and a move on one node (not supported yet).
+            A migrate and a move on one node (one per apply).
     """
     drifted = {drift.node for drift in collected.drift}
     reports = {report.node: report.source for report in collected.reports}
@@ -226,10 +245,7 @@ def node_work(plan: Plan, collected: Collected, scope: Scope) -> list[NodeWork]:
         ops = [op for op in plan.operations if node in op.nodes]
         migrates = [op for op in ops if isinstance(op, Migrate)]
         if migrates and node in moved:
-            raise ApplyError(
-                f"{node}: a migrate and a move on the same node in one apply is not supported "
-                "yet; apply the move first"
-            )
+            raise ApplyError(_migrate_and_move(node, migrates, plan.moves))
         moves = tuple(
             (move, now, new)
             for move, now, new in move_paths(plan.moves)
@@ -239,7 +255,15 @@ def node_work(plan: Plan, collected: Collected, scope: Scope) -> list[NodeWork]:
             name for name, kind in collected.node_names.get(node, {}).items() if kind != "data"
         } | set(top_level(on_node))
         discard = tuple(sorted(present - set(desired.top_level)))
-        changed = dict(on_node) != desired.files or reports.get(node) != "node" or bool(discard)
+        trash = tuple(
+            name for name in collected.gone.get(node, ()) if name not in desired.state.stacks
+        )
+        changed = (
+            dict(on_node) != desired.files
+            or reports.get(node) != "node"
+            or bool(discard)
+            or bool(trash)
+        )
         record_only = not (ops or moves or changed)
         if record_only and node not in collected.untracked:
             continue
@@ -263,6 +287,7 @@ def node_work(plan: Plan, collected: Collected, scope: Scope) -> list[NodeWork]:
                 keep_drift=node in drifted,
                 record_only=record_only,
                 old_services=dict(recorded.services),
+                trash=trash,
             )
         )
     return work
@@ -653,7 +678,17 @@ class Executor:
     ##########################################################################
 
     def _clear_the_way(self, node: Node, work: NodeWork, undo: Undo) -> None:
+        # Projects whose files are gone: by name, from / (no compose file there), no undo.
+        for name in work.trash:
+            node.log(f"down {name} (its files are gone)")
+            with self.steps.step(work.node, f"down {name} (files gone)"):
+                node.compose("/", Stack(name, ()), "down")
         for down in work.runtime.take_down:
+            if down.missing:
+                node.log(f"down {down.project} (its files are gone)")
+                with self.steps.step(work.node, f"down {down.project} (files gone)"):
+                    node.compose("/", Stack(down.project, ()), "down")
+                continue
             project = Stack(down.project, down.files)
             node.log(f"down {down.project} in {down.working_dir}")
             with self.steps.step(work.node, f"down {down.project} (from {down.working_dir})"):

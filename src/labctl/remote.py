@@ -3,15 +3,23 @@
 Each node's ssh alias is its node name; user, port, keys and so on come from ~/.ssh/config.
 Where OpenSSH supports it (not native Windows), connections are shared: the first call to a node
 opens a master connection and later calls reuse it.
+
+Every call runs in batch mode: nothing ever prompts. A node that wants a password or 2FA (ssh
+refuses the batch login, and the node offers `password` or `keyboard-interactive`) gets, in a
+terminal, its master opened with ssh's own prompt, once per run; the call is then made again
+through it. Nothing is stored: the master closes with the run (``close_all``).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import shlex
 import socket
 import subprocess
+import sys
+import threading
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 # Seconds ssh waits for a node to answer.
 CONNECT_TIMEOUT = 10
+# Shared connections: where their sockets are, and how long one outlives its last use (seconds).
+CONTROL_PATH = "~/.ssh/labctl-%C"
+CONTROL_PERSIST = 120
 
 # Starts a section line in a script's output: "@@LABCTL@@ <section name>".
 MARK = "@@LABCTL@@"
@@ -101,6 +112,12 @@ class Remote:
             command,
         ]
 
+    def _logged_in(self, code: int, stderr: str) -> bool:
+        """After a failed call: whether a login was asked for, so the call can be made again."""
+        if self.local or code != 255 or not wants_login(stderr):
+            return False
+        return login(self.host, self.connect_timeout)
+
     def _unreachable(self, code: int, stderr: str) -> None:
         if code == 255 and not self.local:
             raise Unreachable(f"{self.host}: {stderr.strip() or 'ssh failed'}")
@@ -109,9 +126,15 @@ class Remote:
         """Run a command in ``cwd`` on the node and capture its output."""
         command = f"cd {shlex.quote(cwd)} && {shlex.join(args)}"
         logger.debug("%s: %s", self.host, command)
-        proc = subprocess.run(
-            self.argv(command), stdin=subprocess.DEVNULL, capture_output=True, text=True
-        )
+
+        def call() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                self.argv(command), stdin=subprocess.DEVNULL, capture_output=True, text=True
+            )
+
+        proc = call()
+        if self._logged_in(proc.returncode, proc.stderr):
+            proc = call()
         _log_failure(self.host, proc.returncode, proc.stderr)
         self._unreachable(proc.returncode, proc.stderr)
         return Result(proc.stdout, proc.stderr, proc.returncode)
@@ -121,6 +144,8 @@ class Remote:
         command = "sh -s -- " + " ".join(shlex.quote(arg) for arg in args)
         logger.debug("%s: script (%d lines) %s", self.host, script.count("\n"), command)
         proc = subprocess.run(self.argv(command), input=script, capture_output=True, text=True)
+        if self._logged_in(proc.returncode, proc.stderr):
+            proc = subprocess.run(self.argv(command), input=script, capture_output=True, text=True)
         _log_failure(self.host, proc.returncode, proc.stderr)
         self._unreachable(proc.returncode, proc.stderr)
         if proc.returncode:
@@ -231,8 +256,77 @@ def _ssh_options(connect_timeout: int = CONNECT_TIMEOUT) -> list[str]:
             "-o",
             "ControlMaster=auto",
             "-o",
-            "ControlPath=~/.ssh/labctl-%C",
+            f"ControlPath={CONTROL_PATH}",
             "-o",
-            "ControlPersist=120",
+            f"ControlPersist={CONTROL_PERSIST}",
         ]
     return options
+
+
+##########################################################################
+
+# Logins that need a password or 2FA
+
+##########################################################################
+
+# The hosts a login was asked for in this run (asked once each, whatever the answer).
+_asked: set[str] = set()
+# Nodes are read in parallel: one prompt at a time.
+_login_lock = threading.Lock()
+_DENIED = re.compile(r"Permission denied \(([^)]*)\)")
+
+
+def wants_login(stderr: str) -> bool:
+    """Whether ssh refused a batch login that a person could complete: the node offers a password
+    or keyboard-interactive (2FA) login."""
+    match = _DENIED.search(stderr)
+    if match is None:
+        return False
+    return bool({"password", "keyboard-interactive"} & set(match[1].split(",")))
+
+
+def login(host: str, connect_timeout: int = CONNECT_TIMEOUT) -> bool:
+    """
+    Open ``host``'s shared connection with ssh's own prompts (password, 2FA), once per run and only
+    in a terminal; later batch calls go through it. Nothing is stored.
+
+    Args:
+        host (str):
+            The node's ssh alias.
+        connect_timeout (int):
+            Seconds ssh waits for the node (default: CONNECT_TIMEOUT).
+
+    Returns:
+        bool:
+            Whether the connection is open now (the failed call can be made again).
+    """
+    if os.name == "nt" or not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return False
+    with _login_lock:
+        if host in _asked:
+            return _master_open(host)
+        _asked.add(host)
+        print(f"{host}: ssh asks for a login (kept for this run only)", file=sys.stderr)
+        proc = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                f"ConnectTimeout={connect_timeout}",
+                "-o",
+                "ControlMaster=yes",
+                "-o",
+                f"ControlPath={CONTROL_PATH}",
+                "-o",
+                f"ControlPersist={CONTROL_PERSIST}",
+                "-fN",
+                host,
+            ]
+        )
+        return proc.returncode == 0
+
+
+def _master_open(host: str) -> bool:
+    proc = subprocess.run(
+        ["ssh", "-o", f"ControlPath={CONTROL_PATH}", "-O", "check", host], capture_output=True
+    )
+    return proc.returncode == 0

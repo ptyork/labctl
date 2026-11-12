@@ -519,11 +519,12 @@ def test_every_stack_file_in_deploy_dir_is_a_stack(settings: Settings, tmp_path:
 
 
 @docker
-def test_a_running_stack_without_its_file_is_an_error(settings: Settings, tmp_path: Path) -> None:
+def test_a_running_stack_without_its_file_is_left_out(settings: Settings, tmp_path: Path) -> None:
+    """It is trash: Collected.gone lists it, and apply takes it down by name."""
     folder = tmp_path / "docker"
     write_tree(folder, APPS)
-    with pytest.raises(ComposeError, match="its files \\(gone.yml\\) are not in DEPLOY_DIR"):
-        current_state(settings, "cirdan", folder, Dirs(HOME, APPDATA), {"x": ("gone.yml",)})
+    state = current_state(settings, "cirdan", folder, Dirs(HOME, APPDATA), {"x": ("gone.yml",)})
+    assert "x" not in state.stacks
 
 
 ##############################################################################

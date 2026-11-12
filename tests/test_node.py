@@ -15,7 +15,14 @@ from labctl.cli import cli
 from labctl.cli.commands import node as node_module
 from labctl.remote import Remote
 from labctl.settings import write_config
-from labctl.stack import Seen, ServiceStatus, compose_command, ps_rows, statuses
+from labctl.stack import (
+    Seen,
+    ServiceStatus,
+    compose_command,
+    parse_restarts,
+    ps_rows,
+    statuses,
+)
 from labctl.state import Stack
 
 POINTERS: dict[str, str] = {}  # node -> what its ~/.labctl-home says
@@ -299,6 +306,33 @@ def test_statuses_from_compose_ps(array: bool) -> None:
         ServiceStatus("media", "plex", "running", "Up 2 hours", "plex:1", configured=True),
         ServiceStatus("media", "sonarr", "", "", "", configured=True),
     ]
+
+
+def test_restarts_and_restart_loops() -> None:
+    output = "\n".join(
+        [
+            "1762970400",  # 2025-11-12T18:00:00Z
+            "/media-sonarr-1 12 2025-11-12T17:59:00.123456789Z",  # up a minute, 12 restarts
+            "/media-plex-1 4 2025-11-10T08:00:00Z",  # up two days: crashed long ago
+            "/media-bazarr-1 1 2025-11-12T17:59:30Z",
+            "/media-radarr-1 7 0001-01-01T00:00:00Z",  # Docker restarting it now
+            "garbage",
+        ]
+    )
+    restarts = parse_restarts(output)
+    assert restarts["media-sonarr-1"] == (12, 60) and restarts["media-plex-1"][0] == 4
+    rows = [
+        {"Service": s, "Name": f"media-{s}-1", "State": state, "Status": "", "Image": ""}
+        for s, state in [
+            ("sonarr", "running"),
+            ("plex", "running"),
+            ("bazarr", "running"),
+            ("radarr", "restarting"),
+        ]
+    ]
+    looping = {s.service: s.looping for s in statuses("media", [], rows, restarts)}
+    assert looping == {"bazarr": False, "plex": False, "radarr": True, "sonarr": True}
+    assert parse_restarts("") == {}
 
 
 def test_a_node_without_stack_files(ran: list[tuple[str, str]], tmp_path: Path) -> None:

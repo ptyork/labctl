@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from labctl.ports import (
     CONTAINER,
     LISTENING,
@@ -11,11 +13,14 @@ from labctl.ports import (
     RUNNING,
     SERVICE,
     PortUse,
+    moved_ports,
     port_map,
 )
 from labctl.runtime import Container, Listener, Port
+from labctl.state import NodeState, Service
 
 TCP80, TCP443 = Port("tcp", 80), Port("tcp", 443)
+TCP32400 = Port("tcp", 32400)
 
 
 def ours(service: str, *ports: Port, up: bool = True) -> Container:
@@ -97,3 +102,25 @@ def test_listeners_on_both_wildcards_are_one_row() -> None:
         Listener(Port("tcp", 22, "::"), "sshd"),
     ]
     assert len(port_map("n", {}, [], listeners)) == 1
+
+
+def test_ports_that_move_to_another_node_or_port() -> None:
+    def state(node: str, **services: list[str]) -> NodeState:
+        return NodeState.of(
+            node,
+            *(
+                Service(name, config=json.dumps({"ports": [{"published": p} for p in ports]}))
+                for name, ports in services.items()
+            ),
+        )
+
+    before = {"a": state("a", plex=["32400"], sonarr=["8989"], same=["80"]), "b": state("b")}
+    after = {"a": state("a", sonarr=["8990"], same=["80"]), "b": state("b", plex=["32400"])}
+    moves = moved_ports(after, before, ["a", "b"])
+    assert [(m.service, m.before, m.after) for m in moves] == [
+        ("plex", (("a", (TCP32400,)),), (("b", (TCP32400,)),)),
+        ("sonarr", (("a", (Port("tcp", 8989),)),), (("a", (Port("tcp", 8990),)),)),
+    ]
+    assert moved_ports(after, before, ["c"]) == []  # no node the plan changes
+    (plex,) = [m for m in moved_ports(after, before, ["b"]) if m.service == "plex"]
+    assert (plex.before, plex.after) == ((), (("b", (TCP32400,)),))  # a: not this plan's

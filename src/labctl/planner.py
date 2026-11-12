@@ -298,6 +298,7 @@ def make_plan(
             reason = "fanout" if not kept else ("shared" if movers else "duplicate")
             notices.append(NotMigrated(group.keys, source, reason, _fresh(added), kept, movers))
 
+    notices += _unlinked_duplicates(want, have, notices)
     operations = _with_archives(operations, groups, migrated_from, aliases)
 
     # Only the nodes named change. A migrate needs both of its nodes: with one left out it is a
@@ -332,6 +333,54 @@ def make_plan(
         ),
         unchanged=tuple(unchanged),
     )
+
+
+def _unlinked_duplicates(
+    want: Mapping[str, Mapping[str, Service]],
+    have: Mapping[str, Mapping[str, Service]],
+    noticed: Iterable[NotMigrated],
+) -> list[NotMigrated]:
+    """
+    Second instances whose data is named differently on each node, so no data group links them:
+    above all named volumes (their names carry the stack's project, `homelab-frodo_db` and
+    `homelab-bilbo_db`). Matched by service and container path, as renames are.
+
+    Args:
+        want (Mapping[str, Mapping[str, Service]]):
+            Each node's services, as the repo wants them.
+        have (Mapping[str, Mapping[str, Service]]):
+            Each node's services now.
+        noticed (Iterable[NotMigrated]):
+            The notices already made: a second instance one of them names is not named again.
+
+    Returns:
+        list[NotMigrated]:
+            One "duplicate" notice per service added on a node while it keeps running, with its
+            data, on another.
+    """
+    said = {(n.source, fresh) for n in noticed for fresh in n.fresh}
+    found = []
+    for node, services in sorted(want.items()):
+        for name, service in sorted(services.items()):
+            if name in have.get(node, {}) or not service.mounts:
+                continue
+            for other in sorted(have):
+                running = have[other].get(name)
+                if other == node or running is None or name not in want.get(other, {}):
+                    continue
+                theirs = dict(running.mounts)
+                keys = sorted(
+                    {
+                        theirs[path]
+                        for path, key in service.mounts
+                        if path in theirs and theirs[path] != key
+                    }
+                )
+                if keys and (other, (name, node)) not in said:
+                    found.append(
+                        NotMigrated(tuple(keys), other, "duplicate", ((name, node),), kept=(name,))
+                    )
+    return found
 
 
 def _notice_nodes(notice: NotMigrated | MoveNotice) -> tuple[str, ...]:

@@ -380,8 +380,10 @@ def test_a_project_from_elsewhere_with_a_stacks_name_is_taken_down() -> None:
         ),
     )
     assert runtime.blocked == ()
-    gone = run(want, have, {"cirdan": (elsewhere,)}, missing={"cirdan": frozenset(elsewhere.files)})
-    assert "its files are gone" in gone.blocked[0]
+    # Its files gone: trash, taken down like any other (by name, for good), never a block.
+    missing = {"cirdan": frozenset(elsewhere.files)}
+    gone = run(want, have, {"cirdan": (elsewhere,)}, missing=missing, answers=STOP_ALL)
+    assert gone.blocked == () and gone.take_down[0].missing == elsewhere.files
 
 
 def test_each_conflict_is_answered_by_its_key_before_the_flags() -> None:

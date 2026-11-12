@@ -16,6 +16,7 @@ is never a clash (it plainly works). Pure functions only.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from itertools import combinations
@@ -23,6 +24,7 @@ from itertools import combinations
 from labctl.bundle import Desired
 from labctl.envfile import PLACEHOLDER_PREFIX
 from labctl.runtime import DOCKER_PROCESSES, Container, Listener, Port, is_any_address, published
+from labctl.state import NodeState
 
 # What uses a port.
 SERVICE = "labctl"  # a service of the lab config, or a container run from DEPLOY_DIR
@@ -72,6 +74,62 @@ def declared_ports(desired: Desired) -> dict[tuple[str, str], tuple[Port, ...]]:
         for name, service in sorted(desired.state.services.items())
         if (ports := published(desired.service_config(name)))
     }
+
+
+@dataclass(frozen=True)
+class PortMove:
+    """A service whose published host ports change: another node, or another port."""
+
+    service: str
+    before: tuple[tuple[str, tuple[Port, ...]], ...]  # (node, its ports), by node
+    after: tuple[tuple[str, tuple[Port, ...]], ...]
+
+
+def moved_ports(
+    desired: Mapping[str, NodeState],
+    recorded: Mapping[str, NodeState | None],
+    nodes: Iterable[str],
+) -> list[PortMove]:
+    """
+    The services whose published host ports change on ``nodes`` (only those nodes are shown, so a
+    service running on several nodes lists the ones this plan changes): what to check by hand
+    afterwards (proxy hosts, DNS, dashboards point at node and port; each app keeps them its own
+    way, so labctl cannot fix them).
+
+    Args:
+        desired (Mapping[str, NodeState]):
+            Every node as the lab config wants it.
+        recorded (Mapping[str, NodeState | None]):
+            Every node as it is (or as of its tag).
+        nodes (Iterable[str]):
+            The nodes the plan changes.
+
+    Returns:
+        list[PortMove]:
+            By service.
+    """
+    named = set(nodes)
+
+    def published_by(
+        states: Mapping[str, NodeState | None],
+    ) -> dict[str, dict[str, tuple[Port, ...]]]:
+        """On the nodes the plan changes: service -> node -> its ports."""
+        found: dict[str, dict[str, tuple[Port, ...]]] = {}
+        for node, state in states.items():
+            if node not in named:
+                continue
+            for name, service in (state.services if state else {}).items():
+                ports = tuple(sorted(map(_plain, published(json.loads(service.config or "{}")))))
+                if ports:
+                    found.setdefault(name, {})[node] = ports
+        return found
+
+    before, after = published_by(recorded), published_by(desired)
+    return [
+        PortMove(name, tuple(sorted(before.get(name, {}).items())), tuple(sorted(was_now.items())))
+        for name in sorted(before.keys() | after.keys())
+        if (was_now := after.get(name, {})) != before.get(name, {})
+    ]
 
 
 def lab_clashes(desired: Desired) -> list[str]:

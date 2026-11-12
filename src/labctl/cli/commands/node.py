@@ -182,11 +182,10 @@ def status_cmd(targets: tuple[str, ...], **kwargs: Any) -> None:
     """Show each service's container state."""
 
     def show(t: Target, runs: Runs) -> int:
-        rows = [
-            [status.stack, *_status_row(status)]
-            for stack in t.stacks
-            for status in read_services(t.deployed.location, stack)
+        found = [
+            status for stack in t.stacks for status in read_services(t.deployed.location, stack)
         ]
+        rows = [[status.stack, *_status_row(status)] for status in found]
         if t.whole:
             rows += [
                 [name, _NO_FILE, "", status, ""]
@@ -215,6 +214,13 @@ def status_cmd(targets: tuple[str, ...], **kwargs: Any) -> None:
             body = table(["A"] * len(header))
         title = t.deployed.label(t.stacks[0]) if len(t.stacks) == 1 else t.deployed.node
         console.print(Panel(body, title=title, border_style="cyan"))
+        for status in found:
+            if status.looping:
+                how = "restarting" if status.state == "restarting" else "up less than 5 minutes"
+                console.print(
+                    f"[yellow]![/] {t.deployed.node}: {escape(status.service)} may be in a restart "
+                    f"loop ({how}, {status.restarts} restarts)"
+                )
         return 0
 
     _each_node(targets, show, labelled=False)
@@ -227,7 +233,8 @@ _NOT_CREATED = "not created"
 
 def _status_row(status: ServiceStatus) -> list[str]:
     name = status.service + ("" if status.configured else _ORPHAN)
-    return [name, status.state or _NOT_CREATED, status.status, status.image]
+    restarts = f" ({status.restarts} restarts)" if status.restarts else ""
+    return [name, status.state or _NOT_CREATED, status.status + restarts, status.image]
 
 
 def _flagged(value: str) -> str:

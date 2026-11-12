@@ -255,6 +255,8 @@ class Collected:
     node_files: dict[str, Mapping[str, str]] = field(default_factory=dict)
     node_names: dict[str, Mapping[str, str]] = field(default_factory=dict)
     projects: dict[str, frozenset[str]] = field(default_factory=dict)
+    # Of those, the ones whose files are gone (from DEPLOY_DIR, or into a data folder): trash.
+    gone: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # For each node read: what runs there (see runtime.py).
     containers: dict[str, tuple[Container, ...]] = field(default_factory=dict)
     listeners: dict[str, tuple[Listener, ...] | None] = field(default_factory=dict)
@@ -542,6 +544,7 @@ def _collect_remote(
     result.node_files[node] = on_node.files
     result.node_names[node] = on_node.names
     result.projects[node] = frozenset(on_node.projects)
+    result.gone[node] = tuple(sorted(set(on_node.projects) - set(state.stacks)))
 
     if applied is None:
         count, stacks = len(state.services), len(state.stacks)
@@ -851,11 +854,8 @@ def current_state(
     Returns:
         NodeState:
             Each top-level stack file (found by the rule the bundle uses), and each project with
-            containers that runs from other files.
-
-    Raises:
-        ComposeError:
-            A project has containers, but its files are not in DEPLOY_DIR.
+            containers that runs from other files. A project whose files are gone is left out:
+            it is trash (``Collected.gone``).
     """
     location = Location(str(folder), docker_cli=settings.docker_cli)
     files = [path.name for path in folder.iterdir() if path.is_file()]
@@ -864,13 +864,8 @@ def current_state(
     for name, paths in sorted(projects.items()):
         if name in known:
             continue
-        missing = [path for path in paths if not (folder / path).is_file()]
-        if missing:
-            raise ComposeError(
-                f"stack '{name}' has containers, but its files ({', '.join(missing)}) are not in "
-                "DEPLOY_DIR (or are in a data folder); take it down by hand"
-            )
-        stacks.append(Stack(name, paths))
+        if all((folder / path).is_file() for path in paths):
+            stacks.append(Stack(name, paths))
     resolved = resolve_stacks(location, stacks, dirs.deploy_dir)
     return reduce_stacks(node, resolved, dirs.appdata_dir, running=projects.keys())
 

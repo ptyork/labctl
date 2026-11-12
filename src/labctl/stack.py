@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import json
 import shlex
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from labctl.bundle import Location, discover_stacks, stack_args
@@ -85,6 +86,8 @@ class ServiceStatus:
     status: str  # e.g. "Up 3 hours (healthy)"
     image: str
     configured: bool  # False: a container left from a service no longer in the compose files
+    restarts: int = 0  # how often Docker restarted its container, by its restart policy
+    looping: bool = False  # it looks like a restart loop (see restart_loop)
 
 
 def stack_services(location: Location, stack: Stack) -> list[str]:
@@ -94,8 +97,47 @@ def stack_services(location: Location, stack: Stack) -> list[str]:
 
 def read_services(location: Location, stack: Stack) -> list[ServiceStatus]:
     """The stack's services and their containers."""
-    ps = location.compose(*stack_args(stack), "ps", "--all", "--format", "json")
-    return statuses(stack.name, stack_services(location, stack), ps_rows(ps))
+    rows = ps_rows(location.compose(*stack_args(stack), "ps", "--all", "--format", "json"))
+    names = [str(row["Name"]) for row in rows if row.get("Name")]
+    restarts = parse_restarts(location.run("sh", "-c", _RESTARTS, "sh", *names).stdout)
+    return statuses(stack.name, stack_services(location, stack), rows, restarts)
+
+
+# The node's clock, then per container: its name, RestartCount and when it last started.
+_RESTARTS = (
+    "date -u +%s; [ $# -gt 0 ] && docker inspect --format "
+    "'{{.Name}} {{.RestartCount}} {{.State.StartedAt}}' \"$@\" 2>/dev/null; true"
+)
+# A restart loop: restarting now, or restarted this often and up for less than this long.
+LOOP_RESTARTS = 3
+LOOP_WINDOW = 300  # seconds
+
+
+def parse_restarts(output: str) -> dict[str, tuple[int, int]]:
+    """_RESTARTS's output: container name -> (restarts, seconds up)."""
+    lines = output.split("\n")
+    if not lines or not lines[0].strip().isdigit():
+        return {}
+    now = int(lines[0].strip())
+    found = {}
+    for line in lines[1:]:
+        fields = line.split()
+        if len(fields) != 3 or not fields[1].isdigit():
+            continue
+        try:
+            started = datetime.strptime(fields[2][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        found[fields[0].lstrip("/")] = (int(fields[1]), max(now - int(started.timestamp()), 0))
+    return found
+
+
+def restart_loop(state: str, restarts: int, up: int) -> bool:
+    """Whether a container looks like it is in a restart loop: Docker is restarting it now, or it
+    restarted at least LOOP_RESTARTS times and has been up less than LOOP_WINDOW seconds."""
+    if state == "restarting":
+        return True
+    return state == "running" and restarts >= LOOP_RESTARTS and up < LOOP_WINDOW
 
 
 def unbacked_projects(deployed: Deployed) -> dict[str, str]:
@@ -115,27 +157,47 @@ def unbacked_projects(deployed: Deployed) -> dict[str, str]:
 
 
 def statuses(
-    stack: str, configured: list[str], containers: list[dict[str, Any]]
+    stack: str,
+    configured: list[str],
+    containers: list[dict[str, Any]],
+    restarts: Mapping[str, tuple[int, int]] | None = None,
 ) -> list[ServiceStatus]:
+    """
+    Each service of a stack with its container (configured first, then containers left over).
+
+    Args:
+        stack (str):
+            The stack.
+        configured (list[str]):
+            The services its files define.
+        containers (list[dict[str, Any]]):
+            `compose ps` rows.
+        restarts (Mapping[str, tuple[int, int]] | None):
+            Container name -> (restarts, seconds up), from parse_restarts (default: none).
+
+    Returns:
+        list[ServiceStatus]:
+            By service name.
+    """
     by_service = {container["Service"]: container for container in containers}
-    found = [
-        ServiceStatus(
+    restarts = restarts or {}
+
+    def status(name: str, container: Mapping[str, Any], in_files: bool) -> ServiceStatus:
+        state = str(container.get("State", ""))
+        count, up = restarts.get(str(container.get("Name", "")), (0, 0))
+        return ServiceStatus(
             stack,
             name,
-            by_service.get(name, {}).get("State", ""),
-            by_service.get(name, {}).get("Status", ""),
-            by_service.get(name, {}).get("Image", ""),
-            True,
+            state,
+            str(container.get("Status", "")),
+            str(container.get("Image", "")),
+            in_files,
+            count,
+            restart_loop(state, count, up),
         )
-        for name in configured
-    ]
-    found += [
-        ServiceStatus(
-            stack, name, c.get("State", ""), c.get("Status", ""), c.get("Image", ""), False
-        )
-        for name, c in by_service.items()
-        if name not in configured
-    ]
+
+    found = [status(name, by_service.get(name, {}), True) for name in configured]
+    found += [status(name, c, False) for name, c in by_service.items() if name not in configured]
     return sorted(found, key=lambda s: s.service)
 
 

@@ -181,6 +181,29 @@ def test_second_instance_starts_without_data() -> None:
     assert not plan.problems
 
 
+def test_second_instance_with_a_volume_named_by_its_stack_is_a_duplicate_too() -> None:
+    """Volume names carry the project: frodo's and cirdan's differ, so no data group links them;
+    the container path does."""
+    on_frodo = Service(
+        "pg", (), ("homelab-frodo_db",), "pg-v1", mounts=(("/data", "volume:homelab-frodo_db"),)
+    )
+    on_cirdan = Service(
+        "pg", (), ("homelab-cirdan_db",), "pg-v1", mounts=(("/data", "volume:homelab-cirdan_db"),)
+    )
+    plan = make_plan(
+        homelab(frodo=[on_frodo], cirdan=[on_cirdan]), homelab(frodo=[on_frodo], cirdan=[])
+    )
+    assert plan.operations == (Add("pg", "cirdan"),)
+    assert plan.notices == (
+        NotMigrated(
+            ("volume:homelab-frodo_db",), "frodo", "duplicate", (("pg", "cirdan"),), kept=("pg",)
+        ),
+    )
+    # Bind data named alike is linked by its data group: one notice, not two.
+    plan = make_plan(homelab(frodo=[PLEX], cirdan=[PLEX]), homelab(frodo=[PLEX], cirdan=[]))
+    assert len(plan.notices) == 1
+
+
 def test_moving_one_of_two_services_that_share_data_needs_confirmation() -> None:
     plan = make_plan(
         homelab(frodo=[NB_DB], cirdan=[NB_API]),
