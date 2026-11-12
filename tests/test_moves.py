@@ -311,15 +311,14 @@ def test_renamed_data_of_a_removed_service_follows_the_move() -> None:
     assert Add("plex", "frodo") not in plan.operations
 
 
-def test_moves_on_a_skipped_node_are_held() -> None:
+def test_moves_on_a_skipped_node_are_left_out() -> None:
     from labctl.state import Scope
 
     have = states(frodo=[svc("plex", "a", config="plexms")])
     want = states(frodo=[svc("plex", "b", config="plex")])
     moves = plan_moves(want, have, dirs_for("frodo"), dirs_for("frodo"))
     plan = make_plan(want, have, Scope(frozenset({"frodo"})), move_plan=moves)
-    assert plan.moves == ()
-    assert [h.operation for h in plan.held] == [moves.moves[0], Update("plex", "frodo")]
+    assert (plan.moves, plan.operations, plan.problems) == ((), (), ())
 
 
 def test_root_and_rename_together_rename_in_the_new_root() -> None:

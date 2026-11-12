@@ -35,7 +35,7 @@ from labctl.planner import (
     Migrate,
     MissingBaseline,
     NotMigrated,
-    Operation,
+    NotNamed,
     Plan,
     Problem,
     Remove,
@@ -63,6 +63,11 @@ def render_nodes(collected: Collected) -> None:
     console.print(f"Nodes included:  {', '.join(included) or 'none'}")
     if skipped:
         console.print(f"Nodes skipped:   {', '.join(skipped)}")
+    for node, why in sorted(collected.unread.items()):
+        console.print(
+            f"[yellow]![/] {node} not read ({escape(why)}): planned as of its last apply",
+            highlight=False,
+        )
 
 
 def render_problems(
@@ -82,6 +87,13 @@ def render_problems(
                 )
             case MoveConflict(node, message):
                 console.print(f"  [red]✗[/] {node}: {escape(message)}")
+            case NotNamed(migrate, missing):
+                services = ", ".join(migrate.added)
+                console.print(
+                    f"  [red]✗[/] {services} moves {migrate.source} → {migrate.target}: name "
+                    f"{missing} too, or start {'it' if len(migrate.added) == 1 else 'them'} "
+                    f"fresh with --no-migrate {migrate.added[0]}"
+                )
     for node, names in sorted(placeholders.items()):
         console.print(f"  [red]✗[/] {node}: no value for {', '.join(names)}")
 
@@ -349,16 +361,20 @@ def render_runtime(runtime: Runtime) -> None:
         )
 
 
-def render_moves(plan: Plan, probes: dict[str, dict[str, PathInfo]]) -> None:
+def render_moves(plan: Plan, probes: dict[str, dict[str, PathInfo]], verbose: bool = False) -> None:
     if not plan.moves:
         return
     console.print("\n[bold]Moves[/] (run first, in this order; affected services restart)")
     for move, source, target in move_paths(plan.moves):
-        console.print("  " + _describe_move(move, probes, source, target))
+        console.print("  " + _describe_move(move, probes, source, target, verbose))
 
 
 def _describe_move(
-    move: Move, probes: dict[str, dict[str, PathInfo]], source: str = "", target: str = ""
+    move: Move,
+    probes: dict[str, dict[str, PathInfo]],
+    source: str = "",
+    target: str = "",
+    verbose: bool = False,
 ) -> str:
     if move.kind == DATA:
         return (
@@ -384,45 +400,14 @@ def _describe_move(
     dst = probes.get(move.node, {}).get(target)
     if src and src.size is not None:
         details.append(human_size(src.size))
-    if src and dst and src.device and dst.device:
+    if verbose and src and dst and src.device and dst.device:
+        # How it moves (a rename, or a copy that is checked) is apply's business.
         details.append(
             "same filesystem: a rename"
             if src.device == dst.device
-            else "[yellow]other filesystem: a full copy[/]"
+            else "another filesystem: copied, checked, then the old one deleted"
         )
     return f"{head} ({'; '.join(details)})" if details else head
-
-
-def render_held(plan: Plan, collected: Collected) -> None:
-    """Operations that touch a node not named: left for when it is."""
-    if not plan.held:
-        return
-    console.print("\n[bold]Held (touch a node not named)[/]")
-    for held in plan.held:
-        console.print(
-            f"  - {_describe(held.operation, collected)} (skipped: {', '.join(held.skipped)})"
-        )
-
-
-def _describe(op: Operation | Move, collected: Collected) -> str:
-    """One operation in a line, for the held ones."""
-    match op:
-        case Move():
-            return _describe_move(op, {}).removeprefix("- ")
-        case Add(service, node):
-            return f"add {service} on {_on(collected.desired[node].state, service)}"
-        case Remove(service, node):
-            return f"remove {service} from {_on(collected.recorded.get(node), service, node)}"
-        case Update(service, node):
-            return f"update {service} on {_on(collected.desired[node].state, service)}"
-        case Migrate(_, source, target, removed, added):
-            names = ", ".join(added)
-            if removed != added:
-                names = f"{', '.join(removed)} → {names}"
-            return f"migrate {names} {source} → {target}"
-        case Restore(service, node, source, stamp):
-            return f"restore {service} on {node} from {source}'s archive {stamp}"
-    return str(op)
 
 
 def _migrate_details(
@@ -462,15 +447,6 @@ def _migrate_details(
 def _secrets(collected: Collected) -> frozenset[str]:
     """Every secret value the plan may come across: masked wherever it would be shown."""
     return frozenset().union(*(desired.env.secret_values for desired in collected.desired.values()))
-
-
-def _on(state: NodeState | None, service: str, node: str = "") -> str:
-    """The node, or node/stack when the node has several stacks."""
-    if state is None:
-        return node
-    if state.multi_stack and service in state.services:
-        return f"{state.node}/{state.services[service].stack}"
-    return state.node
 
 
 def _remove_note(op: Remove, collected: Collected) -> str:
@@ -647,8 +623,6 @@ def render_summary(plan: Plan, files_changed: int, reasons: list[str], conflicts
     real_moves = [move for move in plan.moves if not move.carried]
     if real_moves:
         parts.insert(0, f"{len(real_moves)} move{'s' if len(real_moves) > 1 else ''}")
-    if plan.held:
-        parts.append(f"{len(plan.held)} held")
     parts.append(f"{len(plan.unchanged)} unchanged")
     if files_changed:
         parts.append(f"files differ on {files_changed} node{'s' if files_changed > 1 else ''}")

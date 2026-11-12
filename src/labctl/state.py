@@ -144,8 +144,8 @@ class NodeState:
 class Scope:
     """Which nodes a run may contact and change.
 
-    Skipped nodes (not named, or unreachable) are still planned against (as of their latest apply
-    tag), but any operation that touches one is held.
+    Skipped nodes (not named) are still read and planned against, but never changed; a migrate
+    between a named node and a skipped one blocks the plan.
     """
 
     skipped: frozenset[str] = frozenset()

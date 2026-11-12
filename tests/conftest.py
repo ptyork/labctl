@@ -3,9 +3,11 @@ from __future__ import annotations
 import subprocess
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from labctl.remote import Unreachable
 from labctl.repo import ConfigRepo
 
 
@@ -38,3 +40,14 @@ def make_repo() -> MakeRepo:
         return ConfigRepo.open(root)
 
     return make
+
+
+@pytest.fixture(autouse=True)
+def no_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests never reach a real node: collect finds every node unreachable unless a test says
+    otherwise (by replacing read_node)."""
+
+    def unreachable(remote: Any, *args: Any) -> Any:
+        raise Unreachable(f"{remote.host}: not in tests")
+
+    monkeypatch.setattr("labctl.collect.read_node", unreachable)

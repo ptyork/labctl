@@ -15,7 +15,8 @@ One run, in phases across the nodes it changes:
 2. per node:
    a. stop: take down the stacks that go away (all of them when anything moves on the node), if
       they have containers;
-   b. moves: root moves and data renames (plain renames: same filesystem only); a rename with a
+   b. moves: root moves and data renames (a rename; to another filesystem, a checked copy whose
+      original is deleted once the whole apply succeeded); a rename with a
       volume on either side (a service in another stack mounts another volume) is a copy;
    c. files: every top-level name in DEPLOY_DIR except .labctl and data goes to
       DEPLOY_DIR/.labctl/previous/ (the config backup), the bundle takes their place;
@@ -101,6 +102,8 @@ from labctl.state import (
     volume_name,
 )
 
+logger = logging.getLogger(__name__)
+
 # $1: DEPLOY_DIR, then the names to set aside. The bundle is in .labctl/incoming.
 _SWAP_IN = """\
 set -e
@@ -133,13 +136,12 @@ HELPER = (
     "debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3"
 )
 
-# In the helper: $1 to $2, a rename on one filesystem; $2's parents are created.
+# In the helper: $1 to $2 when one filesystem holds both (a rename); else it only says
+# "elsewhere". $2's parents are created.
 _MOVE = """\
 set -e
 mkdir -p "$(dirname "$2")"
-if [ "$(stat -c %d "$1")" != "$(stat -c %d "$(dirname "$2")")" ]; then
-  echo "different filesystems: moving across filesystems is not supported yet" >&2; exit 3
-fi
+if [ "$(stat -c %d "$1")" != "$(stat -c %d "$(dirname "$2")")" ]; then echo elsewhere; exit 0; fi
 mv -T -- "$1" "$2"
 """
 
@@ -272,6 +274,8 @@ class Node:
     def __init__(self, remote: Remote) -> None:
         self.remote = remote
         self.name = remote.host
+        # Directories moved to another filesystem: copied, and deleted once the apply succeeded.
+        self.moved_away: list[str] = []
 
     def run(self, *args: str, cwd: str = "/") -> str:
         result = execute(args, cwd, self.remote)
@@ -325,11 +329,63 @@ class Node:
             "docker", "run", "--rm", "-v", mount, HELPER, "sh", "-c", script, "sh", *args
         )
 
-    def move(self, now: str, new: str) -> None:
-        """Rename a directory (as root: app data is often root-owned). Only a rename: both paths
-        must be on one filesystem. Parents of ``new`` are created."""
+    def move(self, now: str, new: str) -> Callable[[], object]:
+        """
+        Move a directory (as root: app data is often root-owned). Parents of ``new`` are created.
+
+        On one filesystem it is a rename. To another, it is copied and checked, and ``now`` stays
+        until the apply has succeeded (``delete_moved_away``), so undoing only drops the copy.
+
+        Args:
+            now (str):
+                The directory.
+            new (str):
+                Where it goes (nothing there yet).
+
+        Returns:
+            Callable[[], object]:
+                What undoes the move.
+
+        Raises:
+            ApplyError:
+                It failed, or the copy differs from the original (the copy is removed).
+        """
         root = posixpath.commonpath([now, new])
-        self.helper(root, _MOVE, *(f"/x/{posixpath.relpath(path, root)}" for path in (now, new)))
+        inside = [f"/x/{posixpath.relpath(path, root)}" for path in (now, new)]
+        if self.helper(root, _MOVE, *inside).strip() != "elsewhere":
+            return partial(self.move, new, now)
+        logger.debug(
+            "%s: %s and %s are on different filesystems: copy and check", self.name, now, new
+        )
+        if root in (now, new):
+            raise ApplyError(f"{self.name}: cannot move {now} to {new}: one is inside the other")
+        self.copy(now, new)
+        if self.sums(now) != self.sums(new):
+            self.remove(new)
+            raise ApplyError(f"{self.name}: the copy of {now} at {new} differs from the original")
+        self.moved_away.append(now)
+        return partial(self._drop_copy, now, new)
+
+    def _drop_copy(self, now: str, new: str) -> None:
+        self.remove(new)
+        self.moved_away.remove(now)
+
+    def remove(self, path: str) -> None:
+        """Delete a directory (as root)."""
+        folder, name = posixpath.split(path)
+        self.helper(folder, 'rm -rf -- "/x/$1"', name)
+
+    def delete_moved_away(self) -> list[str]:
+        """Delete the originals of the directories copied to another filesystem. Returns the
+        problems (the apply has succeeded: they are only reported)."""
+        problems = []
+        for path in self.moved_away:
+            try:
+                self.remove(path)
+            except ApplyError as exc:
+                problems.append(f"{path} was copied, but is still there: {exc}")
+        self.moved_away = []
+        return problems
 
     def data_state(self, appdata: str, key: str) -> str:
         """ "missing", "empty" or "data" for APPDATA_DIR/key."""
@@ -485,6 +541,9 @@ class Executor:
                     self._node(nodes[work.node], work, undo)
                 for work in changes:
                     self._archive(nodes[work.node], work, undo)
+            for node in nodes.values():
+                for problem in node.delete_moved_away():
+                    self.say(f"[yellow]![/] {node.name}: {escape(problem)}")
             self.say("")
             for work in works:
                 done = "recorded (nothing to change)" if work.record_only else "applied"
@@ -750,13 +809,8 @@ class Executor:
                         f"migrate {label}: {dst_root}/{new_key} already has data (--replace-stale)"
                     )
                 aside = f"{dst_root}/{ARCHIVE_DIR}/{new_key}-{self.stamp}"
-                target.move(f"{dst_root}/{new_key}", aside)
-                undo.append(
-                    (
-                        f"restore {new_key} on {op.target}",
-                        partial(target.move, aside, f"{dst_root}/{new_key}"),
-                    )
-                )
+                back = target.move(f"{dst_root}/{new_key}", aside)
+                undo.append((f"restore {new_key} on {op.target}", back))
                 self._sidecar(target, dst_root, new_key, "replaced", dst.old_services)
             elif state == "empty":
                 target.helper(dst_root, 'rmdir "/x/$1"', new_key)
@@ -825,10 +879,8 @@ class Executor:
         if state == "data":
             self._refuse_stale(node, key)
             aside = f"{root}/{ARCHIVE_DIR}/{key}-{self.stamp}"
-            node.move(f"{root}/{key}", aside)
-            undo.append(
-                (f"restore {key} on {node.name}", partial(node.move, aside, f"{root}/{key}"))
-            )
+            back = node.move(f"{root}/{key}", aside)
+            undo.append((f"restore {key} on {node.name}", back))
             self._sidecar(node, root, key, "replaced", work.old_services)
         elif state == "empty":
             node.helper(root, 'rmdir "/x/$1"', key)
@@ -866,13 +918,8 @@ class Executor:
             )
             if op.source == op.node and not is_volume(key):
                 self._clear(target, root, key, undo, work)
-                target.move(archived, f"{root}/{key}")
-                undo.append(
-                    (
-                        f"put {entry} back in {op.node}'s archive",
-                        partial(target.move, f"{root}/{key}", archived),
-                    )
-                )
+                back = target.move(archived, f"{root}/{key}")
+                undo.append((f"put {entry} back in {op.node}'s archive", back))
                 # Its description stays, renamed: the entry is no longer in the archive.
                 folder, name = posixpath.split(archived)
                 done = f"{SIDECAR}.restored"
@@ -935,9 +982,9 @@ class Executor:
         )
 
     @staticmethod
-    def _unarchive(node: Node, entry: str, path: str) -> None:
-        """An archived directory back where it was; its sidecar goes."""
-        node.move(entry, path)
+    def _unarchive(node: Node, entry: str, back: Callable[[], object]) -> None:
+        """An archived directory back where it was (``back`` undoes its move); its sidecar goes."""
+        back()
         folder, name = posixpath.split(entry)
         node.helper(folder, f'rm -f -- "/x/$1{SIDECAR}"', name)
 
@@ -1012,8 +1059,8 @@ class Executor:
                 continue
             node.log(f"move {now} -> {new}")
             with self.steps.step(work.node, f"move {now} → {new}"):
-                node.move(now, new)
-            undo.append((f"move {new} back", partial(node.move, new, now)))
+                back = node.move(now, new)
+            undo.append((f"move {new} back", back))
 
         # c. Files. On undo, once the old files are back, the stacks that kept their containers and
         # are brought up below come back as they were (compose recreates what apply changed).
@@ -1165,9 +1212,9 @@ class Executor:
                 continue
             new = f"{appdata}/{ARCHIVE_DIR}/{key}-{self.stamp}"
             node.log(f"archive {now}")
-            node.move(now, new)
+            back = node.move(now, new)
             undo.append(
-                (f"unarchive {key} on {work.node}", partial(self._unarchive, node, new, now))
+                (f"unarchive {key} on {work.node}", partial(self._unarchive, node, new, back))
             )
             self._sidecar(node, appdata, key, reason, work.old_services)
             archived.append(f"{key}/")

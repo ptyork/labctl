@@ -5,7 +5,7 @@ from __future__ import annotations
 import getpass
 import socket
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import partial
@@ -46,7 +46,6 @@ from labctl.cli.render import (
     render_drift,
     render_files,
     render_findings,
-    render_held,
     render_moves,
     render_nodes,
     render_notices,
@@ -86,9 +85,9 @@ from labctl.state import Scope
 def plan_cmd(options: Options, **kwargs: Any) -> None:
     """Show what apply would change on the nodes named, or 'all' (apply --dry-run).
 
-    Plans the lab config as it is now, uncommitted changes included. The nodes not named are
-    planned too (as of their last apply tag), so a service moving between them is seen; what
-    touches them is held. Never changes a node.
+    Plans the lab config as it is now, uncommitted changes included. The nodes not named are read
+    too, so a service moving between them is seen: a migrate needs both of its nodes named. Never
+    changes a node.
     """
     _run(options, dry_run=True)
 
@@ -353,9 +352,10 @@ class Planned:
 def _files(collected: Collected) -> object:
     return (
         {node: d.files for node, d in collected.desired.items()},
-        dict(collected.node_files),
-        dict(collected.node_names),
-        dict(collected.projects),
+        # Only the named nodes': the others are only looked at.
+        _named(collected.node_files, collected.scope),
+        _named(collected.node_names, collected.scope),
+        _named(collected.projects, collected.scope),
     )
 
 
@@ -372,16 +372,19 @@ class Computed:
 
 
 def _restores(collected: Collected, plan: Plan, options: Options, ask: Ask | None) -> Restores:
-    """Archived data for the services added: found on the nodes read (only when one is
-    stateful)."""
+    """Archived data for the services added: found on every node read, named or not (only when
+    one is stateful)."""
     states = {node: d.state for node, d in collected.desired.items()}
     adds = [op for op in plan.operations if isinstance(op, Add)]
     if not any(states[op.node].services[op.service].stateful for op in adds):
         return Restores((), (), (), (), ())
     roots = {
-        node: d.dirs.appdata_dir
+        # A node not named keeps its archive where its last apply put it.
+        node: (
+            d.dirs if collected.scope.in_scope(node) else collected.recorded_dirs[node]
+        ).appdata_dir
         for node, d in collected.desired.items()
-        if collected.scope.in_scope(node)
+        if node in collected.containers  # read
     }
     archived = find_archives(roots, node_remote)
     return plan_restores(plan, states, archived, options.fresh, options.restore, ask)
@@ -422,9 +425,9 @@ def _compute(collected: Collected, options: Options, ask: Ask | None = None) -> 
         collected.desired,
         collected.recorded,
         plan,
-        containers=collected.containers,
-        listeners=collected.listeners,
-        missing=collected.missing,
+        containers=_named(collected.containers, scope),
+        listeners=_named(collected.listeners, scope),
+        missing=_named(collected.missing, scope),
         work={work.node for work in works or () if not work.record_only},
     )
     with_runtime = (
@@ -469,8 +472,7 @@ def _plan_and_render(
     render_drift(collected)
     files_changed = render_files(collected, scope, options.verbose)
     render_stacks(plan, collected, runtime, work_nodes, probes, options.verbose)
-    render_moves(plan, probes)
-    render_held(plan, collected)
+    render_moves(plan, probes, options.verbose)
     for note in restores.notes:
         console.print(f"  [cyan]i[/] {escape(note)}")
     for error in restores.errors:
@@ -514,8 +516,6 @@ def _plan_and_render(
         confirm.append(f"{len(findings)} check{'s' if len(findings) > 1 else ''}")
     if plan.notices:
         confirm.append(f"{len(plan.notices)} notice{'s' if len(plan.notices) > 1 else ''}")
-    if plan.held:
-        confirm.append("held operations")
     if shared:
         confirm.append("remote storage newly shared between nodes")
     if collected.drift:
@@ -538,6 +538,11 @@ def _plan_and_render(
         collected.base,
         options,
     )
+
+
+def _named[T](found: Mapping[str, T], scope: Scope) -> dict[str, T]:
+    """Of what was read on each node, the named nodes': only they are analysed for apply."""
+    return {node: value for node, value in found.items() if scope.in_scope(node)}
 
 
 def _source(collected: Collected, node: str) -> str:

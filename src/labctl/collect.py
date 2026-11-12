@@ -19,9 +19,11 @@ With the files comes what runs: every container on the node, and the ports held 
 (runtime.py decides what that means for apply).
 
 The desired bundles come from the config repo (repo.py): the working tree for plan, a commit for
-apply. applied.json names the commit and the apply tag. A node that is not named is not read: it is
-planned against its latest apply tag, that commit's tree rebuilt like a bundle. A named node that
-cannot be reached is an error: nothing is planned.
+apply. applied.json names the commit and the apply tag. Every node is read, all at the same time.
+A node that is not named is only looked at (its lock and its edits are not this plan's business);
+one that cannot be read (ssh waits NOT_NAMED_TIMEOUT for it) is planned against its latest apply
+tag, that commit's tree rebuilt like a bundle. A named node that cannot be reached is an error:
+nothing is planned.
 There is no state on this machine.
 
 A node labctl never applied to is planned against what its DEPLOY_DIR has now (nothing, if it does
@@ -38,6 +40,7 @@ import json
 import posixpath
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -56,7 +59,15 @@ from labctl.bundle import (
 )
 from labctl.compose import ComposeError, reduce_stacks
 from labctl.envfile import EnvError, Prompt
-from labctl.remote import MARK, Remote, RemoteError, Unreachable, node_remote, sections
+from labctl.remote import (
+    CONNECT_TIMEOUT,
+    MARK,
+    Remote,
+    RemoteError,
+    Unreachable,
+    node_remote,
+    sections,
+)
 from labctl.repo import ConfigRepo, RepoError, TagInfo
 from labctl.runtime import (
     CONTAINER_FORMAT,
@@ -83,6 +94,8 @@ UNREAD = "-"
 # Where the source tree is exported in the work folder (node names never start with a dot).
 _TREE = ".tree"
 _BASELINES = ".baselines"
+# Seconds ssh waits for a node not named: it is only looked at.
+NOT_NAMED_TIMEOUT = 2
 
 _MOUNTS = '{{range .Mounts}}{{if eq .Type "bind"}}{{println .Source}}{{end}}{{end}}'
 
@@ -240,6 +253,8 @@ class Collected:
     reports: list[NodeReport] = field(default_factory=list)
     drift: list[Drift] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)  # fatal: unreachable, unreadable
+    # The nodes not named that could not be read (planned as of their apply tag), and why.
+    unread: dict[str, str] = field(default_factory=dict)
     # For each reachable node: its files, its top-level names, and the projects with containers.
     node_files: dict[str, Mapping[str, str]] = field(default_factory=dict)
     node_names: dict[str, Mapping[str, str]] = field(default_factory=dict)
@@ -278,7 +293,8 @@ def collect(
         settings (Settings):
             labctl's settings (the lab config, the docker CLI).
         scope (Scope):
-            The nodes named: read live; the others are planned as of their latest apply tag.
+            The nodes named. The others are read too, but only looked at; one that cannot be read
+            is planned as of its latest apply tag.
         secrets (Secrets):
             The values for ``_SECRET_`` variables.
         prompt (Prompt | None):
@@ -312,36 +328,99 @@ def collect(
         if tree is not None and any(wanted.env.new_node_vars for wanted in desired.values()):
             tree = repo.snapshot()  # with the answers just written to node.env
         result = Collected(desired=desired, recorded={}, tree=tree, base=repo.head())
+        reads = _read_all(settings, nodes, desired, work, scope)
         for node in nodes:
-            if not scope.in_scope(node):
-                _collect_baseline(result, settings, node, repo, work, "not named", secrets)
-                continue
+            named = scope.in_scope(node)
             why = _collect_remote(
-                result, settings, node, desired[node], work, locked, repo, result.base
+                result,
+                settings,
+                node,
+                desired[node],
+                work,
+                locked,
+                repo,
+                result.base,
+                named,
+                reads[node],
             )
-            if why:
+            if why and named:
                 result.errors.append(f"{node} is unreachable ({why})")
+            elif why:
+                # ssh's last words say it ("Connection timed out", "No route to host").
+                down = reads[node].unreachable
+                result.unread[node] = f"unreachable: {down.rsplit(': ', 1)[-1]}" if down else why
+                _collect_baseline(
+                    result, settings, node, repo, work, "not named, not read", secrets
+                )
         result.scope = scope
         yield result
 
 
-def _collect_remote(
-    result: Collected,
+@dataclass(frozen=True)
+class NodeRead:
+    """What reading a node found: its DEPLOY_DIR and stacks, or why it could not be read."""
+
+    node: str
+    on_node: OnNode | None = None
+    home: str = ""  # where its files were read (the pointer's DEPLOY_DIR, when followed)
+    moved_from: str = ""  # the old DEPLOY_DIR the pointer led to ("": not followed)
+    state: NodeState | None = None  # its stacks (None: no DEPLOY_DIR yet)
+    unreachable: str = ""  # why ssh could not reach it
+    error: str = ""  # why it could not be read
+
+
+def _read_all(
+    settings: Settings,
+    nodes: Sequence[str],
+    desired: Mapping[str, Desired],
+    work: Path,
+    scope: Scope,
+) -> dict[str, NodeRead]:
+    """Every node, read at the same time. A node not named gets less time to answer: it is only
+    looked at, and one that is down should not hold up the plan."""
+    with ThreadPoolExecutor(max_workers=max(len(nodes), 1)) as pool:
+        futures = {
+            node: pool.submit(
+                read_remote,
+                settings,
+                node,
+                desired[node],
+                work,
+                CONNECT_TIMEOUT if scope.in_scope(node) else NOT_NAMED_TIMEOUT,
+            )
+            for node in nodes
+        }
+        return {node: future.result() for node, future in futures.items()}
+
+
+def read_remote(
     settings: Settings,
     node: str,
     desired: Desired,
     workdir: Path,
-    locked: bool = False,
-    repo: ConfigRepo | None = None,
-    base: str = "",
-) -> str:
-    """Read the node into ``result``. Returns why it cannot be reached, or "" when it was.
+    connect_timeout: int = CONNECT_TIMEOUT,
+) -> NodeRead:
+    """
+    Read a node: its DEPLOY_DIR and what runs there (read-only; runs alongside other nodes').
 
-    With ``repo``, the node's recorded commit is checked against ``base`` (the commit planned), and
-    a missing apply tag its record names is recreated.
+    Args:
+        settings (Settings):
+            labctl's settings (the docker CLI).
+        node (str):
+            The node.
+        desired (Desired):
+            Its bundle (where DEPLOY_DIR is, and the names in it that are data).
+        workdir (Path):
+            Where its stack files are downloaded.
+        connect_timeout (int):
+            Seconds ssh waits for the node (default: CONNECT_TIMEOUT).
+
+    Returns:
+        NodeRead:
+            What was found, or why it was not.
     """
     home = desired.dirs.deploy_dir
-    remote = node_remote(node)
+    remote = node_remote(node, connect_timeout)
     data = data_names(desired)
     try:
         on_node = read_node(remote, home, desired.top_level, data)
@@ -354,16 +433,57 @@ def _collect_remote(
             if at_old.applied is not None and at_old.applied.owner in ("", node):
                 on_node, home, moved_from = at_old, on_node.pointer, on_node.pointer
     except Unreachable as exc:
-        return str(exc).removeprefix(f"{node}: ")
+        return NodeRead(node, unreachable=str(exc).removeprefix(f"{node}: "))
     except (RemoteError, ComposeError) as exc:
-        result.errors.append(f"{node}: {exc}")
-        return ""
-    if on_node.lock is not None and not locked:
+        return NodeRead(node, error=str(exc))
+    if not on_node.exists:
+        return NodeRead(node, on_node, home, moved_from)
+    dirs = on_node.applied.dirs if on_node.applied else desired.dirs
+    folder = workdir / f"{node}.current" / (PurePosixPath(home).name or "docker")
+    try:
+        fetch_stack_files(remote, home, on_node, desired.top_level, folder)
+        state = current_state(settings, node, folder, dirs, on_node.projects)
+    except (RemoteError, ComposeError) as exc:
+        return NodeRead(
+            node, on_node, home, moved_from, error=f"cannot read the stacks in {home}: {exc}"
+        )
+    return NodeRead(node, on_node, home, moved_from, state)
+
+
+def _collect_remote(
+    result: Collected,
+    settings: Settings,
+    node: str,
+    desired: Desired,
+    workdir: Path,
+    locked: bool = False,
+    repo: ConfigRepo | None = None,
+    base: str = "",
+    named: bool = True,
+    read: NodeRead | None = None,
+) -> str:
+    """Read the node into ``result``. Returns why it cannot be reached, or "" when it was.
+
+    With ``repo``, the node's recorded commit is checked against ``base`` (the commit planned), and
+    a missing apply tag its record names is recreated. A node not named (``named`` False) is only
+    looked at: its lock and edits are not its plan's business, and a node that cannot be read is
+    not an error (why is returned, and it is planned as of its tag). ``read``: already read.
+    """
+    found = read or read_remote(settings, node, desired, workdir)
+    if found.unreachable:
+        return found.unreachable
+    if found.error and not named:
+        return found.error
+    on_node, home = found.on_node, found.home
+    if on_node is not None and on_node.lock is not None and not locked and named:
         done = "; ".join(on_node.lock) or "nothing recorded"
         result.errors.append(
             f"{node}: an apply holds ~/{LOCK} (running now, or interrupted). Its log: {done}. "
             f"Once nothing runs there and the node is checked, remove ~/{LOCK}"
         )
+        return ""
+    if found.error or on_node is None:
+        result.errors.append(f"{node}: {found.error}")
         return ""
     result.containers[node] = on_node.containers
     result.listeners[node] = on_node.listeners
@@ -375,18 +495,10 @@ def _collect_remote(
             NodeReport(node, "first", f"never applied; {home} does not exist yet")
         )
         return ""
-
     applied = on_node.applied
-    dirs = applied.dirs if applied else desired.dirs
-    folder = workdir / f"{node}.current" / (PurePosixPath(home).name or "docker")
-    try:
-        fetch_stack_files(remote, home, on_node, desired.top_level, folder)
-        state = current_state(settings, node, folder, dirs, on_node.projects)
-    except (RemoteError, ComposeError) as exc:
-        result.errors.append(f"{node}: cannot read the stacks in {home}: {exc}")
-        return ""
+    state = found.state or NodeState.of(node)
     result.recorded[node] = state
-    result.recorded_dirs[node] = dirs
+    result.recorded_dirs[node] = applied.dirs if applied else desired.dirs
     result.node_files[node] = on_node.files
     result.node_names[node] = on_node.names
     result.projects[node] = frozenset(on_node.projects)
@@ -402,9 +514,14 @@ def _collect_remote(
             )
         )
         return ""
-    where = f" at the old DEPLOY_DIR {moved_from}" if moved_from else ""
+    where = f" at the old DEPLOY_DIR {found.moved_from}" if found.moved_from else ""
     result.applied[node] = applied
     detail = f"applied {applied.applied_at}{where}"
+    if not named:
+        if applied.commit and repo is not None:
+            detail += f" from {applied.commit[:7]}{_behind(repo, applied.commit, base)}"
+        result.reports.append(NodeReport(node, "node", f"not named; {detail}"))
+        return ""
     if not applied.commit:
         detail += " (before git tracking)"
         result.untracked.add(node)

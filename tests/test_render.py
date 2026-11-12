@@ -9,7 +9,7 @@ from labctl.bundle import Desired
 from labctl.cli import render
 from labctl.collect import Collected
 from labctl.envfile import CompiledEnv
-from labctl.planner import Plan, Update
+from labctl.planner import Migrate, NotNamed, Plan, Update
 from labctl.state import NodeState, Scope, Service, Stack
 
 ENV = CompiledEnv(values={"DEPLOY_DIR": "/srv/docker", "APPDATA_DIR": "/srv/appdata"})
@@ -70,4 +70,27 @@ def test_stacks_list_what_changes_under_the_stack_it_ends_up_in(shown: Console) 
         "  - bilbo/docker (remove)\n"
         "  - bilbo/homelab-bilbo (add)\n"
         "    * update:  npm (move from bilbo/docker)\n"
+    )
+
+
+def test_a_migrate_with_a_node_not_named_says_what_to_do(shown: Console) -> None:
+    plex = Migrate(("plexms",), "bilbo", "cirdan", ("plex",), ("plex",))
+    render.render_problems((NotNamed(plex, "bilbo"),), {})
+    assert (
+        "plex moves bilbo → cirdan: name bilbo too, or start it fresh with --no-migrate plex"
+        in (shown.export_text())
+    )
+
+
+def test_an_unread_node_not_named_is_one_line(shown: Console) -> None:
+    state = NodeState.of("bilbo")
+    collected = Collected(
+        desired={n: Desired(n, Path(), ENV, {}, state, {}) for n in ("bilbo", "cirdan")},
+        recorded={},
+        scope=Scope.build({"bilbo", "cirdan"}, ["cirdan"]),
+        unread={"bilbo": "unreachable: Connection timed out"},
+    )
+    render.render_nodes(collected)
+    assert shown.export_text().splitlines()[-1] == (
+        "! bilbo not read (unreachable: Connection timed out): planned as of its last apply"
     )

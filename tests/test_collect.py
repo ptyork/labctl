@@ -17,12 +17,15 @@ from labctl.bundle import Desired
 from labctl.collect import (
     _READ_NODE,
     MARK,
+    NOT_NAMED_TIMEOUT,
     UNREAD,
     Collected,
+    NodeRead,
     OnNode,
     Record,
     _collect_baseline,
     _collect_remote,
+    _read_all,
     collect,
     current_state,
     data_names,
@@ -31,7 +34,7 @@ from labctl.collect import (
 )
 from labctl.compose import ComposeError, reduce_stacks
 from labctl.envfile import CompiledEnv
-from labctl.remote import Remote, Unreachable
+from labctl.remote import CONNECT_TIMEOUT, Remote, RemoteError, Unreachable
 from labctl.repo import TagInfo
 from labctl.runtime import Container
 from labctl.settings import Secrets, Settings
@@ -521,3 +524,90 @@ def test_a_running_stack_without_its_file_is_an_error(settings: Settings, tmp_pa
     write_tree(folder, APPS)
     with pytest.raises(ComposeError, match="its files \\(gone.yml\\) are not in DEPLOY_DIR"):
         current_state(settings, "cirdan", folder, Dirs(HOME, APPDATA), {"x": ("gone.yml",)})
+
+
+##############################################################################
+
+
+# Nodes not named (B5)
+
+
+##############################################################################
+
+
+def test_a_node_not_named_is_read_but_only_looked_at(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings, tmp_path: Path, from_node: NodeState
+) -> None:
+    """Its state is what runs there; its lock and its edits do not stop or concern the plan."""
+    edited = {**RECORD_DOC.manifest, "apps/plex.yml": "edited"}
+    on_node = OnNode(RECORD_DOC, edited, lock=("labctl apply 2026-11-11",))
+    monkeypatch.setattr(collect_module, "read_node", lambda r, h, n, d: on_node)
+    desired = desired_for(Path("/unused"))
+
+    result = Collected(desired={"cirdan": desired}, recorded={})
+    why = _collect_remote(result, settings, "cirdan", desired, tmp_path, named=False)
+    assert why == "" and result.errors == []
+    assert result.recorded == {"cirdan": from_node}
+    assert not result.drift and not result.untracked
+    assert result.reports[0].detail == "not named; applied 2026-10-30T12:00:00"
+
+
+def test_a_node_not_named_that_cannot_be_read_is_not_an_error(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings, tmp_path: Path
+) -> None:
+    def broken(remote: Remote, *args: object) -> OnNode:
+        raise RemoteError("cirdan: remote script failed (1): oops")
+
+    monkeypatch.setattr(collect_module, "read_node", broken)
+    desired = desired_for(Path("/unused"))
+    result = Collected(desired={"cirdan": desired}, recorded={})
+    why = _collect_remote(result, settings, "cirdan", desired, tmp_path, named=False)
+    assert why == "cirdan: remote script failed (1): oops"
+    assert result.errors == [] and result.recorded == {}
+
+
+def test_nodes_not_named_fall_back_to_their_tag_when_unreachable(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings, make_repo: MakeRepo
+) -> None:
+    repo = make_repo(
+        settings.lab_config,
+        {f"nodes/{node}/docker-compose.yml": "services: {}\n" for node in ("cirdan", "frodo")},
+    )
+    on_node = OnNode(RECORD_DOC, dict(RECORD_DOC.manifest))
+
+    def read_node(remote: Remote, home: str, names: object, data: object) -> OnNode:
+        if remote.host == "frodo":
+            raise Unreachable("frodo: ssh: connect to host frodo port 22: Connection timed out")
+        return on_node
+
+    monkeypatch.setattr(collect_module, "resolve_desired", lambda s, node, *a: desired_for(Path()))
+    monkeypatch.setattr(collect_module, "read_node", read_node)
+    monkeypatch.setattr(collect_module, "fetch_stack_files", lambda *args: None)
+    monkeypatch.setattr(collect_module, "current_state", lambda *a: NodeState.of("cirdan"))
+
+    with collect(settings, Scope(frozenset({"frodo"})), Secrets(), None, repo) as result:
+        assert result.errors == []
+        assert result.unread == {"frodo": "unreachable: Connection timed out"}
+        report = next(report for report in result.reports if report.node == "frodo")
+        assert (report.source, report.detail) == ("none", "not named, not read; no apply tag")
+
+
+def test_nodes_are_read_together_and_those_not_named_get_less_time(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings
+) -> None:
+    timeouts: dict[str, int] = {}
+
+    def read(s: Settings, node: str, desired: object, work: Path, timeout: int) -> NodeRead:
+        timeouts[node] = timeout
+        return NodeRead(node, unreachable="down")
+
+    monkeypatch.setattr(collect_module, "read_remote", read)
+    desired: Any = {"cirdan": None, "frodo": None}
+    reads = _read_all(settings, ["cirdan", "frodo"], desired, Path(), Scope(frozenset({"frodo"})))
+    assert set(reads) == {"cirdan", "frodo"}
+    assert timeouts == {"cirdan": CONNECT_TIMEOUT, "frodo": NOT_NAMED_TIMEOUT}
+
+
+def test_ssh_waits_as_long_as_the_remote_says() -> None:
+    assert "ConnectTimeout=2" in Remote("frodo", connect_timeout=2).argv("true")
+    assert f"ConnectTimeout={CONNECT_TIMEOUT}" in Remote("frodo").argv("true")

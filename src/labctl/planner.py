@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
-from labctl.moves import Move, MoveConflict, MoveNotice, MovePlan
+from labctl.moves import FannedOut, Move, MoveConflict, MoveNotice, MovePlan, UnevenRename
 from labctl.state import NodeState, Scope, Service, is_volume, overlaps, under
 
 ##############################################################################
@@ -112,14 +112,6 @@ class Restore:
 Operation = Add | Remove | Update | Migrate | Restore
 
 
-@dataclass(frozen=True)
-class Held:
-    """An operation that would touch a skipped node."""
-
-    operation: Operation | Move
-    skipped: tuple[str, ...]
-
-
 #############################################################################
 
 
@@ -182,7 +174,16 @@ class Assumed:
     node: str
 
 
-Problem = MissingBaseline | UnknownNode | MoveConflict
+@dataclass(frozen=True)
+class NotNamed:
+    """A migrate between a named node and one that is not: it needs both, so nothing is applied
+    (name the other node too, or --no-migrate the service)."""
+
+    migrate: Migrate
+    missing: str  # the node not named
+
+
+Problem = MissingBaseline | UnknownNode | MoveConflict | NotNamed
 
 
 #############################################################################
@@ -198,7 +199,6 @@ Problem = MissingBaseline | UnknownNode | MoveConflict
 class Plan:
     moves: tuple[Move, ...] = ()  # run first, in this order
     operations: tuple[Operation, ...] = ()
-    held: tuple[Held, ...] = ()
     notices: tuple[NotMigrated | MoveNotice | Assumed, ...] = ()
     problems: tuple[Problem, ...] = ()
     unchanged: tuple[tuple[str, str], ...] = ()  # (service, node)
@@ -221,7 +221,8 @@ def make_plan(
             Every node labctl knows about: its current state if in scope, its latest apply tag's
             if skipped, or None when neither exists.
         scope (Scope | None):
-            The nodes that may change; operations touching the others are held (default: all).
+            The nodes that may change (default: all). What touches only the others is left
+            out; a migrate between one and another is a problem.
         no_migrate (Iterable[str]):
             Services whose data must not move: a migrate involving one becomes a fresh start
             (remove + add) (default: none).
@@ -231,8 +232,8 @@ def make_plan(
 
     Returns:
         Plan:
-            The moves, operations, held operations, notices and problems. Any problem means
-            nothing else is planned.
+            The moves, operations, notices and problems on the nodes in scope. Any problem
+            blocks apply.
     """
     scope = scope or Scope()
     no_migrate = set(no_migrate)
@@ -299,34 +300,51 @@ def make_plan(
 
     operations = _with_archives(operations, groups, migrated_from, aliases)
 
-    final_moves: list[Move] = []
-    final: list[Operation] = []
-    held: list[Held] = []
-    steps: list[Operation | Move] = [
-        *(move_plan.moves if move_plan else ()),
-        *sorted(operations, key=_op_order),
+    # Only the nodes named change. A migrate needs both of its nodes: with one left out it is a
+    # problem, never half done.
+    not_named = [
+        NotNamed(op, node)
+        for op in operations
+        if isinstance(op, Migrate) and scope.in_scope(op.source) != scope.in_scope(op.target)
+        for node in op.nodes
+        if not scope.in_scope(node)
     ]
-    for step in steps:
-        skipped = tuple(node for node in step.nodes if not scope.in_scope(node))
-        if skipped:
-            held.append(Held(step, skipped))
-        elif isinstance(step, Move):
-            final_moves.append(step)
-        else:
-            final.append(step)
-
     return Plan(
-        moves=tuple(final_moves),
-        operations=tuple(final),
-        held=tuple(held),
+        moves=tuple(
+            move for move in (move_plan.moves if move_plan else ()) if scope.in_scope(move.node)
+        ),
+        operations=tuple(
+            op
+            for op in sorted(operations, key=_op_order)
+            if all(scope.in_scope(node) for node in op.nodes)
+        ),
         notices=(
             *(Assumed(node) for node in assumed),
-            *(move_plan.notices if move_plan else ()),
-            *notices,
+            *(
+                notice
+                for notice in (*(move_plan.notices if move_plan else ()), *notices)
+                if any(scope.in_scope(node) for node in _notice_nodes(notice))
+            ),
         ),
-        problems=tuple(move_plan.conflicts if move_plan else ()),
+        problems=(
+            *(c for c in (move_plan.conflicts if move_plan else ()) if scope.in_scope(c.node)),
+            *not_named,
+        ),
         unchanged=tuple(unchanged),
     )
+
+
+def _notice_nodes(notice: NotMigrated | MoveNotice) -> tuple[str, ...]:
+    """The nodes a notice is about: it is shown when one of them is named."""
+    match notice:
+        case NotMigrated():
+            return (notice.source, *(node for _, node in notice.fresh))
+        case FannedOut():
+            return (notice.node, *notice.targets)
+        case UnevenRename(target=target) if target:
+            return (notice.node, target)
+        case _:
+            return (notice.node,)
 
 
 def top_level_paths(keys: Iterable[str]) -> tuple[str, ...]:

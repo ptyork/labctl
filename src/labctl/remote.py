@@ -18,6 +18,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Seconds ssh waits for a node to answer.
+CONNECT_TIMEOUT = 10
+
 # Starts a section line in a script's output: "@@LABCTL@@ <section name>".
 MARK = "@@LABCTL@@"
 
@@ -84,12 +87,19 @@ class Remote:
 
     host: str
     local: bool = False
+    connect_timeout: int = CONNECT_TIMEOUT  # seconds ssh waits for the connection
 
     def argv(self, command: str, tty: bool = False) -> list[str]:
         """The argv running a shell command on the node."""
         if self.local:
             return ["sh", "-c", command]
-        return ["ssh", *_ssh_options(), *(["-t"] if tty else []), self.host, command]
+        return [
+            "ssh",
+            *_ssh_options(self.connect_timeout),
+            *(["-t"] if tty else []),
+            self.host,
+            command,
+        ]
 
     def _unreachable(self, code: int, stderr: str) -> None:
         if code == 255 and not self.local:
@@ -169,7 +179,7 @@ class Remote:
         argv = (
             self.argv(command)
             if self.local
-            else ["ssh", *_ssh_options(), "-tt", "-q", self.host, command]
+            else ["ssh", *_ssh_options(self.connect_timeout), "-tt", "-q", self.host, command]
         )
         return subprocess.Popen(
             argv,
@@ -209,13 +219,13 @@ def _log_failure(where: str, code: int, stderr: str) -> None:
         logger.debug("%s: exit %d: %s", where, code, stderr.strip())
 
 
-def node_remote(node: str) -> Remote:
+def node_remote(node: str, connect_timeout: int = CONNECT_TIMEOUT) -> Remote:
     """The node's shell. The node named like this machine (ignoring case) is run locally."""
-    return Remote(node, local=node.lower() == socket.gethostname().lower())
+    return Remote(node, node.lower() == socket.gethostname().lower(), connect_timeout)
 
 
-def _ssh_options() -> list[str]:
-    options = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+def _ssh_options(connect_timeout: int = CONNECT_TIMEOUT) -> list[str]:
+    options = ["-o", "BatchMode=yes", "-o", f"ConnectTimeout={connect_timeout}"]
     if os.name != "nt":
         options += [
             "-o",

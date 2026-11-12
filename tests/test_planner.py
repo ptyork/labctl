@@ -5,10 +5,10 @@ import pytest
 from labctl.planner import (
     Add,
     Assumed,
-    Held,
     Migrate,
     MissingBaseline,
     NotMigrated,
+    NotNamed,
     Remove,
     UnknownNode,
     Update,
@@ -46,7 +46,7 @@ def migrate(data: tuple[str, ...], source: str, target: str, *services: str) -> 
 def test_identical_state_is_an_empty_plan() -> None:
     state = homelab(frodo=[PLEX, DOZZLE_AGENT], bilbo=[NPM])
     plan = make_plan(state, dict(state))
-    assert (plan.moves, plan.operations, plan.held, plan.problems) == ((), (), (), ())
+    assert (plan.moves, plan.operations, plan.problems) == ((), (), ())
     assert sorted(plan.unchanged) == [
         ("dozzle-agent", "frodo"),
         ("npm", "bilbo"),
@@ -257,21 +257,31 @@ def test_node_dropped_from_repo_blocks_everything() -> None:
 # ── Scope ─────────────────────────────────────────────────────────────────────
 
 
-def test_migrate_touching_a_skipped_node_is_held() -> None:
+def test_a_migrate_needs_both_of_its_nodes_named() -> None:
     recorded = homelab(frodo=[PLEX, SONARR], cirdan=[])
     desired = homelab(frodo=[SONARR], cirdan=[PLEX])
+    plex_moves = migrate(("plexms",), "frodo", "cirdan", "plex")
     plan = make_plan(desired, recorded, Scope(skipped=frozenset({"frodo"})))
-    assert plan.operations == ()
-    assert plan.held == (Held(migrate(("plexms",), "frodo", "cirdan", "plex"), ("frodo",)),)
+    assert plan.problems == (NotNamed(plex_moves, "frodo"),)
+    plan = make_plan(desired, recorded, Scope(skipped=frozenset({"cirdan"})))
+    assert plan.problems == (NotNamed(plex_moves, "cirdan"),)
+    plan = make_plan(desired, recorded)
+    assert plan.operations == (plex_moves,) and not plan.problems
+
+
+def test_what_touches_only_nodes_not_named_is_left_out() -> None:
+    recorded = homelab(frodo=[PLEX], cirdan=[], bilbo=[])
+    desired = homelab(frodo=[], cirdan=[PLEX], bilbo=[NPM])
+    plan = make_plan(desired, recorded, Scope(skipped=frozenset({"frodo", "cirdan"})))
+    assert plan.operations == (Add("npm", "bilbo"),)
     assert not plan.problems
 
 
-def test_operations_within_scope_proceed_alongside_held_ones() -> None:
-    recorded = homelab(frodo=[PLEX], cirdan=[], bilbo=[])
-    desired = homelab(frodo=[], cirdan=[PLEX], bilbo=[NPM])
-    plan = make_plan(desired, recorded, Scope(skipped=frozenset({"frodo"})))
-    assert plan.operations == (Add("npm", "bilbo"),)
-    assert [h.operation for h in plan.held] == [migrate(("plexms",), "frodo", "cirdan", "plex")]
+def test_no_migrate_starts_fresh_without_the_other_node() -> None:
+    recorded = homelab(frodo=[PLEX], cirdan=[])
+    desired = homelab(frodo=[], cirdan=[PLEX])
+    plan = make_plan(desired, recorded, Scope(skipped=frozenset({"frodo"})), no_migrate=["plex"])
+    assert plan.operations == (Add("plex", "cirdan"),) and not plan.problems
 
 
 def test_skipped_node_never_applied_is_assumed_to_match_the_repo() -> None:

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -90,8 +92,12 @@ class FakeNode:
     def exists(self, path: str) -> bool:
         return True
 
-    def move(self, now: str, new: str) -> None:
+    def move(self, now: str, new: str) -> Callable[[], object]:
         self._call(f"move {now} {new}")
+        return partial(self.move, new, now)
+
+    def delete_moved_away(self) -> list[str]:
+        return []
 
     def helper(self, root: str, script: str, *args: str, read_only: bool = False) -> str:
         if "printf" in script:  # an archive entry's sidecar
@@ -943,3 +949,86 @@ def test_a_rollback_says_what_does_not_run_as_before(settings: Settings, tmp_pat
     with pytest.raises(ApplyError):
         executor.run({"cirdan": node}, [work(tmp_path)], Plan())  # type: ignore[dict-item]
     assert "[yellow]![/] cirdan: not running as before the apply: plex" in said
+
+
+class Helper:
+    """The real Node with its helper container and copy faked: the filesystems ``elsewhere``
+    names are not the one the move starts on."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, elsewhere: bool, same_copy: bool = True):
+        self.node = Node(Remote("frodo"))
+        self.calls: list[str] = []
+
+        def helper(root: str, script: str, *args: str, read_only: bool = False) -> str:
+            if "elsewhere" in script:
+                self.calls.append(f"try {' '.join(args)}")
+                return "elsewhere\n" if elsewhere else ""
+            self.calls.append(f"helper {root} {' '.join(args)}")
+            return ""
+
+        def sums(spec: str) -> str:
+            return "abc  ./x\n" if same_copy or spec.startswith("/zconfig") else "def  ./x\n"
+
+        monkeypatch.setattr(self.node, "helper", helper)
+        monkeypatch.setattr(self.node, "copy", lambda s, t: self.calls.append(f"copy {s} {t}"))
+        monkeypatch.setattr(self.node, "sums", sums)
+
+
+def test_a_move_on_one_filesystem_is_a_rename(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = Helper(monkeypatch, elsewhere=False)
+    back = fake.node.move("/zconfig/appdata", "/zconfig/data")
+    assert fake.calls == ["try /x/appdata /x/data"] and fake.node.moved_away == []
+    back()
+    assert fake.calls[-1] == "try /x/data /x/appdata"
+
+
+def test_a_move_to_another_filesystem_copies_and_deletes_the_original_only_at_the_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = Helper(monkeypatch, elsewhere=True)
+    fake.node.move("/zconfig/appdata", "/optane/appdata")
+    assert fake.calls == [
+        "try /x/zconfig/appdata /x/optane/appdata",
+        "copy /zconfig/appdata /optane/appdata",
+    ]
+    assert fake.node.moved_away == ["/zconfig/appdata"]
+    assert fake.node.delete_moved_away() == []
+    assert fake.calls[-1] == "helper /zconfig appdata"  # rm -rf, once the apply succeeded
+    assert fake.node.moved_away == []
+
+
+def test_undoing_a_move_to_another_filesystem_drops_the_copy_and_keeps_the_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = Helper(monkeypatch, elsewhere=True)
+    back = fake.node.move("/zconfig/appdata", "/optane/appdata")
+    back()
+    assert fake.calls[-1] == "helper /optane appdata"
+    assert fake.node.moved_away == []
+
+
+def test_a_copy_that_differs_is_removed_and_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = Helper(monkeypatch, elsewhere=True, same_copy=False)
+    with pytest.raises(ApplyError, match="differs from the original"):
+        fake.node.move("/zconfig/appdata", "/optane/appdata")
+    assert fake.calls[-1] == "helper /optane appdata" and fake.node.moved_away == []
+
+
+def test_originals_are_deleted_only_after_everything_applied(
+    settings: Settings, tmp_path: Path
+) -> None:
+    deleted: list[str] = []
+
+    class Moving(FakeNode):
+        def delete_moved_away(self) -> list[str]:
+            deleted.append("now")
+            return ["/zconfig/appdata was copied, but is still there: busy"]
+
+    said: list[str] = []
+    executor = Executor(settings, said.append, wait=5, when=datetime(2026, 10, 31, 9, 0))
+    with pytest.raises(ApplyError):
+        executor.run({"cirdan": Moving(fail="up -d")}, [work(tmp_path)], Plan())  # type: ignore[dict-item]
+    assert deleted == []  # rolled back: the originals stay
+    executor.run({"cirdan": Moving()}, [work(tmp_path)], Plan())  # type: ignore[dict-item]
+    assert deleted == ["now"]
+    assert any("still there: busy" in line for line in said)
