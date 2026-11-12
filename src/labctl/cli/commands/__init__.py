@@ -1,3 +1,4 @@
+from .add import add_cmd as add_cmd
 from .archive import archive_cmd as archive_cmd
 from .init import init_cmd as init_cmd
 from .node import node_cmd as node_cmd

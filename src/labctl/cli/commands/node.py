@@ -7,29 +7,22 @@ have it.
 
 from __future__ import annotations
 
-import re
 import sys
 import threading
-from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import click
-import yaml
 from craftable import get_table
 from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-from labctl.bundle import REQUIRED_VARS
-from labctl.cli import menu
 from labctl.cli.commands.settings import load_settings
 from labctl.click import AliasedGroup, DebugOptions
 from labctl.compose import ComposeError
 from labctl.console import console
-from labctl.envfile import node_env_file, parse_env
 from labctl.remote import Remote, RemoteError, node_remote
 from labctl.settings import SettingsError
 from labctl.stack import (
@@ -431,132 +424,3 @@ def _follow(streams: Sequence[tuple[str, Remote, str]]) -> list[tuple[str, int]]
 
 def _tty() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
-
-
-#############################################################################
-
-
-# labctl node add
-
-
-#############################################################################
-
-_NODE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
-DEPLOY, APPDATA = REQUIRED_VARS
-
-
-@node_cmd.command(name="add")
-@click.argument("name")
-@click.option("--deploy-dir", metavar="DIR", help="DEPLOY_DIR: where the node's stacks go.")
-@click.option(
-    "--appdata-dir",
-    metavar="DIR",
-    help="APPDATA_DIR: the services' data, migrated with them (may start with $DEPLOY_DIR).",
-)
-@DebugOptions().options
-def add_cmd(name: str, deploy_dir: str | None, appdata_dir: str | None, **kwargs: Any) -> None:
-    """Add a node to the lab config: nodes/NAME/node.env and a compose file (not committed:
-    apply -m does that, with the rest of the change).
-
-    NAME is the node's ssh host. In a terminal, asks for DEPLOY_DIR and APPDATA_DIR (offering
-    what the other nodes use); with no terminal, pass both. There is no default: a wrong one
-    would put the stacks or the data where you did not choose. Checks the node over ssh (a
-    warning when it cannot be reached yet).
-    """
-    settings = load_settings()
-    if name == ALL or not _NODE_NAME.fullmatch(name):
-        raise click.ClickException(f"'{name}' cannot be a node name")
-    folder = settings.nodes_dir / name
-    if folder.exists() and any(folder.iterdir()):
-        raise click.ClickException(f"{folder} already exists")
-    try:
-        others = settings.node_names()
-    except SettingsError as exc:
-        raise click.ClickException(str(exc)) from exc
-    raw = {other: parse_env(_read(node_env_file(settings.nodes_dir, other))) for other in others}
-
-    deploy = deploy_dir or _ask(name, DEPLOY, _usual(raw, DEPLOY), "Where labctl puts its stacks.")
-    appdata = appdata_dir or _ask(
-        name,
-        APPDATA,
-        _usual(raw, APPDATA) or f"${DEPLOY}/appdata",
-        "The services' data: what labctl migrates and archives.",
-    )
-    for var, value in ((DEPLOY, deploy), (APPDATA, appdata)):
-        problem = _node_path(value, allow_deploy=var == APPDATA)
-        if problem:
-            raise click.ClickException(f"{var}: {problem}")
-
-    folder.mkdir(parents=True, exist_ok=True)
-    env_file = node_env_file(settings.nodes_dir, name)
-    env_file.write_text(f"{DEPLOY}={deploy}\n{APPDATA}={appdata}\n", encoding="utf-8")
-    compose_file = folder / "docker-compose.yml"
-    project = _project_prefix(settings.nodes_dir, others) + name
-    compose_file.write_text(
-        f"name: {project}\n\n# {name}'s services: include files of the lab config, or define "
-        "them here.\n",
-        encoding="utf-8",
-    )
-    console.print(f"[green]✓[/] added {escape(str(folder))}")
-    _check_node(name)
-
-
-def _read(path: Path) -> str:
-    return path.read_text(encoding="utf-8") if path.is_file() else ""
-
-
-def _usual(raw: Mapping[str, Mapping[str, str]], var: str) -> str:
-    """The value most nodes give ``var`` in their node.env, as written ($DEPLOY_DIR kept)."""
-    values = Counter(env[var] for env in raw.values() if env.get(var))
-    return values.most_common(1)[0][0] if values else ""
-
-
-def _project_prefix(nodes_dir: Path, nodes: Sequence[str]) -> str:
-    """What the other nodes put before their name in their project name (homelab-), if they
-    agree on it."""
-    prefixes = set()
-    for node in nodes:
-        try:
-            config = yaml.safe_load(_read(nodes_dir / node / "docker-compose.yml")) or {}
-        except yaml.YAMLError:
-            continue
-        project = str(config.get("name", "")) if isinstance(config, dict) else ""
-        if project.endswith(node):
-            prefixes.add(project.removesuffix(node))
-    return prefixes.pop() if len(prefixes) == 1 else ""
-
-
-def _node_path(value: str, allow_deploy: bool = False) -> str | None:
-    if value.startswith("/") or (allow_deploy and value.startswith(f"${DEPLOY}/")):
-        return None
-    return "must be an absolute path on the node" + (
-        f" (or start with ${DEPLOY}/)" if allow_deploy else ""
-    )
-
-
-def _ask(node: str, var: str, suggestion: str, what: str) -> str:
-    if not _tty():
-        raise click.ClickException(
-            "No terminal to ask in: pass --deploy-dir and --appdata-dir (labctl does not guess "
-            "where the stacks or the data go)"
-        )
-    answer = menu.edit_text(
-        f"{var} for {node}",
-        suggestion,
-        header=f"{what} Saved to nodes/{node}/node.env.",
-        validators=[lambda v: _node_path(v, allow_deploy=var == APPDATA)],
-    )
-    if answer is None:
-        raise click.ClickException("Not added")
-    return answer
-
-
-def _check_node(node: str) -> None:
-    """Warn when labctl cannot reach the node, or it has no docker compose (yet)."""
-    try:
-        result = node_remote(node).execute(["docker", "compose", "version", "--short"], "/")
-    except RemoteError as exc:
-        console.print(f"[yellow]![/] {node}: not reachable ({escape(str(exc))})")
-        return
-    if result.code:
-        console.print(f"[yellow]![/] {node}: no docker compose there")

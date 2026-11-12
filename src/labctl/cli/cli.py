@@ -5,6 +5,7 @@ import click
 from labctl.click import AliasedGroup
 
 from .commands import (
+    add_cmd,
     apply_cmd,
     archive_cmd,
     init_cmd,
@@ -37,6 +38,7 @@ main.add_command(secrets_cmd)
 main.add_command(plan_cmd)
 main.add_command(validate_cmd)
 main.add_command(apply_cmd)
+main.add_command(add_cmd)
 main.add_command(node_cmd)
 main.add_command(archive_cmd)
 main.add_command(unlock_cmd)

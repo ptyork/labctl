@@ -18,7 +18,7 @@ from labctl.compose import ComposeError
 from labctl.console import console
 from labctl.envfile import EnvError
 from labctl.repo import ConfigRepo, RepoError
-from labctl.settings import Secrets, SettingsError, node_names
+from labctl.settings import Secrets, Settings, SettingsError, node_names
 from labctl.state import ALL, Scope
 
 
@@ -49,25 +49,49 @@ def validate_cmd(nodes: tuple[str, ...], **kwargs: Any) -> None:
         except RepoError as exc:
             raise click.ClickException(str(exc)) from exc
         for node in node_names(source / "nodes"):
-            if not scope.in_scope(node):
-                continue
-            try:
-                desired = resolve_desired(settings, node, secrets, work, None, source, offline=True)
-            except (ComposeError, EnvError) as exc:
-                console.print(f"[red]✗[/] {escape(str(exc))}")
+            if scope.in_scope(node) and not check_node(settings, node, secrets, work, source):
                 invalid += 1
-                continue
-            for file, why in sorted(desired.not_stacks.items()):
-                console.print(f"[yellow]![/] {not_a_stack(node, file, why)}")
-            missing = desired.env.placeholders
-            if missing:
-                console.print(f"[red]✗[/] {node}: no value for {', '.join(missing)}")
-                invalid += 1
-                continue
-            stacks, services = len(desired.configs), len(desired.state.services)
-            console.print(
-                f"[green]✓[/] {node}: {stacks} stack{'' if stacks == 1 else 's'}, "
-                f"{services} service{'' if services == 1 else 's'}"
-            )
     if invalid:
         sys.exit(1)
+
+
+def check_node(
+    settings: Settings, node: str, secrets: Secrets, work: Path, source: Path | None = None
+) -> bool:
+    """
+    Build and resolve one node's bundle offline, and say in one line whether it is valid (a yml
+    that is not a stack is a warning before it).
+
+    Args:
+        settings (Settings):
+            labctl's settings.
+        node (str):
+            The node.
+        secrets (Secrets):
+            The values for `_SECRET_` variables.
+        work (Path):
+            Where the bundle is built.
+        source (Path | None):
+            The copy of the lab config (default: the lab config itself).
+
+    Returns:
+        bool:
+            Whether the node is valid.
+    """
+    try:
+        desired = resolve_desired(settings, node, secrets, work, None, source, offline=True)
+    except (ComposeError, EnvError) as exc:
+        console.print(f"[red]✗[/] {escape(str(exc))}")
+        return False
+    for file, why in sorted(desired.not_stacks.items()):
+        console.print(f"[yellow]![/] {not_a_stack(node, file, why)}")
+    missing = desired.env.placeholders
+    if missing:
+        console.print(f"[red]✗[/] {node}: no value for {', '.join(missing)}")
+        return False
+    stacks, services = len(desired.configs), len(desired.state.services)
+    console.print(
+        f"[green]✓[/] {node}: {stacks} stack{'' if stacks == 1 else 's'}, "
+        f"{services} service{'' if services == 1 else 's'}"
+    )
+    return True
