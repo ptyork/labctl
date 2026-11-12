@@ -1,3 +1,4 @@
+from .archive import archive_cmd as archive_cmd
 from .init import init_cmd as init_cmd
 from .node import node_cmd as node_cmd
 from .plan import apply_cmd as apply_cmd

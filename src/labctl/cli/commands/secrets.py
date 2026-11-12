@@ -40,14 +40,14 @@ def secrets_set(key: str, value: str | None, node: str | None) -> None:
     if error:
         raise click.ClickException(error)
     if value is None:
-        value = menu.edit_text(f"[bold cyan]{key}[/] ({_scope(node)})", key, validators=[_required])
+        value = menu.edit_text(f"Value for {key} ({_scope(node)})", validators=[_required])
         if value is None:
             raise click.ClickException("Cancelled")
     path = secrets_file()
     secrets = Secrets.load(path)
     secrets.table(node)[key] = value
     secrets.save(path)
-    console.print(f"[green]✓[/] {key} set ({_scope(node)}) [dim]({path})[/]")
+    console.print(f"[green]✓[/] {key} set ({_scope(node)}) in {path}")
 
 
 @secrets_cmd.command(name="edit")
@@ -60,15 +60,10 @@ def secrets_edit() -> None:
         entries = secrets.entries()
         width = max((len(_scope(n)) for n, _, _ in entries), default=0)
         options = [
-            "[green]+ add a secret[/]",
+            "+ add a secret",
             *menu.rows([(f"{_scope(n).ljust(width)}  {k}", escape(v)) for n, k, v in entries]),
         ]
-        index = menu.choose(
-            "[bold cyan]labctl secrets[/]",
-            f"{path}. Enter to edit, Esc to leave.",
-            options,
-            selected,
-        )
+        index = menu.choose(f"Secrets in {path}", options, selected)
         if index is None:
             return
         selected = index
@@ -77,10 +72,9 @@ def secrets_edit() -> None:
             continue
         node, key, value = entries[index - 1]
         new = menu.edit_text(
-            f"[bold cyan]{escape(key)}[/] ({_scope(node)})",
-            key,
+            f"Value for {key} ({_scope(node)})",
             value,
-            header="Enter to accept (clear the value to remove the secret), Esc to cancel.",
+            header="Clear the value to remove the secret.",
         )
         if new is None or new == value:
             continue
@@ -90,26 +84,25 @@ def secrets_edit() -> None:
             console.print(f"[green]✓[/] {key} updated ({_scope(node)})")
         else:
             del table[key]
-            console.print(f"[yellow]-[/] {key} removed ({_scope(node)})")
+            console.print(f"[green]✓[/] {key} removed ({_scope(node)})")
         secrets.save(path)
 
 
 def _add(secrets: Secrets, path: Path) -> None:
-    key = menu.edit_text("[bold cyan]New secret[/]", "Name", validators=[_required, _check_name])
+    key = menu.edit_text("Name of the new secret", validators=[_required, _check_name])
     if key is None:
         return
     scopes: list[str | None] = [None, *_node_names()]
     index = menu.choose(
-        f"[bold cyan]{escape(key)}[/]: where?",
-        "Global applies to every node; a node value overrides it there. Esc to cancel.",
+        f"Where is {escape(key)} set?",
         [_scope(scope) for scope in scopes],
+        header="Global applies to every node; a node's value overrides it there.",
     )
     if index is None:
         return
     node = scopes[index]
     value = menu.edit_text(
-        f"[bold cyan]{escape(key)}[/] ({_scope(node)})",
-        key,
+        f"Value for {key} ({_scope(node)})",
         secrets.table(node).get(key, ""),
         validators=[_required],
     )

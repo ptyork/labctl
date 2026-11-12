@@ -4,8 +4,7 @@
   Docker would make an empty root-owned directory).
 - Migrate source data: should exist, with its size shown.
 - Migrate target data under the managed root: existing data is moved aside (needs --replace-stale).
-- Add of a stateful service: existing data on the target is reused; earlier archived copies are
-  pointed out.
+- Add of a stateful service: existing data on the target is reused.
 - Moves (relocated roots, renamed data): the source should exist; the target must not hold data
   (a renamed directory's target may be archived with --replace-stale). Sizes and filesystems show
   whether a root move is a rename or a copy.
@@ -30,20 +29,9 @@ from labctl.remote import Remote, RemoteError, node_remote
 from labctl.state import NodeState, is_volume, volume_key, volume_name
 
 # Arguments are "<mode>:<path>". Mode S: also measure size and newest mtime. Mode -: kind only.
-# Mode A: <path> is an archive prefix; report how many <path>-* entries exist.
 _PROBE = """\
 for arg in "$@"; do
   mode=${arg%%:*}; p=${arg#*:}
-  if [ "$mode" = A ]; then
-    # Archived copies without a sidecar (made before they were described: restored by hand).
-    n=0
-    for e in "$p"-*; do
-      case $e in *.labctl.json) continue ;; esac
-      if [ -e "$e" ] && [ ! -e "$e.labctl.json" ]; then n=$((n + 1)); fi
-    done
-    printf '%s\\tarchived\\t\\t\\t%s\\n' "$p" "$n"
-    continue
-  fi
   if [ -L "$p" ] && [ ! -e "$p" ]; then kind=broken
   elif [ ! -e "$p" ]; then
     # [ -e ] is also false when a parent directory is not searchable by the ssh user (e.g.
@@ -66,7 +54,7 @@ for arg in "$@"; do
     d=$p; while [ ! -e "$d" ] && [ "$d" != / ]; do d=$(dirname "$d"); done
     dev=$(stat -c %d "$d" 2>/dev/null)
   fi
-  printf '%s\\t%s\\t%s\\t%s\\t\\t%s\\n' "$p" "$kind" "$size" "$newest" "$dev"
+  printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "$p" "$kind" "$size" "$newest" "$dev"
 done
 """
 
@@ -88,11 +76,10 @@ class Finding:
 
 @dataclass(frozen=True)
 class PathInfo:
-    # missing, empty, dir, file, broken, other, unreadable (no permission to look), archived
+    # missing, empty, dir, file, broken, other, unreadable (no permission to look)
     kind: str
     size: int | None = None
     newest: datetime | None = None
-    count: int = 0  # archived copies (kind "archived")
     device: str = ""  # filesystem (path or nearest existing parent), mode S only
 
     @property
@@ -171,7 +158,6 @@ def check_paths(
                 if isinstance(op, Add):
                     for path in _data_paths(desired[node], service):
                         want(node, path, "S")
-                        want(node, _archive_prefix(desired[node], path), "A")
                     for key in _volume_keys(desired[node], service):
                         want_key(node, key)
             case Migrate(_, source, target, _, added):
@@ -361,12 +347,11 @@ def parse_probe(output: str) -> dict[str, PathInfo]:
     result: dict[str, PathInfo] = {}
     for line in output.splitlines():
         fields = line.split("\t")
-        path, kind, size, newest, count, device = [*fields, "", ""][:6]
+        path, kind, size, newest, device = [*fields, "", ""][:5]
         result[path] = PathInfo(
             kind=kind,
             size=int(size) if size else None,
             newest=datetime.fromtimestamp(int(newest), UTC) if newest else None,
-            count=int(count.strip() or 0),
             device=device.strip(),
         )
     return result
@@ -421,20 +406,6 @@ def _findings_for(
                             node,
                             service,
                             f"{key_label(key)} already has data ({describe(p)}); it will be used",
-                        )
-                    )
-            for path in _data_paths(desired[node], service):
-                prefix = _archive_prefix(desired[node], path)
-                archived = info(node, prefix)
-                if archived and archived.count:
-                    copies = f"cop{'y' if archived.count == 1 else 'ies'}"
-                    found.append(
-                        Finding(
-                            Level.INFO,
-                            node,
-                            service,
-                            f"{archived.count} older archived {copies} ({prefix}-*), made before "
-                            "archives were described: restore by hand if wanted",
                         )
                     )
         case Update(service, node):
@@ -553,8 +524,8 @@ def human_size(size: int) -> str:
 
 
 def archive_path(root: str, key: str) -> str:
-    """Where data is archived: <root>/archive/<key>, a volume as <root>/archive/volume-<name> (the
-    executor appends -<timestamp>)."""
+    """Where data is archived: <key> in <root>'s archive, a volume as volume-<name> (the executor
+    appends -<timestamp>)."""
     return str(PurePosixPath(root) / ARCHIVE_DIR / archive_name(key))
 
 

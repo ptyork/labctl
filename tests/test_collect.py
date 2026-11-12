@@ -307,7 +307,7 @@ def test_never_applied_is_what_is_there_now(
     assert result.reports[0].source == "first"
 
 
-def test_an_unreachable_node_is_planned_as_skipped(
+def test_an_unreachable_named_node_is_an_error(
     monkeypatch: pytest.MonkeyPatch, settings: Settings, make_repo: MakeRepo
 ) -> None:
     repo = make_repo(
@@ -327,15 +327,9 @@ def test_an_unreachable_node_is_planned_as_skipped(
     monkeypatch.setattr(collect_module, "current_state", lambda *a: NodeState.of("cirdan"))
 
     with collect(settings, Scope(), Secrets(), None, repo) as result:
-        assert result.errors == []
-        assert result.unreachable == ("frodo",)
-        assert result.scope == Scope(frozenset({"frodo"}))
-        assert result.recorded["frodo"] is None  # no apply tag: the planner assumes the repo
-        (report,) = [r for r in result.reports if r.node == "frodo"]
-        assert (
-            report.detail == "unreachable (ssh: connect to host frodo port 22: No route to "
-            "host); no apply tag"
-        )
+        assert result.errors == [
+            "frodo is unreachable (ssh: connect to host frodo port 22: No route to host)"
+        ]
 
 
 TRACKED = replace(RECORD_DOC, tag="applied/cirdan/20261030-120000")
@@ -417,9 +411,12 @@ def test_a_node_not_named_is_planned_as_of_its_apply_tag(
     applied_at = repo.head()
     (settings.lab_config / "later.txt").write_text("x\n")
     repo.commit("later")
-    info = TagInfo("2026-11-01T10:00:00", "me@here", "0.1.0", ("stack1",), Dirs(HOME, APPDATA))
+    info = TagInfo(
+        "2026-11-01T10:00:00", "me@here", "0.1.0", ("stack1",), Dirs(HOME, APPDATA), "10.0.0.7"
+    )
     repo.tag_applied("frodo", "20261101-100000", applied_at, info)
     built: list[tuple[str, Path | None, bool]] = []
+    today = Secrets(global_={"API_KEY": "s3cret"})
 
     def resolve(
         s: Settings,
@@ -429,15 +426,17 @@ def test_a_node_not_named_is_planned_as_of_its_apply_tag(
         prompt: object,
         tree: Path,
         baseline: bool,
+        address: str,
     ) -> Desired:
         built.append((node, tree, baseline))
-        assert secrets == Secrets() and prompt is None  # no secrets, no questions
+        # Today's secrets (the repo has none), the address the tag recorded, no questions.
+        assert secrets is today and address == "10.0.0.7" and prompt is None
         return desired_for(tree)
 
     monkeypatch.setattr(collect_module, "resolve_desired", resolve)
     monkeypatch.setattr(collect_module, "reduce_stacks", lambda n, r, a, running: running)
     result = Collected(desired={}, recorded={}, base=repo.head())
-    _collect_baseline(result, settings, "frodo", repo, tmp_path, "not named")
+    _collect_baseline(result, settings, "frodo", repo, tmp_path, "not named", today)
     assert result.errors == []
     assert result.recorded["frodo"] == ("stack1",)  # running: the tag's Stacks-Up
     assert result.recorded_dirs["frodo"] == Dirs(HOME, APPDATA)

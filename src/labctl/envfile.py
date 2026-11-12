@@ -53,6 +53,7 @@ class CompiledEnv:
     # key -> (value, is_global): answers to save to secrets.toml
     new_secrets: Mapping[str, tuple[str, bool]] = field(default_factory=dict)
     secret_keys: tuple[str, ...] = ()  # variables whose value is a secret (never shown)
+    host_ip: str = ""  # the node's address, when a `_HOST_IP_` value needed it
 
     @property
     def secret_values(self) -> frozenset[str]:
@@ -160,6 +161,7 @@ def compile_env(
         new_node_vars=new_node_vars,
         new_secrets=new_secrets,
         secret_keys=secret_keys,
+        host_ip=address,
     )
 
 

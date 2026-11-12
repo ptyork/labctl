@@ -100,7 +100,7 @@ def test_apply_stops_when_the_lab_config_changed_since_the_plan(
     monkeypatch.setattr(plan_module, "unlock", lambda remote: locks.remove(remote.host))
     repo = ConfigRepo.open(root)
     settings = Settings(lab_config=root, config_dir=tmp_path / "config")
-    options = plan_module.Options((), False, (), False, False)
+    options = plan_module.Options((), False, (), False)
 
     def apply(tree: str, base: str) -> None:
         planned = plan_module.Planned(Plan(), [], [], None, tree=tree, base=base)
@@ -131,6 +131,7 @@ def test_once_applied_the_snapshot_is_committed_and_the_branch_moves(root: Path)
     assert repo.head() == head  # a commit, no branch moved yet
     assert repo.advance(made, head)
     assert git(root, "log", "-1", "--format=%s") == "add new.yml"
+    assert repo.subjects(f"{made}^!") == ["add new.yml"]  # what the committed line shows
     assert git(root, "status", "--porcelain") == ""  # the index follows; the file is committed
 
 
@@ -184,9 +185,9 @@ def test_in_a_terminal_the_fast_forward_is_offered(
 ) -> None:
     repo = ConfigRepo.open(behind)
     repo.fetch()
-    options = plan_module.Options((), False, (), False, False)
-    answers = [1, 0]  # plan as it is, then fast-forward first
-    monkeypatch.setattr(git_sync.menu, "choose", lambda *args: answers.pop(0))
+    options = plan_module.Options((), False, (), False)
+    answers = [False, True]  # plan as it is, then fast-forward first
+    monkeypatch.setattr(git_sync.menu, "confirm", lambda *args, **kwargs: answers.pop(0))
     git_sync.catch_up(repo, options, ask=True, applying=True)
     assert git(behind, "log", "-1", "--format=%s") == "first"  # goes on behind, asked first
     git_sync.catch_up(repo, options, ask=True, applying=True)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import shlex
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -66,11 +67,13 @@ def deployed(settings: Settings, node: str, remote: Remote) -> Deployed:
     return Deployed(node, location, tuple(stacks), not_stacks)
 
 
-def compose_command(deploy_dir: str, stack: Stack, *args: str) -> str:
-    """Shell command running docker compose on one stack (for output streamed to the terminal)."""
+def compose_command(deploy_dir: str, stack: Stack, *args: str, progress: str = "") -> str:
+    """Shell command running docker compose on one stack (for output streamed to the terminal);
+    ``progress`` is compose's --progress (plain: a line per event, for output read by labctl)."""
     missing = shlex.quote(f"DEPLOY_DIR {deploy_dir} does not exist")
+    flags = ["--progress", progress] if progress else []
     return f"cd {shlex.quote(deploy_dir)} 2>/dev/null || {{ echo {missing} >&2; exit 3; }}; " + (
-        shlex.join(["docker", "compose", *stack_args(stack), *args])
+        shlex.join(["docker", "compose", *flags, *stack_args(stack), *args])
     )
 
 
@@ -143,3 +146,126 @@ def ps_rows(output: str) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = json.loads(text)
         return rows
     return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+##########################################################################
+
+# Containers before and after: what compose recreated, created or removed
+
+##########################################################################
+
+# `docker ps -a --format`: one JSON object per container, with its compose labels.
+SNAPSHOT_FORMAT = (
+    '{"id":{{json .ID}},"project":{{json (.Label "com.docker.compose.project")}},'
+    '"service":{{json (.Label "com.docker.compose.service")}},"state":{{json .State}}}'
+)
+SNAPSHOT_COMMAND = ("docker", "ps", "--all", "--no-trunc", "--format", SNAPSHOT_FORMAT)
+
+
+@dataclass(frozen=True)
+class Seen:
+    """A service's containers at one moment (several when it is scaled)."""
+
+    ids: frozenset[str]
+    up: bool  # any of them running (or restarting)
+
+
+Snapshot = dict[tuple[str, str], Seen]  # (project, service) -> its containers
+
+
+def snapshot(output: str) -> Snapshot:
+    """The compose containers in SNAPSHOT_COMMAND's output (others have no service)."""
+    found: dict[tuple[str, str], tuple[set[str], bool]] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        row: dict[str, Any] = json.loads(line)
+        if not row.get("service"):
+            continue
+        ids, up = found.setdefault((row["project"], row["service"]), (set(), False))
+        ids.add(row["id"])
+        if row["state"] in ("running", "restarting"):
+            found[(row["project"], row["service"])] = (ids, True)
+    return {key: Seen(frozenset(ids), up) for key, (ids, up) in found.items()}
+
+
+def read_snapshot(remote: Remote, project: str = "") -> Snapshot:
+    """The node's compose containers now (one project's, when named)."""
+    args = list(SNAPSHOT_COMMAND)
+    if project:
+        args += ["--filter", f"label=com.docker.compose.project={project}"]
+    result = execute(args, "/", remote)
+    if result.code:
+        raise ComposeError(f"{remote.host}: docker ps: {result.stderr.strip()}")
+    return snapshot(result.stdout)
+
+
+@dataclass(frozen=True)
+class ContainerChanges:
+    """What became of one project's services between two snapshots."""
+
+    recreated: tuple[str, ...] = ()
+    created: tuple[str, ...] = ()
+    removed: tuple[str, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.recreated or self.created or self.removed)
+
+    def __str__(self) -> str:
+        """``recreated dozzle; created x``; more than three names are counted."""
+        parts = []
+        for what, names in (
+            ("recreated", self.recreated),
+            ("created", self.created),
+            ("removed", self.removed),
+        ):
+            if len(names) > 3:
+                parts.append(f"{what} {len(names)} ({', '.join(names[:3])}, …)")
+            elif names:
+                parts.append(f"{what} {', '.join(names)}")
+        return "; ".join(parts)
+
+
+def container_changes(
+    before: Snapshot,
+    after: Snapshot,
+    project: str,
+    came_from: Collection[str] = (),
+    staying: Collection[str] = (),
+) -> ContainerChanges:
+    """
+    What became of ``project``'s services from ``before`` to ``after``.
+
+    Args:
+        before (Snapshot):
+            The containers before.
+        after (Snapshot):
+            The containers now.
+        project (str):
+            The compose project (stack) to compare.
+        came_from (Collection[str]):
+            Projects a service may have moved in from: its container there counts as its old one.
+        staying (Collection[str]):
+            Services that left the project for another, so are not called removed.
+
+    Returns:
+        ContainerChanges: recreated (new container), created (none before), removed (none now).
+    """
+    now = {service: seen for (name, service), seen in after.items() if name == project}
+    was = {service: seen for (name, service), seen in before.items() if name == project}
+    elsewhere = {service: seen for (name, service), seen in before.items() if name in came_from}
+    recreated, created = [], []
+    for service, seen in sorted(now.items()):
+        prior = was.get(service) or elsewhere.get(service)
+        if prior is None:
+            created.append(service)
+        elif seen.ids != prior.ids:
+            recreated.append(service)
+    removed = [service for service in sorted(was) if service not in now and service not in staying]
+    return ContainerChanges(tuple(recreated), tuple(created), tuple(removed))
+
+
+def not_up_again(before: Snapshot, after: Snapshot) -> list[str]:
+    """Services up in ``before`` that are not up in ``after`` (in any project)."""
+    up_now = {service for (_, service), seen in after.items() if seen.up}
+    return sorted({service for (_, service), seen in before.items() if seen.up} - up_now)

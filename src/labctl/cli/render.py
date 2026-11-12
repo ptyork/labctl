@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 
-from git_wrap import StatusEntry
 from rich.markup import escape
 
 from labctl.changes import definition_changes, network_changes
@@ -17,7 +16,6 @@ from labctl.checks import (
     key_label,
     move_paths,
 )
-from labctl.cli.git_sync import list_changes
 from labctl.collect import FILES_ARCHIVE, Collected
 from labctl.console import console
 from labctl.moves import (
@@ -45,43 +43,26 @@ from labctl.planner import (
     UnknownNode,
     Update,
 )
-from labctl.repo import ConfigRepo
-from labctl.runtime import Runtime, StackRun
+from labctl.runtime import Runtime
 from labctl.state import NodeState, Scope, Service, is_volume
-
-
-def render_repo(repo: ConfigRepo, changes: list[StatusEntry], fetched: str | None) -> None:
-    branch = repo.branch() or "detached"
-    console.print(f"[bold]Repo[/] {repo.root} [dim]{branch} @ {repo.head()[:7]}[/]")
-    if fetched == "no remote":
-        console.print("  [dim]no remote: apply tags stay in this clone[/]")
-    if changes:
-        console.print(f"  [yellow]![/] {escape(list_changes(repo, changes, limit=10))}")
-        console.print("  [dim]planned as they are; apply commits them once applied[/]")
-    console.print()
 
 
 def render_repo_notices(notices: list[str]) -> None:
     if not notices:
         return
-    console.print("\n[bold yellow]Repo[/] [dim](apply asks first)[/]")
+    console.print("\n[bold]Repo[/] (apply asks first)")
     for notice in notices:
         console.print(f"  [yellow]![/] {escape(notice)}")
 
 
 def render_nodes(collected: Collected) -> None:
-    console.print("[bold]Nodes[/]")
-    sources = {
-        "node": "[green]recorded[/]",
-        "first": "[yellow]first apply[/]",
-        "tag": "[cyan]as of tag[/]",
-        "none": "[yellow]assumed[/]",
-    }
-    for report in sorted(collected.reports, key=lambda r: r.node):
-        source = sources[report.source]
-        if report.node in collected.unreachable:
-            source = f"[red]unreachable[/], {source}"
-        console.print(f"  {report.node:<10} {source}  [dim]{escape(report.detail)}[/]")
+    """The nodes named, and the others (planned as of their latest apply, never changed)."""
+    nodes = sorted(collected.desired)
+    included = [node for node in nodes if collected.scope.in_scope(node)]
+    skipped = [node for node in nodes if not collected.scope.in_scope(node)]
+    console.print(f"Nodes included:  {', '.join(included) or 'none'}")
+    if skipped:
+        console.print(f"Nodes skipped:   {', '.join(skipped)}")
 
 
 def render_problems(
@@ -89,7 +70,7 @@ def render_problems(
 ) -> None:
     if not (problems or placeholders):
         return
-    console.print("\n[bold red]Problems (block apply)[/]")
+    console.print("\n[bold]Problems (block apply)[/]")
     for problem in problems:
         match problem:
             case MissingBaseline(node):
@@ -109,8 +90,8 @@ def render_drift(collected: Collected) -> None:
     if not collected.drift:
         return
     console.print(
-        "\n[bold yellow]Edited directly on the node[/] [dim](apply replaces them with the repo's; "
-        f"the node's copies are archived to {FILES_ARCHIVE}/node-edits-<timestamp>)[/]"
+        "\n[bold]Edited directly on the node[/] (apply replaces them with the repo's; the "
+        f"node's copies are archived to {FILES_ARCHIVE}/node-edits-<timestamp>)"
     )
     for drift in collected.drift:
         for change in drift.changes:
@@ -136,10 +117,12 @@ def file_changes(
     return changes
 
 
+_FILE_OPERATIONS = (("new", "Add"), ("changed", "Update"), ("removed", "Archive"))
+
+
 def render_files(collected: Collected, scope: Scope, verbose: bool) -> int:
-    """Per node, how apply makes DEPLOY_DIR match the bundle. Returns how many nodes have
-    changes."""
-    lines: list[str] = []
+    """Per node, how apply makes DEPLOY_DIR match the bundle: what it adds, updates and archives.
+    Returns how many nodes have changes."""
     changed = 0
     for node in sorted(collected.desired):
         if not scope.in_scope(node) or collected.recorded.get(node) is None:
@@ -152,113 +135,162 @@ def render_files(collected: Collected, scope: Scope, verbose: bool) -> int:
             label = name + ("/" if kind == "dir" else "")
             if kind != "data" and name not in desired.top_level and label not in changes:
                 changes[label] = {"removed": []}
-        kept = sorted(name for name, kind in names.items() if kind == "data")
-        if changes:
-            changed += 1
-            parts = []
-            for top, kinds in changes.items():
-                if "/" not in top or not any(kinds.values()):
-                    (kind,) = kinds
-                    parts.append(f"{escape(top)} ({kind})")
-                else:
-                    counts = ", ".join(f"{len(v)} {k}" for k, v in kinds.items())
-                    parts.append(f"{escape(top)} ({counts})")
-            lines.append(f"  {node}: {', '.join(parts)}")
-        elif kept:
-            lines.append(f"  {node}: no changes")
-        if any(name.rstrip("/") not in desired.top_level for name in changes):
-            lines.append(
-                f"    [dim]removed: archived to {desired.dirs.deploy_dir}/{FILES_ARCHIVE}/"
-                "<name>-<timestamp>[/]"
+        if not changes:
+            continue
+        changed += 1
+        console.print(f"\n[bold]File operations on {node}[/]")
+        for kind, title in _FILE_OPERATIONS:
+            entries = [(top, kinds[kind]) for top, kinds in changes.items() if kind in kinds]
+            if not entries:
+                continue
+            shown = ", ".join(
+                f"{escape(top)} ({len(paths)} file{'s' if len(paths) != 1 else ''})"
+                if top.endswith("/") and paths
+                else escape(top)
+                for top, paths in entries
             )
-        if kept:
-            mounted = escape(", ".join(name + "/" for name in kept))
-            lines.append(f"    [dim]left alone, a container mounts it: {mounted}[/]")
-        if verbose:
-            marks = {"new": "[green]+[/]", "changed": "[yellow]~[/]", "removed": "[red]-[/]"}
-            for kinds in changes.values():
-                for kind, paths in kinds.items():
-                    lines.extend(f"      {marks[kind]} {escape(path)}" for path in paths)
-    if lines:
-        console.print("\n[bold]Files[/]")
-        for line in lines:
-            console.print(line)
+            console.print(f"  - {title + ':':<9}{shown}")
+            for _, paths in entries if verbose else ():
+                for path in paths:
+                    console.print(f"      {escape(path)}")
     return changed
 
 
-def render_stacks(collected: Collected, runtime: Runtime, work: set[str], verbose: bool) -> None:
-    """Stacks added or removed per node, whether the stacks apply writes run afterwards (where
-    that is not plain "up, and stays up"), and node ymls that are not stacks."""
+def render_stacks(
+    plan: Plan,
+    collected: Collected,
+    runtime: Runtime,
+    work: set[str],
+    probes: dict[str, dict[str, PathInfo]],
+    verbose: bool,
+) -> None:
+    """The stacks of the nodes included that are new, go away or change, each with what happens
+    to its services: a service under the stack it ends up in, a remove under the stack it leaves,
+    a migrate under both."""
     runs = {(stack.node, stack.stack): stack for stack in runtime.stacks}
     secrets = _secrets(collected)
+    entries: dict[tuple[str, str], list[str]] = {}
+
+    def add(node: str, stack: str, *lines: str) -> None:
+        entries.setdefault((node, stack), []).extend(lines)
+
+    def stack_of(state: NodeState | None, service: str) -> str:
+        found = state.services.get(service) if state else None
+        return found.stack if found else ""
+
+    for op in plan.operations:
+        match op:
+            case Add(service, node):
+                state = collected.desired[node].state
+                note = _remote_note(state.services.get(service), "mounted as it is")
+                add(node, stack_of(state, service), f"* add:     {service}{note}")
+            case Remove(service, node):
+                recorded = collected.recorded.get(node)
+                note = _remove_note(op, collected)
+                add(node, stack_of(recorded, service), f"* [red]remove[/]:  {service}{note}")
+            case Update(service, node):
+                recorded = collected.recorded.get(node)
+                before = recorded.services.get(service) if recorded else None
+                after = collected.desired[node].state.services[service]
+                changes = definition_changes(before.config if before else "", after.config, secrets)
+                was = before.stack if before else after.stack
+                if was != after.stack and changes:
+                    how = f" (update and move from {node}/{was})"
+                elif was != after.stack:
+                    how = f" (move from {node}/{was})"
+                else:
+                    how = ""
+                add(
+                    node,
+                    after.stack,
+                    f"* update:  {service}{escape(how)}",
+                    *(f"    {escape(line)}" for line in changes),
+                )
+            case Migrate(_, source, target, removed, added):
+                there = collected.desired[target].state
+                to = f"{target}/{stack_of(there, added[0])}" if added else target
+                for service in removed:
+                    add(
+                        source,
+                        stack_of(collected.recorded.get(source), service),
+                        f"* migrate: {service} (move to {to})",
+                    )
+                frm = collected.recorded.get(source)
+                origin = f"{source}/{stack_of(frm, removed[0])}" if removed else source
+                details = _migrate_details(op, collected, probes, plan.moves)
+                for service in added:
+                    add(
+                        target,
+                        stack_of(there, service),
+                        f"* migrate: {service} (move from {origin}; {escape(details)})",
+                    )
+            case Restore(service, node, source, stamp, entries=restored, size=size):
+                where = "its archive" if source == node else f"{source}'s archive"
+                keys = ", ".join(key_label(key) for _, key in restored)
+                note = f"{keys}; {human_size(size)}" if size is not None else keys
+                add(
+                    node,
+                    stack_of(collected.desired[node].state, service),
+                    f"* restore: {service} from {where} {stamp} ({escape(note)})",
+                )
+
+    for node, bundle in sorted(collected.desired.items()):
+        if not collected.scope.in_scope(node):
+            continue
+        recorded = collected.recorded.get(node)
+        for change in network_changes(recorded, bundle.state, secrets) if node in work else ():
+            run = runs.get((node, change.stack))
+            what = escape("; ".join(change.lines))
+            if run is not None and not run.start:  # compose only recreates it on `up`
+                line = f"changes ({what}; recreated when the stack starts)"
+            else:
+                kept = run.stay_down if run else ()
+                restarting = [service for service in change.services if service not in kept]
+                restart = f"; {', '.join(restarting)} restart" if restarting else ""
+                line = f"recreated ({what}{escape(restart)})"
+            add(node, change.stack, f"* network: {escape(change.name)} {line}")
+        for name in bundle.state.stacks if node in work else ():
+            run = runs.get((node, name))
+            for service, starts, why in run.stopped if run else ():
+                label = "starts:  " if starts else "stays down: "
+                add(node, name, f"* {label}{service} ({escape(why)})")
+
     lines: list[str] = []
-    for node, desired in sorted(collected.desired.items()):
-        wanted = set(desired.state.stacks)
+    for node, bundle in sorted(collected.desired.items()):
+        if not collected.scope.in_scope(node):
+            continue
+        wanted = set(bundle.state.stacks)
         recorded = collected.recorded.get(node)
         had = set(recorded.stacks) if recorded else wanted
-        parts = [f"[green]+[/] {escape(name)} (new)" for name in sorted(wanted - had)]
-        projects = collected.projects.get(node)
-        parts += [
-            f"[red]-[/] {escape(name)} "
-            + ("(removed: taken down)" if projects is None or name in projects else "(removed)")
-            for name in sorted(had - wanted)
-        ]
-        if parts:
-            lines.append(f"  {node}: {', '.join(parts)}")
-        for change in network_changes(recorded, desired.state, secrets) if node in work else ():
-            run = runs.get((node, change.stack))
-            if run is None or run.start:
-                then = "[yellow]recreated[/]"
-                restart = f"; {', '.join(change.services)} restart" if change.services else ""
-            else:  # compose only recreates it on `up`
-                then, restart = f"changes [dim](recreated when {change.stack} starts)[/]", ""
-            lines.append(
-                f"  {node}: network {escape(change.name)} {then} "
-                f"({escape('; '.join(change.lines))}{escape(restart)})"
-            )
-        for name in sorted(wanted) if node in work else ():
+        for name in sorted(wanted | had):
             run = runs.get((node, name))
-            line = _describe_run(run, desired.state.services) if run else ""
-            if line:
-                lines.append(f"  {node}/{escape(name)}: {line}")
-        for file, why in sorted(desired.not_stacks.items()):
+            if name in wanted - had:
+                how = " (add)"
+            elif name in had - wanted:
+                how = " ([red]remove[/])"
+            else:
+                how = ""
+            if run is not None and not run.start and node in work:
+                how += " (stays down: not running)"
+            body = entries.get((node, name), [])
+            if how or body:
+                lines.append(f"  - {node}/{escape(name)}{how}")
+                lines.extend(f"    {line}" for line in body)
+        for file, why in sorted(bundle.not_stacks.items()):
             reason = "defines no services" if why == "defines no services" else "does not resolve"
-            lines.append(
-                f"  [dim]{node}: {escape(file)} is not a stack ({reason}); copied as is[/]"
-            )
+            lines.append(f"  - {node}: {escape(file)} is not a stack ({reason}); copied as is")
             if verbose and reason != why:
-                lines.extend(f"      [dim]{escape(line)}[/]" for line in why.splitlines()[-3:])
+                lines.extend(f"      {escape(line)}" for line in why.splitlines()[-3:])
     if lines:
         console.print("\n[bold]Stacks[/]")
         for line in lines:
             console.print(line)
 
 
-def _describe_run(run: StackRun, services: Mapping[str, Service]) -> str:
-    """How a stack runs after apply, when that needs saying."""
-    if not run.start:
-        if run.why == "new":
-            state = "new"
-        elif run.containers:
-            state = f"down ({run.running}/{run.containers} containers running)"
-        else:
-            state = "down"
-        return f"[dim]{state}: files only, stays down (--start starts it)[/]"
-    if run.why == "up":
-        if run.running >= run.containers:
-            return ""
-        count = sum(1 for service in services.values() if service.stack == run.stack)
-        return (
-            f"up ({run.running}/{run.containers} containers running): apply starts all {count} "
-            f"of its service{'s' if count > 1 else ''}"
-        )
-    return f"[green]starts[/] ({escape(run.why)})"
-
-
 def render_runtime(runtime: Runtime) -> None:
     """Containers labctl does not manage, and what is in the way of what apply starts."""
     if runtime.unmanaged:
-        console.print("\n[bold]Not managed by labctl[/] [dim](left alone)[/]")
+        console.print("\n[bold]Not managed by labctl[/] (left alone)")
         for node, containers in sorted(runtime.unmanaged.items()):
             for container in containers:
                 origin = (
@@ -268,12 +300,12 @@ def render_runtime(runtime: Runtime) -> None:
                 )
                 console.print(
                     f"  [yellow]![/] {node}: {escape(container.name)} "
-                    f"[dim]({escape(container.image)}, {container.state}{escape(origin)})[/]"
+                    f"({escape(container.image)}, {container.state}{escape(origin)})"
                 )
     if runtime.conflicts or runtime.blocked:
         console.print(
-            "\n[bold]In the way of what apply starts[/] [dim](apply asks in a terminal, all or "
-            "nothing; without one it stops)[/]"
+            "\n[bold]In the way of what apply starts[/] (apply asks in a terminal, all or "
+            "nothing; without one it stops)"
         )
     for down in runtime.take_down:
         services = ", ".join(down.services) or "no compose services"
@@ -299,7 +331,7 @@ def render_runtime(runtime: Runtime) -> None:
             then += f", renamed {stop.container.name}-labctl-<timestamp>"
         console.print(
             f"  [yellow]![/] {stop.node}: container {escape(stop.container.name)} "
-            f"[dim]({escape(stop.container.image)})[/] {escape('; '.join(stop.why))} → {then}"
+            f"({escape(stop.container.image)}) {escape('; '.join(stop.why))} → {then}"
         )
     for defer in runtime.defers:
         services = ", ".join(defer.services)
@@ -308,9 +340,9 @@ def render_runtime(runtime: Runtime) -> None:
             "created, not started (start it once the port is free)"
         )
     if runtime.later:
-        console.print("\n[bold]Would be in the way[/] [dim](nothing to do now)[/]")
+        console.print("\n[bold]Would be in the way[/] (nothing to do now)")
         for line in runtime.later:
-            console.print(f"  [dim]{escape(line)}[/]")
+            console.print(f"  {escape(line)}")
     for node in runtime.no_port_check:
         console.print(
             f"\n[yellow]![/] {node}: no `ss` there; ports held outside Docker not checked"
@@ -320,7 +352,7 @@ def render_runtime(runtime: Runtime) -> None:
 def render_moves(plan: Plan, probes: dict[str, dict[str, PathInfo]]) -> None:
     if not plan.moves:
         return
-    console.print("\n[bold]Moves[/] [dim](run first, in this order; affected services restart)[/]")
+    console.print("\n[bold]Moves[/] (run first, in this order; affected services restart)")
     for move, source, target in move_paths(plan.moves):
         console.print("  " + _describe_move(move, probes, source, target))
 
@@ -330,8 +362,8 @@ def _describe_move(
 ) -> str:
     if move.kind == DATA:
         return (
-            f"[magenta]» rename [/] {escape(move.old)}/ → {escape(move.new)}/ on {move.node} "
-            f"[dim]({', '.join(move.services)})[/]"
+            f"- rename: {escape(move.old)}/ → {escape(move.new)}/ on {move.node} "
+            f"({', '.join(move.services)})"
         )
     if move.kind == VOLUME:
         size = probes.get(move.node, {}).get(source or move.old)
@@ -339,14 +371,12 @@ def _describe_move(
         if size and size.size is not None:
             details.insert(1, human_size(size.size))
         return (
-            f"[magenta]» rename [/] {escape(key_label(move.old))} → {escape(key_label(move.new))} "
-            f"on {move.node} [dim]({'; '.join(details)})[/]"
+            f"- rename: {escape(key_label(move.old))} → {escape(key_label(move.new))} "
+            f"on {move.node} ({'; '.join(details)})"
         )
-    head = (
-        f"[magenta]» move   [/] {move.kind} on {move.node}: {escape(move.old)} → {escape(move.new)}"
-    )
+    head = f"- move:   {move.kind} on {move.node}: {escape(move.old)} → {escape(move.new)}"
     if move.carried:
-        return f"{head} [dim](moves with the one above)[/]"
+        return f"{head} (moves with the one above)"
     details = []
     if move.source != move.old:
         details.append(f"from {escape(move.source)}, where the move above takes it")
@@ -360,109 +390,73 @@ def _describe_move(
             if src.device == dst.device
             else "[yellow]other filesystem: a full copy[/]"
         )
-    return f"{head} [dim]({'; '.join(details)})[/]" if details else head
+    return f"{head} ({'; '.join(details)})" if details else head
 
 
-def render_services(
-    plan: Plan, collected: Collected, probes: dict[str, dict[str, PathInfo]]
-) -> None:
-    if plan.operations:
-        console.print("\n[bold]Services[/]")
-        for op in plan.operations:
-            console.print("  " + _describe(op, collected, probes, plan.moves))
-    if plan.held:
-        console.print("\n[bold]Held (touch a node not named, or unreachable)[/]")
-        for held in plan.held:
-            console.print(
-                f"  [dim]{_describe(held.operation, collected, probes)}  "
-                f"(skipped: {', '.join(held.skipped)})[/]"
-            )
+def render_held(plan: Plan, collected: Collected) -> None:
+    """Operations that touch a node not named: left for when it is."""
+    if not plan.held:
+        return
+    console.print("\n[bold]Held (touch a node not named)[/]")
+    for held in plan.held:
+        console.print(
+            f"  - {_describe(held.operation, collected)} (skipped: {', '.join(held.skipped)})"
+        )
 
 
-def _describe(
-    op: Operation | Move,
-    collected: Collected,
-    probes: dict[str, dict[str, PathInfo]],
-    moves: tuple[Move, ...] = (),
-) -> str:
+def _describe(op: Operation | Move, collected: Collected) -> str:
+    """One operation in a line, for the held ones."""
     match op:
         case Move():
-            return _describe_move(op, probes)
+            return _describe_move(op, {}).removeprefix("- ")
         case Add(service, node):
-            state = collected.desired[node].state
-            note = _remote_note(state.services.get(service), "mounted as it is")
-            return f"[green]+ add    [/] {service} on {_on(state, service)}{note}"
+            return f"add {service} on {_on(collected.desired[node].state, service)}"
         case Remove(service, node):
-            where = _on(collected.recorded.get(node), service, node)
-            return f"[red]- remove [/] {service} from {where}{_remove_note(op, collected)}"
+            return f"remove {service} from {_on(collected.recorded.get(node), service, node)}"
         case Update(service, node):
-            desired = collected.desired[node].state
-            recorded = collected.recorded.get(node)
-            before = recorded.services.get(service) if recorded else None
-            moved = (
-                f" [dim](moves from stack {before.stack})[/]"
-                if before and before.stack != desired.services[service].stack
-                else ""
-            )
-            changes = definition_changes(
-                before.config if before else "",
-                desired.services[service].config,
-                _secrets(collected),
-            )
-            shown = "".join(f"\n      {escape(line)}" for line in changes)
-            return f"[yellow]~ update [/] {service} on {_on(desired, service)}{moved}{shown}"
-        case Migrate(data, source, target, removed, added):
-            services = (
-                ", ".join(added)
-                if removed == added
-                else f"{', '.join(removed)} → {', '.join(added)}"
-            )
-            names = dict(op.renamed)
-            details = [
-                ", ".join(
-                    f"{key_label(names[key])} → {key_label(key)}"
-                    if key in names
-                    else key_label(key)
-                    for key in data
-                )
-            ]
-            size = _migrate_size(op, collected, probes, moves)
-            if size:
-                details.append(size)
-            wanted = collected.desired[target].state.services
-            anonymous = sorted(
-                {
-                    path
-                    for service in added
-                    if service in wanted
-                    for path in wanted[service].anonymous
-                }
-            )
-            if anonymous:
-                details.append(f"anonymous volumes not copied: {', '.join(anonymous)}")
-            remote = sorted(
-                {
-                    volume
-                    for service in added
-                    if service in wanted
-                    for volume in wanted[service].remote
-                }
-            )
-            details += [
-                f"volume {name} on {where}: not copied, {target} mounts it"
-                for name, where in remote
-            ]
-            if op.archive:
-                details.append(f"{source}'s copy archived")
-            return (
-                f"[magenta]» migrate[/] {services} {source} → {target} "
-                f"[dim]({'; '.join(details)})[/]"
-            )
-        case Restore(service, node, source, stamp, entries=entries, size=size):
-            where = "its archive" if source == node else f"{source}'s archive"
-            keys = ", ".join(key_label(key) for _, key in entries)
-            note = f"{keys}; {human_size(size)}" if size is not None else keys
-            return f"[green]↺ restore[/] {service} on {node} from {where} {stamp} [dim]({note})[/]"
+            return f"update {service} on {_on(collected.desired[node].state, service)}"
+        case Migrate(_, source, target, removed, added):
+            names = ", ".join(added)
+            if removed != added:
+                names = f"{', '.join(removed)} → {names}"
+            return f"migrate {names} {source} → {target}"
+        case Restore(service, node, source, stamp):
+            return f"restore {service} on {node} from {source}'s archive {stamp}"
+    return str(op)
+
+
+def _migrate_details(
+    op: Migrate,
+    collected: Collected,
+    probes: dict[str, dict[str, PathInfo]],
+    moves: tuple[Move, ...],
+) -> str:
+    """What a migrate copies: its data, the size, and what it leaves behind."""
+    names = dict(op.renamed)
+    details = [
+        ", ".join(
+            f"{key_label(names[key])} → {key_label(key)}" if key in names else key_label(key)
+            for key in op.data
+        )
+    ]
+    size = _migrate_size(op, collected, probes, moves)
+    if size:
+        details.append(size)
+    wanted = collected.desired[op.target].state.services
+    anonymous = sorted(
+        {path for service in op.added if service in wanted for path in wanted[service].anonymous}
+    )
+    if anonymous:
+        details.append(f"anonymous volumes not copied: {', '.join(anonymous)}")
+    remote = sorted(
+        {volume for service in op.added if service in wanted for volume in wanted[service].remote}
+    )
+    details += [
+        f"volume {name} on {where}: not copied, {op.target} mounts it" for name, where in remote
+    ]
+    if op.archive:
+        details.append(f"{op.source}'s copy archived")
+    return "; ".join(details)
 
 
 def _secrets(collected: Collected) -> frozenset[str]:
@@ -487,9 +481,9 @@ def _remove_note(op: Remove, collected: Collected) -> str:
         where = ", ".join(
             archive_path(root, key).removeprefix(root + "/") + "-<timestamp>" for key in op.archive
         )
-        return f" [dim](data archived to {where})[/]{_remote_note(service, 'its data stays there')}"
+        return f" (data archived to {where}){_remote_note(service, 'its data stays there')}"
     if service and service.stateful:
-        return " [dim](its data stays: still used by other services)[/]"
+        return " (its data stays: still used by other services)"
     return _remote_note(service, "its data stays there")
 
 
@@ -498,7 +492,7 @@ def _remote_note(service: Service | None, what: str) -> str:
     if service is None or not service.remote:
         return ""
     volumes = "; ".join(f"volume {name} on {escape(where)}" for name, where in service.remote)
-    return f" [dim]({volumes}: {what})[/]"
+    return f" ({volumes}: {what})"
 
 
 def remote_sharing(
@@ -564,7 +558,7 @@ def render_notices(notices: tuple[NotMigrated | MoveNotice | Assumed, ...]) -> N
             f"  [yellow]![/] {rename.service} ({where}): the mounts in {escape(rename.old)}/ end "
             f"up in {' and '.join(escape(name) + '/' for name in rename.new)}. "
             "Done as written, but usually a typo.\n"
-            "    [dim]Each container path keeps its own data; check the volumes in the repo.[/]"
+            "    Each container path keeps its own data; check the volumes in the repo."
         )
     not_renamed = [notice for notice in notices if isinstance(notice, NotRenamed)]
     if not_renamed:
@@ -576,8 +570,8 @@ def render_notices(notices: tuple[NotMigrated | MoveNotice | Assumed, ...]) -> N
             f"{escape(notice.old)}/, but {', '.join(notice.kept)} still "
             f"{'uses' if len(notice.kept) == 1 else 'use'} {escape(notice.old)}/, so it is not "
             "moved.\n"
-            f"    [dim]{', '.join(notice.services)} will start with whatever is in "
-            f"{escape(notice.new)}/ (nothing, if it does not exist).[/]"
+            f"    {', '.join(notice.services)} will start with whatever is in "
+            f"{escape(notice.new)}/ (nothing, if it does not exist)."
         )
     migrated = [notice for notice in notices if isinstance(notice, NotMigrated)]
     fanned = [notice for notice in notices if isinstance(notice, FannedOut)]
@@ -588,7 +582,7 @@ def render_notices(notices: tuple[NotMigrated | MoveNotice | Assumed, ...]) -> N
         console.print(
             f"  [yellow]![/] {fan_out.service} leaves {fan_out.node} for "
             f"{', '.join(fan_out.targets)}; its volumes are not copied: it starts without them on "
-            f"each [dim](archived on {fan_out.node})[/]"
+            f"each (archived on {fan_out.node})"
         )
     for unmigrated in migrated:
         data = ", ".join(unmigrated.data)
@@ -602,8 +596,8 @@ def render_notices(notices: tuple[NotMigrated | MoveNotice | Assumed, ...]) -> N
                     f"leaving {source}, but {', '.join(kept)} still "
                     f"{'uses' if len(kept) == 1 else 'use'} it there.\n"
                     f"    The data stays on {source}. {fresh} will start WITHOUT it.\n"
-                    "    [dim]Services that share data usually work together. "
-                    "Apply will ask you to confirm this.[/]"
+                    "    Services that share data usually work together. "
+                    "Apply will ask you to confirm this."
                 )
             case "duplicate":
                 console.print(
@@ -613,12 +607,12 @@ def render_notices(notices: tuple[NotMigrated | MoveNotice | Assumed, ...]) -> N
             case "fanout":
                 console.print(
                     f"  [yellow]![/] {data} leaves {source} for more than one node; it is "
-                    f"not copied: {fresh} start without it [dim](archived on {source})[/]"
+                    f"not copied: {fresh} start without it (archived on {source})"
                 )
             case "no-migrate":
                 console.print(
                     f"  [cyan]i[/] {data}: --no-migrate; {fresh} starts fresh "
-                    f"[dim](archived on {source})[/]"
+                    f"(archived on {source})"
                 )
 
 
@@ -631,7 +625,7 @@ def render_findings(findings: list[Finding]) -> None:
         findings,
         key=lambda finding: (finding.level is not Level.BLOCK, finding.node, finding.service),
     ):
-        flag = f" [dim](needs {finding.flag})[/]" if finding.flag else ""
+        flag = f" (needs {finding.flag})" if finding.flag else ""
         service = f"{finding.service}: " if finding.service else ""
         console.print(
             f"  {marks[finding.level]} {finding.node}: {escape(service + finding.message)}{flag}"
@@ -660,5 +654,5 @@ def render_summary(plan: Plan, files_changed: int, reasons: list[str], conflicts
         parts.append(f"files differ on {files_changed} node{'s' if files_changed > 1 else ''}")
     if conflicts:
         parts.append(f"{conflicts} in the way")
-    verdict = f"[bold red]blocked:[/] {'; '.join(reasons)}" if reasons else "[bold green]ready[/]"
-    console.print(f"\n{', '.join(parts)} — {verdict}")
+    blocked = f" — [bold red]blocked:[/] {'; '.join(reasons)}" if reasons else ""
+    console.print(f"\n{', '.join(parts)}{blocked}")

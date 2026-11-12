@@ -6,6 +6,7 @@ from labctl.click import AliasedGroup
 
 from .commands import (
     apply_cmd,
+    archive_cmd,
     init_cmd,
     node_cmd,
     plan_cmd,
@@ -34,6 +35,7 @@ main.add_command(secrets_cmd)
 main.add_command(plan_cmd)
 main.add_command(apply_cmd)
 main.add_command(node_cmd)
+main.add_command(archive_cmd)
 
 
 if __name__ == "__main__":

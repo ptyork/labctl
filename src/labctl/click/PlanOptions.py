@@ -15,7 +15,6 @@ class Options:
     nodes: tuple[str, ...]
     replace_stale: bool
     no_migrate: tuple[str, ...]
-    start: bool
     verbose: bool
     fresh: tuple[str, ...] = ()
     restore: tuple[str, ...] = ()  # SERVICE or SERVICE@STAMP
@@ -59,12 +58,6 @@ class PlanOptions:
             help="Restore this added service's archived data without asking: the newest copy, "
             "or the one archived at STAMP (repeatable).",
         )
-        @click.option(
-            "--start",
-            is_flag=True,
-            help="Start every stack apply writes, also those down or new (by default they stay "
-            "down).",
-        )
         @click.option("--verbose", "-v", is_flag=True, help="List every file that would change.")
         @click.option(
             "--ff",
@@ -78,7 +71,6 @@ class PlanOptions:
                 nodes=kwargs.pop("nodes"),
                 replace_stale=kwargs.pop("replace_stale"),
                 no_migrate=kwargs.pop("no_migrate"),
-                start=kwargs.pop("start"),
                 verbose=kwargs.pop("verbose"),
                 fresh=kwargs.pop("fresh"),
                 restore=kwargs.pop("restore"),

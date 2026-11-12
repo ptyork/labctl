@@ -2,10 +2,16 @@
 
 Read with the rest of the node (collect.py) and used for two things.
 
-Whether each stack runs after apply. A stack keeps its state: one that is up (any container of its
-project running, as `docker compose ls` counts it) comes up with the new files; one that is down,
-or new, gets its files only. A service moving in (from another stack, or from another node) that
-was up brings its new stack up. --start starts every stack apply writes.
+What runs after apply. A stack that is up (any container of its project running, restarting or
+paused, as `docker compose ls` counts it) comes up with the new files, as does a new stack with a
+service new to the lab, or one a service that was up moves into (from another stack, or from
+another node). A stack that is down stays down with its files only: `labctl node up` starts it.
+
+In a stack that comes up, every service runs but one that was stopped (exited, or created and never
+started), which follows its restart policy (the repo's). Docker restarts a crashed container itself
+(it shows as restarting: up), so a stopped one was stopped by hand or exited cleanly: `always`
+starts it; `no`, `unless-stopped` and `on-failure` leave it down, but `on-failure:N` starts one that
+ran out of retries (a non-zero exit after N restarts).
 
 Containers labctl does not manage: everything not run from a stack file in DEPLOY_DIR. They are
 listed and left alone (other tools may manage them; the same image is fine), unless they clash with
@@ -48,6 +54,7 @@ CONTAINER_FORMAT = (
     '"files":{{json (index .Config.Labels "com.docker.compose.project.config_files")}},'
     '"dir":{{json (index .Config.Labels "com.docker.compose.project.working_dir")}},'
     '"ports":{{json .HostConfig.PortBindings}},"restart":{{json .HostConfig.RestartPolicy}},'
+    '"exit":{{json .State.ExitCode}},"restarts":{{json .RestartCount}},'
     '"mounts":{{json .Mounts}},"networks":{{json .NetworkSettings.Networks}}}'
 )
 # The listener section when the node has no `ss`.
@@ -92,10 +99,19 @@ class Container:
     binds: tuple[tuple[str, str], ...] = ()  # (container path, host path)
     managed: bool = False  # run from a stack file in DEPLOY_DIR
     networks: tuple[str, ...] = ()  # the networks it is attached to
+    exit_code: int = 0
+    restarts: int = 0  # how often Docker restarted it, by its restart policy
 
     @property
     def up(self) -> bool:
         return self.state in _UP
+
+    @property
+    def stopped(self) -> str:
+        """How it stopped, for the plan: "exited with 1", "exited", "created", ..."""
+        if self.state == "exited" and self.exit_code:
+            return f"exited with {self.exit_code}"
+        return self.state
 
 
 @dataclass(frozen=True, order=True)
@@ -137,6 +153,8 @@ def parse_containers(lines: Iterable[str], deploy_dir: str) -> tuple[Container, 
                 ),
                 managed=bool(files) and all(file.startswith(prefix) for file in files),
                 networks=tuple(sorted(row.get("networks") or {})),
+                exit_code=int(row.get("exit") or 0),
+                restarts=int(row.get("restarts") or 0),
             )
         )
     return tuple(sorted(found, key=lambda c: c.name))
@@ -217,9 +235,12 @@ class StackRun:
     node: str
     stack: str
     start: bool
-    why: str = field(default="", compare=False)  # "up", "new", "down", "--start", or who moves in
+    why: str = field(default="", compare=False)  # "up", "new", "down", or who moves in
     running: int = field(default=0, compare=False)  # its containers running now, of
     containers: int = field(default=0, compare=False)
+    stay_down: tuple[str, ...] = ()  # its services left stopped, when it comes up
+    # Its stopped services: (service, whether it starts, why).
+    stopped: tuple[tuple[str, bool, str], ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -288,6 +309,9 @@ class NodeRuntime:
     take_down: tuple[TakeDown, ...] = ()
     defer: tuple[str, ...] = ()  # services created, not started
     running: frozenset[str] = frozenset()  # projects that are up now
+    stay_down: tuple[str, ...] = ()  # stopped services left stopped in stacks that come up
+    # Projects up now with stopped containers: the services that run (undo starts only those).
+    partly_up: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -302,6 +326,9 @@ class Runtime:
     unmanaged: Mapping[str, tuple[Container, ...]] = field(default_factory=dict, compare=False)
     running: Mapping[str, frozenset[str]] = field(default_factory=dict, compare=False)
     no_port_check: tuple[str, ...] = field(default=(), compare=False)  # nodes without ss
+    partly_up: Mapping[str, Mapping[str, tuple[str, ...]]] = field(
+        default_factory=dict, compare=False
+    )
 
     @property
     def conflicts(self) -> int:
@@ -339,6 +366,15 @@ class Runtime:
                 )
             ),
             running=self.running.get(node, frozenset()),
+            stay_down=tuple(
+                sorted(
+                    service
+                    for stack in self.stacks
+                    if stack.node == node and stack.start
+                    for service in stack.stay_down
+                )
+            ),
+            partly_up=self.partly_up.get(node, {}),
         )
 
 
@@ -351,7 +387,6 @@ def analyse(
     listeners: Mapping[str, tuple[Listener, ...] | None],
     missing: Mapping[str, Collection[str]],
     work: Collection[str],
-    start_all: bool = False,
 ) -> Runtime:
     """
     What runs after apply on each node read, and what is in the way.
@@ -371,13 +406,12 @@ def analyse(
             The compose files containers name that are gone, per node.
         work (Collection[str]):
             The nodes apply changes; only their stacks are started.
-        start_all (bool):
-            ``--start``: every stack apply writes runs (default: False).
 
     Returns:
         Runtime:
-            Whether each stack runs, the conflicts apply resolves (stops, projects taken down,
-            deferred services), those it cannot (``blocked``), and what is only noted.
+            Whether each stack runs and which of its services stay down, the conflicts apply
+            resolves (stops, projects taken down, deferred services), those it cannot
+            (``blocked``), and what is only noted.
     """
     running = {
         node: frozenset(
@@ -385,7 +419,15 @@ def analyse(
         )
         for node, found in containers.items()
     }
-    moving_in = _moving_in(desired, recorded, plan, running)
+    partly_up = {
+        node: {
+            project: tuple(sorted({c.service for c in found if c.project == project and c.up}))
+            for project in running[node]
+            if any(c.project == project and not c.up for c in found)
+        }
+        for node, found in containers.items()
+    }
+    previous = _previous(desired, recorded, plan, containers)
     stacks: list[StackRun] = []
     stops: dict[tuple[str, str], Stop] = {}
     take_down: list[TakeDown] = []
@@ -408,20 +450,53 @@ def analyse(
         for stack in sorted(want.state.stacks):
             mine = [container for container in here if container.project == stack]
             up = sum(container.up for container in mine)
+            names = [s for s, svc in sorted(want.state.services.items()) if svc.stack == stack]
             arriving = [
-                moving_in[(node, s)]
-                for s, service in sorted(want.state.services.items())
-                if service.stack == stack and (node, s) in moving_in
+                f"{prior.name} was up {prior.where}"
+                for s in names
+                if (prior := previous.get((node, s)))
+                and prior.where
+                and prior.container
+                and prior.container.up
             ]
-            if start_all:
-                start, why = True, "--start"
-            elif stack in running[node]:
+            if stack in running[node]:
                 start, why = True, "up"
             elif arriving:
                 start, why = True, arriving[0]
-            else:
-                start, why = False, ("new" if stack not in state.stacks and not mine else "down")
-            stacks.append(StackRun(node, stack, start, why, up, len(mine)))
+            elif stack in state.stacks or mine:
+                start, why = False, "down"
+            elif any((node, s) not in previous for s in names):
+                start, why = True, "new"
+            else:  # its services were all down where they ran
+                start, why = False, "down"
+            stay_down: list[str] = []
+            stopped_services: list[tuple[str, bool, str]] = []
+            for s in names if start else ():
+                prior = previous.get((node, s))
+                if prior is None or prior.container is None or prior.container.up:
+                    continue
+                stopped = prior.container
+                policy = str(want.service_config(s).get("restart") or "no")
+                was = stopped.stopped + (f" {prior.where}" if prior.where else "")
+                if _starts_again(policy, stopped):
+                    if policy.startswith("on-failure"):
+                        was += f", {stopped.restarts} restarts"
+                    stopped_services.append((s, True, f"{was}; restart: {policy}"))
+                else:
+                    stay_down.append(s)
+                    stopped_services.append((s, False, f"{was}; restart: {policy}"))
+            stacks.append(
+                StackRun(
+                    node,
+                    stack,
+                    start,
+                    why,
+                    up,
+                    len(mine),
+                    tuple(stay_down),
+                    tuple(stopped_services),
+                )
+            )
             if start and node in work:
                 started.add(stack)
 
@@ -531,6 +606,7 @@ def analyse(
         unmanaged=unmanaged,
         running=running,
         no_port_check=tuple(no_port_check),
+        partly_up=partly_up,
     )
 
 
@@ -545,42 +621,70 @@ def _route(
     return False
 
 
-def _moving_in(
+def _starts_again(policy: str, stopped: Container) -> bool:
+    """Whether a stopped service of a stack that comes up starts, by its restart policy."""
+    name, _, retries = policy.partition(":")
+    if name == "always":
+        return True
+    if name == "on-failure" and retries.isdigit() and int(retries) > 0:
+        return stopped.exit_code != 0 and stopped.restarts >= int(retries)
+    return False
+
+
+@dataclass(frozen=True)
+class _Before:
+    """Where a service ran before apply."""
+
+    name: str  # its name there (a migrate may rename it)
+    where: str  # "" (its stack on this node), "in STACK" or "on NODE"
+    container: Container | None  # its container there, when that node was read and it has one
+
+
+def _previous(
     desired: Mapping[str, Desired],
     recorded: Mapping[str, NodeState | None],
     plan: Plan,
-    running: Mapping[str, frozenset[str]],
-) -> dict[tuple[str, str], str]:
-    """(node, service) -> where it was up, for services that move into another stack while up:
-    from another stack on the node, or from another node (migrated, or stateless and re-added)."""
-    found: dict[tuple[str, str], str] = {}
+    containers: Mapping[str, tuple[Container, ...]],
+) -> dict[tuple[str, str], _Before]:
+    """(node, service) -> where it ran before, for every service the lab had: on the node, in its
+    stack or another, or on another node (migrated, or stateless and re-added). Services new to the
+    lab are not in it."""
+    found: dict[tuple[str, str], _Before] = {}
 
-    def up_on(node: str, service: str) -> str:
+    def there(node: str, service: str, where: str) -> _Before:
         state = recorded.get(node)
-        before = state.services.get(service) if state else None
-        if before and before.stack in running.get(node, frozenset()):
-            return before.stack
-        return ""
+        stack = state.services[service].stack if state else ""
+        container = next(
+            (c for c in containers.get(node, ()) if (c.project, c.service) == (stack, service)),
+            None,
+        )
+        return _Before(service, where, container)
 
     for node, want in desired.items():
         state = recorded.get(node)
         for name, service in want.state.services.items():
             before = state.services.get(name) if state else None
             if before is not None:
-                if before.stack != service.stack and up_on(node, name):
-                    found[(node, name)] = f"{name} was up in {before.stack}"
+                where = "" if before.stack == service.stack else f"in {before.stack}"
+                found[(node, name)] = there(node, name, where)
                 continue
             for other in sorted(recorded):
+                had = recorded[other]
                 leaving = other in desired and name not in desired[other].state.services
-                if other != node and leaving and up_on(other, name):
-                    found[(node, name)] = f"{name} was up on {other}"
+                if other != node and leaving and had is not None and name in had.services:
+                    found[(node, name)] = there(other, name, f"on {other}")
                     break
     for op in plan.operations:
         if isinstance(op, Migrate):
-            source = next((service for service in op.removed if up_on(op.source, service)), "")
-            for name in op.added:
-                if source:
-                    found.setdefault((op.target, name), f"{source} was up on {op.source}")
+            source = recorded.get(op.source)
+            sources = [
+                there(op.source, service, f"on {op.source}")
+                for service in op.removed
+                if source is not None and service in source.services
+            ]
+            sources.sort(key=lambda before: not (before.container and before.container.up))
+            for name in op.added if sources else ():
+                found.setdefault((op.target, name), sources[0])
     return found
 
 

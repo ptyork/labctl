@@ -19,8 +19,9 @@ With the files comes what runs: every container on the node, and the ports held 
 (runtime.py decides what that means for apply).
 
 The desired bundles come from the config repo (repo.py): the working tree for plan, a commit for
-apply. applied.json names the commit and the apply tag. A node that is not read (not named, or
-unreachable) is planned against its latest apply tag: that commit's tree, rebuilt like a bundle.
+apply. applied.json names the commit and the apply tag. A node that is not named is not read: it is
+planned against its latest apply tag, that commit's tree rebuilt like a bundle. A named node that
+cannot be reached is an error: nothing is planned.
 There is no state on this machine.
 
 A node labctl never applied to is planned against what its DEPLOY_DIR has now (nothing, if it does
@@ -232,9 +233,8 @@ class NodeReport:
 class Collected:
     desired: dict[str, Desired]
     recorded: dict[str, NodeState | None]
-    # The nodes this run may change: those named, less the unreachable (planned as if skipped).
+    # The nodes this run may change: those named.
     scope: Scope = field(default_factory=Scope)
-    unreachable: tuple[str, ...] = ()
     # DEPLOY_DIR and APPDATA_DIR as last applied (or found); compared with desired for moves.
     recorded_dirs: dict[str, Dirs] = field(default_factory=dict)
     reports: list[NodeReport] = field(default_factory=list)
@@ -272,7 +272,7 @@ def collect(
     """
     Collect everything the planner needs. Bundles live in a temp dir for the duration.
 
-    A node that cannot be reached is planned as if not named (``Collected.scope`` leaves it out).
+    A named node that cannot be reached is an error (``Collected.errors``).
 
     Args:
         settings (Settings):
@@ -312,19 +312,16 @@ def collect(
         if tree is not None and any(wanted.env.new_node_vars for wanted in desired.values()):
             tree = repo.snapshot()  # with the answers just written to node.env
         result = Collected(desired=desired, recorded={}, tree=tree, base=repo.head())
-        unreachable = []
         for node in nodes:
             if not scope.in_scope(node):
-                _collect_baseline(result, settings, node, repo, work, "not named")
+                _collect_baseline(result, settings, node, repo, work, "not named", secrets)
                 continue
             why = _collect_remote(
                 result, settings, node, desired[node], work, locked, repo, result.base
             )
             if why:
-                unreachable.append(node)
-                _collect_baseline(result, settings, node, repo, work, f"unreachable ({why})")
-        result.scope = scope.without(unreachable)
-        result.unreachable = tuple(unreachable)
+                result.errors.append(f"{node} is unreachable ({why})")
+        result.scope = scope
         yield result
 
 
@@ -474,10 +471,17 @@ def _check_commit(
 
 
 def _collect_baseline(
-    result: Collected, settings: Settings, node: str, repo: ConfigRepo, work: Path, why: str
+    result: Collected,
+    settings: Settings,
+    node: str,
+    repo: ConfigRepo,
+    work: Path,
+    why: str,
+    secrets: Secrets,
 ) -> None:
-    """A node not read (``why``: not named, or unreachable): its state as of its latest apply
-    tag, rebuilt from that commit's tree."""
+    """A node not read (``why``: not named): its state as of its latest apply tag, rebuilt from
+    that commit's tree. Secrets are not in the repo, so today's stand in (the best known), and
+    `_HOST_IP_` is the address the tag recorded (a tag without one keeps a placeholder)."""
     try:
         applied = repo.last_applied(node)
     except RepoError as exc:
@@ -494,7 +498,16 @@ def _collect_baseline(
     tree = folder / node / _TREE
     try:
         repo.export(applied.commit, tree)
-        then = resolve_desired(settings, node, Secrets(), folder, None, tree, baseline=True)
+        then = resolve_desired(
+            settings,
+            node,
+            secrets,
+            folder,
+            None,
+            tree,
+            baseline=True,
+            address=applied.info.host_ip,
+        )
         resolved = [(then.state.stacks[name], config) for name, config in then.configs.items()]
         result.recorded[node] = reduce_stacks(
             node, resolved, applied.info.dirs.appdata_dir, running=applied.info.stacks_up

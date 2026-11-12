@@ -36,8 +36,10 @@ from labctl.stack import (
     Deployed,
     ServiceStatus,
     compose_command,
+    container_changes,
     deployed,
     read_services,
+    read_snapshot,
     stack_services,
     unbacked_projects,
 )
@@ -82,7 +84,7 @@ def node_cmd() -> None:
 @DebugOptions().options
 def up_cmd(targets: tuple[str, ...], services: tuple[str, ...], **kwargs: Any) -> None:
     """Start the stacks (or some services), removing containers no longer in them."""
-    _compose(targets, services, "up", "-d", "--remove-orphans")
+    _compose(targets, services, "up", "-d", "--remove-orphans", report=True)
 
 
 @node_cmd.command(name="down")
@@ -124,6 +126,24 @@ def prune_cmd(targets: tuple[str, ...], **kwargs: Any) -> None:
         return t.remote.run("docker image prune --force")
 
     _each_node(targets, prune)
+
+
+@node_cmd.command(name="update")
+@targets_argument
+@services_option
+@DebugOptions().options
+def update_cmd(targets: tuple[str, ...], services: tuple[str, ...], **kwargs: Any) -> None:
+    """Pull, up, then prune, node by node (a node whose pull or up fails goes no further). Prune is
+    node-wide, also for NODE/STACK or -s."""
+
+    def update(t: Target, runs: Runs) -> int:
+        failed = _run_stacks(t, runs, "pull", "--ignore-pull-failures")
+        failed = failed or _run_stacks(t, runs, "up", "-d", "--remove-orphans", report=True)
+        if failed:
+            return failed
+        return t.remote.run("docker image prune --force")
+
+    _each_node(targets, update, services=services)
 
 
 @node_cmd.command(name="logs")
@@ -222,7 +242,7 @@ def _flagged(value: str) -> str:
 
 
 def _state_color(value: str) -> str:
-    return {"running": "green", _NOT_CREATED: "dim", "": ""}.get(value, "red")
+    return {"running": "green", _NOT_CREATED: "yellow", "": ""}.get(value, "red")
 
 
 def _colored(color_of: Callable[[str], str]) -> Callable[[Any, str, list[Any], int], str]:
@@ -239,18 +259,37 @@ _plain = _colored(lambda value: "")
 
 
 def _compose(
-    targets: tuple[str, ...], services: tuple[str, ...], *args: str, reverse: bool = False
+    targets: tuple[str, ...],
+    services: tuple[str, ...],
+    *args: str,
+    reverse: bool = False,
+    report: bool = False,
 ) -> None:
     def run(t: Target, runs: Runs) -> int:
-        failed = 0
-        for stack, names in reversed(runs) if reverse else runs:
-            if len(runs) > 1:
-                console.rule(f"[bold]{escape(t.deployed.label(stack))}[/]")
-            command = compose_command(t.deployed.deploy_dir, stack, *args, *names)
-            failed |= t.remote.run(command, _tty())
-        return failed
+        return _run_stacks(t, runs, *args, reverse=reverse, report=report)
 
     _each_node(targets, run, services=services)
+
+
+def _run_stacks(
+    t: Target, runs: Runs, *args: str, reverse: bool = False, report: bool = False
+) -> int:
+    """One compose command on each of a target's stacks; non-zero if any failed. With ``report``,
+    a line per stack after it says which containers the command recreated, created or removed."""
+    failed = 0
+    for stack, names in reversed(runs) if reverse else runs:
+        label = t.deployed.label(stack)
+        if len(runs) > 1:
+            console.rule(f"[bold]{escape(label)}[/]")
+        before = read_snapshot(t.remote, stack.name) if report else {}
+        command = compose_command(t.deployed.deploy_dir, stack, *args, *names)
+        code = t.remote.run(command, _tty())
+        failed |= code
+        if report and not code:
+            changes = container_changes(before, read_snapshot(t.remote, stack.name), stack.name)
+            said = str(changes) if changes else "no containers changed"
+            console.print(f"[green]✓[/] {escape(label)}: {escape(said)}")
+    return failed
 
 
 def _with_services(t: Target, services: tuple[str, ...]) -> Runs:
@@ -266,7 +305,7 @@ def _with_services(t: Target, services: tuple[str, ...]) -> Runs:
     return [(stack, names) for stack, names in by_stack.items() if names]
 
 
-def _nodes(targets: Sequence[str], names: Sequence[str]) -> dict[str, tuple[str, ...]]:
+def target_nodes(targets: Sequence[str], names: Sequence[str]) -> dict[str, tuple[str, ...]]:
     """Node -> the stacks named on it ("" for all of them), in the order given."""
     if ALL in names:
         raise SettingsError(f"a node may not be called '{ALL}'")
@@ -294,7 +333,7 @@ def _resolve(
     has is an error, before anything runs."""
     settings = load_settings()
     try:
-        chosen = _nodes(targets, settings.node_names())
+        chosen = target_nodes(targets, settings.node_names())
     except SettingsError as exc:
         raise click.ClickException(str(exc)) from exc
     resolved: list[tuple[Target, Runs]] = []
@@ -502,10 +541,9 @@ def _ask(node: str, var: str, suggestion: str, what: str) -> str:
             "where the stacks or the data go)"
         )
     answer = menu.edit_text(
-        f"[bold cyan]{escape(node)}[/]: {var}",
-        var,
+        f"{var} for {node}",
         suggestion,
-        header=f"{what} Saved to nodes/{node}/node.env. Esc to cancel.",
+        header=f"{what} Saved to nodes/{node}/node.env.",
         validators=[lambda v: _node_path(v, allow_deploy=var == APPDATA)],
     )
     if answer is None:

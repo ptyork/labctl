@@ -71,11 +71,14 @@ def test_a_terminal_is_offered_what_most_nodes_use(
 ) -> None:
     offered: list[str] = []
 
-    def edit_text(title: str, prompt: str, value: str = "", **kwargs: object) -> str:
+    def edit_text(prompt: str, value: str = "", **kwargs: object) -> str:
         offered.append(f"{prompt}={value}")
         return value
 
     monkeypatch.setattr(node_module, "_tty", lambda: True)
     monkeypatch.setattr(menu, "edit_text", edit_text)
     add("aragorn")
-    assert offered == ["DEPLOY_DIR=/srv/docker", "APPDATA_DIR=$DEPLOY_DIR/app_data"]
+    assert offered == [
+        "DEPLOY_DIR for aragorn=/srv/docker",
+        "APPDATA_DIR for aragorn=$DEPLOY_DIR/app_data",
+    ]

@@ -15,8 +15,10 @@ from typing import Any
 
 from labctl.state import Network, NodeState, Service, Stack, Volume, volume_key
 
-# Under APPDATA_DIR, reserved for labctl: data of removed services and migrate sources.
-ARCHIVE_DIR = "archive"
+# Under APPDATA_DIR, reserved for labctl: copies on their way in, and the archive (data of removed
+# services and migrate sources). Everything in the archive is labctl's.
+LABCTL_DIR = ".labctl"
+ARCHIVE_DIR = f"{LABCTL_DIR}/archive"
 
 
 class ComposeError(Exception):
@@ -259,9 +261,6 @@ def _data_path(source: PurePosixPath, root: PurePosixPath, service: str) -> str 
     if not source.is_relative_to(root):
         return None
     relative = source.relative_to(root)
-    if relative.parts[0] == ARCHIVE_DIR:
-        raise ComposeError(
-            f"{service}: mounts {source}, but {root}/{ARCHIVE_DIR}/ is reserved for labctl's "
-            "archived data"
-        )
+    if relative.parts[0] == LABCTL_DIR:
+        raise ComposeError(f"{service}: mounts {source}, but {root}/{LABCTL_DIR}/ is labctl's")
     return str(relative)

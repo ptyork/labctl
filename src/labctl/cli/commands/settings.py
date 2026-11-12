@@ -93,17 +93,12 @@ def settings_edit() -> None:
                     setting.name,
                     escape(values[setting.name])
                     if setting.name in values
-                    else f"[dim]{setting.default}[/]",
+                    else f"{escape(setting.default)} (default)",
                 )
                 for setting in settings
             ]
         )
-        index = menu.choose(
-            "[bold cyan]labctl settings[/]",
-            f"{path}. Enter to edit, Esc to leave. Dimmed values are defaults.",
-            options,
-            selected,
-        )
+        index = menu.choose(f"Settings in {path}", options, selected)
         if index is None:
             return
         selected = index
@@ -119,12 +114,13 @@ def settings_edit() -> None:
 
 
 def _edit_value(setting: Setting, current: str) -> str | None:
-    title = f"[bold cyan]{setting.name}[/]: {escape(setting.description)}"
     if setting.is_dir:
-        chosen = menu.choose_dir(title, current)
+        chosen = menu.choose_dir(f"{setting.name}: {escape(setting.description)}", current)
         return None if chosen is None else str(chosen)
     return menu.edit_text(
-        title, setting.name, current, validators=[lambda v: check_value(setting, v)]
+        f"{setting.name} ({escape(setting.description)})",
+        current,
+        validators=[lambda v: check_value(setting, v)],
     )
 
 
@@ -133,7 +129,7 @@ def save_setting(setting: Setting, value: str) -> None:
     values = read_config(path)
     values[setting.name] = value
     write_config(path, values)
-    console.print(f"[green]✓[/] {setting.name} = {escape(value)} [dim]({path})[/]")
+    console.print(f"[green]✓[/] {setting.name} = {escape(value)}, saved to {path}")
 
 
 def _setting(name: str) -> Setting:

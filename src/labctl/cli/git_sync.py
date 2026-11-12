@@ -55,10 +55,8 @@ def commit_message(
     if not (ask and sys.stdin.isatty()):
         return default
     answer = menu.edit_text(
-        "[bold cyan]Applied.[/] Commit it",
-        "message",
+        "Enter commit message",
         default,
-        header=f"{len(paths)} changed: {escape(listed)}. Enter commits; Esc takes the default.",
         validators=[lambda v: None if v.strip() else "A message is required"],
     )
     return (answer or default).strip()
@@ -100,12 +98,13 @@ def catch_up(repo: ConfigRepo, options: Options, ask: bool, applying: bool) -> N
         shown = "; ".join(subjects[:3]) + (
             f"; and {len(subjects) - 3} more" if len(subjects) > 3 else ""
         )
-        index = menu.choose(
-            f"[bold cyan]{escape(branch)}[/] is {count} behind {escape(upstream)}",
-            escape(shown),
-            ["Fast-forward first", "Plan as it is"],
+        forward = bool(
+            menu.confirm(
+                f"{escape(branch)} is {count} behind {escape(upstream)}. Fast-forward first?",
+                default=True,
+                header=escape(shown),
+            )
         )
-        forward = index == 0
     if forward:
         problem = repo.fast_forward(upstream)
         if problem:
@@ -145,32 +144,45 @@ def commit_applied(repo: ConfigRepo, tree: str, base: str, message: Callable[[],
     """What was just applied, as a commit on ``base`` (``base`` itself when nothing changed)."""
     if repo.tree_of(base) == tree:
         return base
-    text = message()
-    made = repo.commit_tree(tree, base, text)
-    console.print(f"[green]✓[/] committed {made[:7]} {escape(text)}")
-    return made
+    console.print("All nodes successfully applied. Committing changes.")
+    return repo.commit_tree(tree, base, message())
 
 
 def publish_applied(
-    repo: ConfigRepo, commit: str, stamp: str, tags: list[tuple[str, TagInfo]], branch: bool
+    repo: ConfigRepo,
+    commit: str,
+    stamp: str,
+    tags: list[tuple[str, TagInfo]],
+    branch: bool,
+    committed: bool,
 ) -> None:
-    """Tag each node recorded, then push the tags with the branch (when it holds the commit).
-    Failures are warnings: it is applied."""
+    """Tag each node recorded, then push the tags with the branch (when it holds the commit), and
+    say so in one line. Failures are warnings: it is applied."""
+    tagged = 0
     for node, info in tags:
         try:
-            name = repo.tag_applied(node, stamp, commit, info)
+            repo.tag_applied(node, stamp, commit, info)
+            tagged += 1
         except RepoError as exc:
-            console.print(f"[yellow]! {node}: applied, not tagged: {escape(str(exc))}[/]")
-            continue
-        console.print(f"[green]✓[/] tagged {name}")
+            console.print(f"[yellow]![/] {node}: applied, not tagged: {escape(str(exc))}")
     failed = repo.publish(branch)
     root = repo.root
+    if committed:  # the message was asked for, and the prompt is gone once answered
+        subject = next(iter(repo.subjects(f"{commit}^!")), "").splitlines()
+        done = f"Committed {commit[:7]}"
+        if subject:
+            done += f' "{escape(subject[0])}"'
+    else:
+        done = f"Nothing to commit ({commit[:7]})"
+    if tagged:
+        done += ", tagged"
     if failed == "no remote":
-        console.print("[yellow]! No remote: the commit and its tags stay in this clone[/]")
+        console.print(f"[green]✓[/] {done}; no remote, so it stays in this clone")
     elif failed:
+        console.print(f"[green]✓[/] {done}")
         console.print(
-            f"[yellow]! Not pushed ({escape(failed)}). The next apply pushes; or catch up and "
-            f"push now:\n  git -C {root} pull --rebase\n  git -C {root} push --follow-tags[/]"
+            f"[yellow]![/] Not pushed ({escape(failed)}). The next apply pushes; or catch up and "
+            f"push now:\n  git -C {root} pull --rebase\n  git -C {root} push --follow-tags"
         )
     else:
-        console.print(f"[green]✓[/] pushed to {repo.remote()}")
+        console.print(f"[green]✓[/] {done} and pushed to {repo.remote()}")

@@ -123,8 +123,10 @@ def recorded(node: str, stacks: dict[str, list[str]]) -> NodeState:
     )
 
 
-def ours(project: str, state: str = "running") -> Container:
-    return Container(f"{project}-x-1", state, project=project, managed=True)
+def ours(project: str, state: str = "running", service: str = "x") -> Container:
+    return Container(
+        f"{project}-{service}-1", state, project=project, service=service, managed=True
+    )
 
 
 def run(
@@ -135,7 +137,6 @@ def run(
     plan: Plan | None = None,
     work: set[str] | None = None,
     missing: dict[str, frozenset[str]] | None = None,
-    start_all: bool = False,
 ) -> Runtime:
     return analyse(
         want,
@@ -145,7 +146,6 @@ def run(
         listeners=listeners or {},
         missing=missing or {},
         work=set(containers) if work is None else work,
-        start_all=start_all,
     )
 
 
@@ -154,18 +154,65 @@ def starts(runtime: Runtime) -> dict[str, tuple[bool, str]]:
 
 
 def test_stacks_keep_their_state() -> None:
-    want = {"cirdan": desired("cirdan", {"web": {"a": {}}, "tools": {"b": {}}, "fresh": {"c": {}}})}
-    have = {"cirdan": recorded("cirdan", {"web": ["a"], "tools": ["b"]})}
-    containers = {"cirdan": (ours("web"), ours("web", "exited"), ours("tools", "exited"))}
+    want = {
+        "cirdan": desired(
+            "cirdan", {"web": {"a": {}, "b": {}}, "tools": {"t": {}}, "fresh": {"c": {}}}
+        )
+    }
+    have = {"cirdan": recorded("cirdan", {"web": ["a", "b"], "tools": ["t"]})}
+    web = (ours("web", service="a"), ours("web", "exited", "b"))
+    containers = {"cirdan": (*web, ours("tools", "exited", "t"))}
     runtime = run(want, have, containers)
     assert starts(runtime) == {
         "web": (True, "up"),  # one of its two containers runs: up, like `docker compose ls`
         "tools": (False, "down"),
-        "fresh": (False, "new"),
+        "fresh": (True, "new"),
     }
-    assert runtime.for_node("cirdan").start == {"web"}
+    assert runtime.for_node("cirdan").start == {"web", "fresh"}
     assert [(s.running, s.containers) for s in runtime.stacks if s.stack == "web"] == [(1, 2)]
-    assert starts(run(want, have, containers, start_all=True))["fresh"] == (True, "--start")
+    # A stack without containers (`labctl node down`) is down, even with a new service in it.
+    want = {"cirdan": desired("cirdan", {"tools": {"t": {}, "new": {}}})}
+    assert starts(run(want, have, {"cirdan": ()})) == {"tools": (False, "down")}
+
+
+def test_stopped_services_follow_their_restart_policy() -> None:
+    """Docker restarts a crashed container itself, so a stopped one was stopped by hand or exited
+    cleanly: only always starts it, or on-failure:N once it ran out of retries."""
+    policies = {
+        "always": "always",
+        "crashed": "on-failure:3",
+        "fail": "on-failure",
+        "fail3": "on-failure:3",
+        "never": "no",
+        "loop": "unless-stopped",
+        "unless": "unless-stopped",
+        "up": "unless-stopped",
+    }
+    services = {name: {"restart": policy} for name, policy in policies.items()}
+    want = {"cirdan": desired("cirdan", {"web": {**services, "plain": {}}})}
+    have = {"cirdan": recorded("cirdan", {"web": [*services, "plain"]})}
+    stopped = {name: ours("web", "exited", name) for name in (*services, "plain")}
+    stopped["up"] = ours("web", service="up")
+    stopped["loop"] = ours("web", "restarting", "loop")  # a restart loop is up
+    stopped["crashed"] = replace(stopped["crashed"], exit_code=1, restarts=3)
+    stopped["fail3"] = replace(stopped["fail3"], exit_code=143)  # docker stop: not a failure
+    stopped["always"] = ours("web", "created", "always")
+    runtime = run(want, have, {"cirdan": tuple(stopped.values())})
+    (web,) = runtime.stacks
+    assert (web.start, web.why) == (True, "up")
+    assert web.stay_down == ("fail", "fail3", "never", "plain", "unless")
+    assert runtime.for_node("cirdan").stay_down == web.stay_down
+    assert web.stopped == (
+        ("always", True, "created; restart: always"),
+        ("crashed", True, "exited with 1, 3 restarts; restart: on-failure:3"),
+        ("fail", False, "exited; restart: on-failure"),
+        ("fail3", False, "exited with 143; restart: on-failure:3"),
+        ("never", False, "exited; restart: no"),
+        ("plain", False, "exited; restart: no"),
+        ("unless", False, "exited; restart: unless-stopped"),
+    )
+    # Undo brings back only what ran.
+    assert runtime.for_node("cirdan").partly_up == {"web": ("loop", "up")}
 
 
 def test_a_service_that_was_up_brings_its_new_stack_up() -> None:
@@ -179,7 +226,8 @@ def test_a_service_that_was_up_brings_its_new_stack_up() -> None:
         "cirdan": recorded("cirdan", {"old": ["dozzle", "heimdall", "organizr"]}),
         "aragorn": recorded("aragorn", {}),
     }
-    containers = {"cirdan": (ours("old"),), "aragorn": ()}
+    old = ("dozzle", "heimdall", "organizr")
+    containers = {"cirdan": tuple(ours("old", service=s) for s in old), "aragorn": ()}
     assert starts(run(want, have, containers)) == {
         "new": (True, "dozzle was up in old"),
         "apps": (True, "heimdall was up on cirdan"),
@@ -192,8 +240,8 @@ def test_a_service_that_was_up_brings_its_new_stack_up() -> None:
         "organizr was up on cirdan",
     )
     # Down where it was: stays down.
-    containers["cirdan"] = (ours("old", "exited"),)
-    assert starts(run(want, have, containers, plan=plan))["apps"] == (False, "new")
+    containers["cirdan"] = tuple(ours("old", "exited", s) for s in old)
+    assert starts(run(want, have, containers, plan=plan))["apps"] == (False, "down")
 
 
 WEB: Services = {
@@ -337,7 +385,9 @@ def test_a_changed_network_with_other_stacks_attached_blocks_apply() -> None:
     have = with_proxy(
         recorded("bilbo", {"docker": ["npm"], "tools": ["x"]}), "docker", '{"ipam":{"a":1}}'
     )
-    mine = replace(ours("docker"), networks=("proxy",))  # its stack goes down first: fine
+    mine = replace(
+        ours("docker", service="npm"), networks=("proxy",)
+    )  # its stack goes down first: fine
     other = replace(ours("tools"), name="tools-x-1", networks=("proxy",))
     loose = Container("by-hand", "running", networks=("proxy", "bridge"))
     runtime = run({"bilbo": want}, {"bilbo": have}, {"bilbo": (mine, other, loose)})

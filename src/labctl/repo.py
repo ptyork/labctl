@@ -44,6 +44,7 @@ class TagInfo:
     labctl: str
     stacks_up: tuple[str, ...]
     dirs: Dirs
+    host_ip: str = ""  # the address `_HOST_IP_` had ("": none used, or a tag from before)
 
 
 @dataclass(frozen=True)
@@ -72,7 +73,7 @@ def tag_message(node: str, info: TagInfo) -> str:
         f"Stacks-Up: {' '.join(info.stacks_up)}\n"
         f"Deploy-Dir: {info.dirs.deploy_dir}\n"
         f"Appdata-Dir: {info.dirs.appdata_dir}\n"
-    )
+    ) + (f"Host-IP: {info.host_ip}\n" if info.host_ip else "")
 
 
 def parse_tag_message(text: str) -> TagInfo | None:
@@ -89,6 +90,7 @@ def parse_tag_message(text: str) -> TagInfo | None:
             tuple(fields.get("Stacks-Up", "").split()),
             # Docker-Home: tags made before DOCKER_HOME was renamed DEPLOY_DIR
             Dirs(fields.get("Deploy-Dir") or fields["Docker-Home"], fields["Appdata-Dir"]),
+            fields.get("Host-IP", ""),
         )
     except KeyError:
         return None

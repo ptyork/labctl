@@ -75,9 +75,9 @@ def test_secrets_edit_change_and_remove(
     shown: list[str] = []
     choose = menu.choose
 
-    def spy(title: str, header: str, options: Sequence[str], selected: int = 0) -> int | None:
+    def spy(title: str, options: Sequence[str], selected: int = 0, header: str = "") -> int | None:
         shown.extend(options)
-        return choose(title, header, options, selected)
+        return choose(title, options, selected, header)
 
     monkeypatch.setattr(menu, "choose", spy)
     run("secrets", "edit")

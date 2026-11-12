@@ -119,11 +119,17 @@ def test_mounting_appdata_dir_itself_is_rejected() -> None:
         reduce_config("cirdan", config, CIRDAN_APPDATA)
 
 
-def test_the_archive_folder_is_reserved() -> None:
-    source = f"{CIRDAN_APPDATA}/archive/plexms-20260101"
+def test_the_labctl_folder_is_reserved() -> None:
+    source = f"{CIRDAN_APPDATA}/.labctl/archive/plexms-20260101"
     config = {"services": {"x": {"volumes": [{"type": "bind", "source": source}]}}}
-    with pytest.raises(ComposeError, match="reserved"):
+    with pytest.raises(ComposeError, match="is labctl's"):
         reduce_config("cirdan", config, CIRDAN_APPDATA)
+
+
+def test_a_folder_called_archive_is_ordinary_data() -> None:
+    source = f"{CIRDAN_APPDATA}/archive/photos"
+    config = {"services": {"x": {"volumes": [{"type": "bind", "source": source}]}}}
+    reduce_config("cirdan", config, CIRDAN_APPDATA)
 
 
 def test_networks_by_real_name_with_their_services() -> None:

@@ -77,11 +77,7 @@ def fake_probe(monkeypatch: pytest.MonkeyPatch) -> FakeProbe:
 
     def probe(remote: Remote, paths: Sequence[tuple[str, str]]) -> dict[str, PathInfo]:
         fake.asked[remote.host] = list(paths)
-        default = {"A": PathInfo("archived")}
-        return {
-            p: fake.answers[remote.host].get(p, default.get(mode, PathInfo("missing")))
-            for p, mode in paths
-        }
+        return {p: fake.answers[remote.host].get(p, PathInfo("missing")) for p, mode in paths}
 
     monkeypatch.setattr(checks, "probe", probe)
     return fake
@@ -125,7 +121,8 @@ def test_existing_target_data_blocks_without_replace_stale(fake_probe: FakeProbe
     assert [(f.level, f.flag) for f in findings] == [(Level.BLOCK, "--replace-stale")]
     assert findings[0].message == (
         f"{ROOT_B}/plexms already exists on the target (directory, 5.0 MB, last modified "
-        f"2026-03-02); it will be archived to {ROOT_B}/archive/plexms-<timestamp> before the copy"
+        f"2026-03-02); it will be archived to {ROOT_B}/.labctl/archive/plexms-<timestamp> before "
+        "the copy"
     )
 
     findings, _ = check_paths([PLEX_MOVE], DESIRED, RECORDED, replace_stale=True)
@@ -140,24 +137,16 @@ def test_empty_target_dir_is_treated_as_missing(fake_probe: FakeProbe) -> None:
     assert findings == []
 
 
-def test_add_reuses_existing_data_and_points_out_archived_copies(fake_probe: FakeProbe) -> None:
+def test_add_reuses_existing_data(fake_probe: FakeProbe) -> None:
     fake_probe["cirdan"][f"{ROOT_B}/plexms"] = PathInfo("dir", 2048, WHEN)
-    fake_probe["cirdan"][f"{ROOT_B}/archive/plexms"] = PathInfo("archived", count=2)
     fake_probe["cirdan"].update(OUTSIDE_OK)
     findings, _ = check_paths([Add("plex", "cirdan")], DESIRED, RECORDED)
-    assert (f"{ROOT_B}/archive/plexms", "A") in fake_probe.asked["cirdan"]
     assert messages(findings) == [
         (
             Level.INFO,
             "cirdan",
             f"{ROOT_B}/plexms already has data (directory, 2.0 KB, last modified 2026-03-02); "
             "it will be used",
-        ),
-        (
-            Level.INFO,
-            "cirdan",
-            f"2 older archived copies ({ROOT_B}/archive/plexms-*), made before archives were "
-            "described: restore by hand if wanted",
         ),
     ]
 
@@ -177,17 +166,11 @@ def test_paths_the_ssh_user_cannot_see_are_not_reported_missing(fake_probe: Fake
 
 
 def test_parse_probe() -> None:
-    output = (
-        "/a\tdir\t2048\t1772409600\t\n"
-        "/b\tmissing\t\t\t\n"
-        "/c\tfile\t5\t\t\n"
-        "/r/archive/x\tarchived\t\t\t       2\n"
-    )
+    output = "/a\tdir\t2048\t1772409600\t7\n/b\tmissing\t\t\t\n/c\tfile\t5\t\t\n"
     assert parse_probe(output) == {
-        "/a": PathInfo("dir", 2048, datetime(2026, 3, 2, tzinfo=UTC)),
+        "/a": PathInfo("dir", 2048, datetime(2026, 3, 2, tzinfo=UTC), device="7"),
         "/b": PathInfo("missing"),
         "/c": PathInfo("file", 5),
-        "/r/archive/x": PathInfo("archived", count=2),
     }
 
 
@@ -207,7 +190,6 @@ def test_paths_are_probed_where_they_are_before_the_moves(fake_probe: FakeProbe)
     asked = dict(fake_probe.asked["cirdan"])
     assert asked["/old/appdata"] == "S" and asked[ROOT_B] == "S"
     assert asked["/old/appdata/plexms"] == "S"
-    assert asked["/old/appdata/archive/plexms"] == "A"
     assert f"{ROOT_B}/plexms" not in asked
     # Findings still name the post-move path.
     assert any(f.message.startswith(f"{ROOT_B}/plexms already has data") for f in findings)
@@ -232,7 +214,7 @@ def test_rename_onto_existing_data_needs_replace_stale(fake_probe: FakeProbe) ->
     fake_probe["cirdan"][f"{ROOT_B}/plex"] = PathInfo("dir", 10, WHEN)
     findings, _ = check_paths([], DESIRED, RECORDED, moves=[rename])
     assert [(f.level, f.flag) for f in findings] == [(Level.BLOCK, "--replace-stale")]
-    assert f"archived to {ROOT_B}/archive/plex-<timestamp>" in findings[0].message
+    assert f"archived to {ROOT_B}/.labctl/archive/plex-<timestamp>" in findings[0].message
     findings, _ = check_paths([], DESIRED, RECORDED, replace_stale=True, moves=[rename])
     assert [f.level for f in findings] == [Level.INFO]
 
@@ -297,10 +279,10 @@ def test_docker_sizes(text: str, size: int | None) -> None:
 
 
 def test_archive_names_and_labels() -> None:
-    assert archive_path("/srv/a", "plex") == "/srv/a/archive/plex"
+    assert archive_path("/srv/a", "plex") == "/srv/a/.labctl/archive/plex"
     assert (
         archive_path("/srv/a", "volume:homelab-frodo_db")
-        == "/srv/a/archive/volume-homelab-frodo_db"
+        == "/srv/a/.labctl/archive/volume-homelab-frodo_db"
     )
     assert key_label("plex") == "plex/"
     assert key_label("volume:homelab-frodo_db") == "volume homelab-frodo_db"

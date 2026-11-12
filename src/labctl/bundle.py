@@ -144,6 +144,7 @@ def resolve_desired(
     prompt: Prompt | None,
     source: Path | None = None,
     baseline: bool = False,
+    address: str = "",
 ) -> Desired:
     """
     The node's bundle, built from a copy of the lab config, and resolved.
@@ -203,7 +204,7 @@ def resolve_desired(
         [*sorted(referenced), *REQUIRED_VARS],
         None if baseline else prompt,
         SUGGESTIONS,
-        host_ip=(lambda: PLACEHOLDER_PREFIX + HOST_IP)
+        host_ip=(lambda: address or PLACEHOLDER_PREFIX + HOST_IP)
         if baseline
         else lambda: host_ip(node_remote(node)),
     )

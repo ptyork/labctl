@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
-from get_rich import Input
 from rich.markup import escape
 
 from labctl.bundle import REQUIRED_VARS
@@ -18,9 +17,9 @@ def ask_restore(service: str, node: str, copies: Sequence[Copy]) -> Copy | None:
     """In a terminal: which archived copy to restore, or none (Esc: the newest)."""
     options = [f"Restore {escape(copy.describe())}" for copy in copies] + ["Start it empty"]
     index = menu.choose(
-        f"[bold cyan]{escape(service)}[/] is added to {escape(node)}",
-        "Archived copies of its data exist. Enter chooses; Esc restores the newest.",
+        f"{escape(service)} is added to {escape(node)}: restore its data?",
         options,
+        header="Archived copies of its data exist. Esc restores the newest.",
     )
     if index is None:
         return copies[0]
@@ -33,20 +32,17 @@ def prompt_value(node: str, name: str, secret: bool, suggestion: str) -> str | N
     validators: list[Callable[[str], str | None]] = [_required]
     if _is_path_var(name):
         validators.append(_absolute_path)
-    control = Input(
-        prompt=f"{name}",
-        default_value=suggestion,
+    answer = menu.edit_text(
+        f"Value for {name} on {node}",
+        suggestion,
+        header=f"{node}'s compose files use it and nothing sets it. Saved to {where}; Esc skips.",
         validators=validators,
-        console=console,
-        title_text=f"[bold cyan]{node}[/]: missing {'secret' if secret else 'variable'}",
-        header_text=f"Referenced by {node}'s compose files; saved to {where}. Esc to skip.",
     )
-    answer = control.run()
     if answer is None:
         console.print(f"[yellow]![/] {node}: {name} skipped")
         return None
-    console.print(f"[green]✓[/] {node}: {name} = {escape(answer)} [dim](saved to {where})[/]")
-    return str(answer)
+    console.print(f"[green]✓[/] {node}: {name} = {escape(answer)}, saved to {where}")
+    return answer
 
 
 def _is_path_var(name: str) -> bool:

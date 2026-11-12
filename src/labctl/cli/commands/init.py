@@ -10,6 +10,7 @@ from typing import Any
 import click
 from rich.markup import escape
 
+from labctl.cli import menu
 from labctl.cli.commands.settings import save_setting
 from labctl.click import DebugOptions
 from labctl.console import console
@@ -125,7 +126,7 @@ def _done(made: bool, what: str) -> None:
     if made:
         console.print(f"[green]✓[/] {escape(what)}")
     else:
-        console.print(f"[dim]· {escape(what)}: already there[/]")
+        console.print(f"{escape(what)}: already there")
 
 
 def _make_it_the_lab_config(root: Path) -> None:
@@ -135,11 +136,11 @@ def _make_it_the_lab_config(root: Path) -> None:
         raise click.ClickException(problem)
     current = read_config(config_file()).get(setting.name, "").strip()
     if current and Path(current).expanduser().resolve() == root:
-        console.print(f"[dim]· {setting.name}: already {escape(current)}[/]")
+        console.print(f"{setting.name}: already {escape(current)}")
     elif (
         not current
         or sys.stdin.isatty()
-        and click.confirm(f"{setting.name} is {current}; make it {root}?", default=False)
+        and menu.confirm(f"{setting.name} is {current}. Make it {root}?")
     ):
         save_setting(setting, str(root))
     else:

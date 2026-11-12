@@ -5,10 +5,11 @@ import shutil
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from labctl.apply import ApplyError, Executor, NodeWork, RollbackFailed, node_work
+from labctl.apply import ApplyError, Executor, Node, NodeWork, RollbackFailed, node_work
 from labctl.bundle import Desired, Location, manifest, resolve_stacks
 from labctl.collect import HOME_POINTER, RECORD, Collected, NodeReport, Record, current_state
 from labctl.envfile import CompiledEnv
@@ -17,6 +18,7 @@ from labctl.planner import Migrate, Plan, Restore, Update, make_plan
 from labctl.remote import Remote
 from labctl.runtime import Container, NodeRuntime, Stop, TakeDown, analyse
 from labctl.settings import Settings
+from labctl.stack import Seen, Snapshot
 from labctl.state import Dirs, NodeState, Scope, Service, Stack, Volume
 
 HOME, APPDATA = "/srv/docker", "/srv/appdata"
@@ -27,8 +29,11 @@ NEW = Stack("homelab-cirdan", ("docker-compose.yml",))
 class FakeNode:
     """Records what apply runs; ``fail`` names a step (a substring of it) that fails."""
 
-    def __init__(self, fail: str = "", undo_fails: bool = False) -> None:
+    def __init__(
+        self, fail: str = "", undo_fails: bool = False, says: tuple[str, ...] = ()
+    ) -> None:
         self.calls: list[str] = []
+        self.says = says  # what compose up prints
         self.fail = fail
         self.undo_fails = undo_fails
         self.rolling_back = False
@@ -58,6 +63,13 @@ class FakeNode:
         self._call(" ".join(args))
         return ""
 
+    snapshots: list[Snapshot] = []  # what snapshot() returns, in turn (then the last again)
+
+    def snapshot(self) -> Snapshot:
+        if len(self.snapshots) > 1:
+            return self.snapshots.pop(0)
+        return self.snapshots[0] if self.snapshots else {}
+
     def script(self, script: str, *args: str) -> None:
         if HOME_POINTER in script:
             name = "pointer"
@@ -65,7 +77,7 @@ class FakeNode:
             name = "swap-out" if "previous/*" in script else "swap-in"
         self._call(f"{name} {' '.join(args)}")
 
-    def compose(self, home: str, stack: Stack, *args: str) -> None:
+    def compose(self, home: str, stack: Stack, *args: str, watch: Any = None) -> None:
         self._call(f"compose {home} {stack.name} {' '.join(args)}")
 
     def upload(self, local: Path, dest: str) -> None:
@@ -197,8 +209,8 @@ def test_steps_in_order_and_the_record(settings: Settings, tmp_path: Path) -> No
         f"upload {HOME}/.labctl/incoming",
         f"swap-in {HOME} apps docker-compose.yml",
         f"compose {HOME} homelab-cirdan up -d --remove-orphans",
-        f"move {APPDATA}/sonarr {APPDATA}/archive/sonarr-20261031-090000",
-        "sidecar archive/sonarr-20261031-090000.labctl.json",
+        f"move {APPDATA}/sonarr {APPDATA}/.labctl/archive/sonarr-20261031-090000",
+        "sidecar .labctl/archive/sonarr-20261031-090000.labctl.json",
         f"upload {HOME}",  # .labctl/applied.json and managed
         f"pointer {HOME}",  # ~/.labctl-home
     ]
@@ -308,13 +320,13 @@ def test_a_stack_that_was_down_gets_its_files_only(settings: Settings, tmp_path:
         f"upload {HOME}/.labctl/incoming",
         f"swap-in {HOME} apps docker-compose.yml",
         f"compose {HOME} homelab-cirdan config --quiet",
-        f"move {APPDATA}/sonarr {APPDATA}/archive/sonarr-20261031-090000",
-        "sidecar archive/sonarr-20261031-090000.labctl.json",
+        f"move {APPDATA}/sonarr {APPDATA}/.labctl/archive/sonarr-20261031-090000",
+        "sidecar .labctl/archive/sonarr-20261031-090000.labctl.json",
         f"upload {HOME}",
         "pointer /srv/docker",
         # undo
-        f"move {APPDATA}/archive/sonarr-20261031-090000 {APPDATA}/sonarr",
-        f"helper {APPDATA}/archive sonarr-20261031-090000",  # its sidecar
+        f"move {APPDATA}/.labctl/archive/sonarr-20261031-090000 {APPDATA}/sonarr",
+        f"helper {APPDATA}/.labctl/archive sonarr-20261031-090000",  # its sidecar
         f"swap-out {HOME} docker-compose.yml",
         f"compose {HOME} docker up --no-start --remove-orphans",
         f"compose {HOME} docker stop",
@@ -350,6 +362,118 @@ def test_services_on_a_port_held_outside_docker_are_created_not_started(
         f"compose {HOME} homelab-cirdan up -d --remove-orphans plex",
         f"compose {HOME} homelab-cirdan up --no-start heimdall",
     ]
+
+
+def test_stopped_services_stay_down_and_stay_stopped_on_undo(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """A service its restart policy leaves down is created, not started, and not waited for; undo
+    starts only what ran."""
+    runtime = replace(
+        UP,
+        running=frozenset({NEW.name}),
+        stay_down=("heimdall",),
+        partly_up={NEW.name: ("plex",)},
+    )
+    kept = replace(
+        work(tmp_path, services=("plex", "heimdall"), runtime=runtime),
+        old_stacks=(NEW,),
+        old_projects=frozenset({NEW.name}),
+    )
+    node = FakeNode(fail="pointer")
+    with pytest.raises(ApplyError):
+        run(settings, node, kept)
+    assert [call for call in node.calls if " up " in call] == [
+        f"compose {HOME} homelab-cirdan up -d --remove-orphans plex",
+        f"compose {HOME} homelab-cirdan up --no-start heimdall",
+        # undo
+        f"compose {HOME} homelab-cirdan up --no-start --remove-orphans",
+        f"compose {HOME} homelab-cirdan up -d plex",
+    ]
+
+
+def test_a_stack_left_down_is_named_at_the_end(settings: Settings, tmp_path: Path) -> None:
+    said: list[str] = []
+    executor = Executor(
+        settings, said.append, wait=5, when=datetime(2026, 10, 31, 9, 0), commit="c0ffee1"
+    )
+    executor.run({"cirdan": FakeNode()}, [work(tmp_path, runtime=NodeRuntime())], Plan())  # type: ignore[dict-item]
+    assert said[-1] == (
+        "cirdan/homelab-cirdan was not running, so we didn't automatically start it. Use labctl "
+        "node up cirdan/homelab-cirdan to start it."
+    )
+
+
+def test_each_step_is_marked_and_the_commit_is_asked_only_once_all_applied(
+    settings: Settings, tmp_path: Path
+) -> None:
+    said: list[str] = []
+    seen_before_commit: list[str] = []
+
+    def commit() -> str:
+        seen_before_commit.extend(said)
+        return "c0ffee1"
+
+    executor = Executor(
+        settings, said.append, wait=5, when=datetime(2026, 10, 31, 9, 0), commit_with=commit
+    )
+    executor.run({"cirdan": FakeNode()}, [work(tmp_path)], Plan())  # type: ignore[dict-item]
+    assert seen_before_commit == [
+        "[green]✓[/] cirdan: down docker",
+        "[green]✓[/] cirdan: files",
+        "[green]✓[/] cirdan: up homelab-cirdan: 1/1 running",
+        "[green]✓[/] cirdan: archive: sonarr/",
+        "",
+        "[green]✓[/] cirdan: applied",
+        "",
+    ]
+
+
+def test_a_failed_step_is_marked_and_nothing_is_committed(
+    settings: Settings, tmp_path: Path
+) -> None:
+    said: list[str] = []
+    committed: list[str] = []
+    executor = Executor(
+        settings,
+        said.append,
+        wait=5,
+        when=datetime(2026, 10, 31, 9, 0),
+        commit_with=lambda: committed.append("x") or "c0ffee1",
+    )
+    with pytest.raises(ApplyError):
+        executor.run({"cirdan": FakeNode(fail="homelab-cirdan up")}, [work(tmp_path)], Plan())  # type: ignore[dict-item]
+    assert "[bold red]✗[/] cirdan: up homelab-cirdan" in said
+    assert "Rolling back" in said
+    assert committed == []
+
+
+class StreamingRemote(Remote):
+    """A node whose compose prints two lines, then exits with ``code``."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__("cirdan")
+        self.code = code
+
+    def stream(self, command: str) -> Any:
+        assert "--progress plain" in command
+        code = self.code
+
+        class Proc:
+            stdout = iter([" Container web  Created\r\n", " Container web  Started\r\n"])
+
+            def wait(self) -> int:
+                return code
+
+        return Proc()
+
+
+def test_compose_output_is_read_and_shown_only_when_it_fails() -> None:
+    seen: list[str] = []
+    Node(StreamingRemote(0)).compose(HOME, NEW, "up", "-d", watch=seen.append)
+    assert seen == ["Container web  Created", "Container web  Started"]
+    with pytest.raises(ApplyError, match=r"failed \(homelab-cirdan\):\n    Container web  Created"):
+        Node(StreamingRemote(1)).compose(HOME, NEW, "up", "-d")
 
 
 DOCKER_RUN = Container("heimdall", "running", image="heimdall", restart="unless-stopped")
@@ -442,9 +566,9 @@ def test_a_migrate_stops_copies_verifies_places_then_archives_the_source(
         f"helper {APPDATA} {STAGING}",  # empty staging dirs removed
     ]
     # The source's copy is archived only after every node is up.
-    assert cirdan.index(f"move {APPDATA}/heimdall {APPDATA}/archive/heimdall-20261031-090000") > (
-        cirdan.index(f"compose {HOME} homelab-cirdan up -d --remove-orphans")
-    )
+    assert cirdan.index(
+        f"move {APPDATA}/heimdall {APPDATA}/.labctl/archive/heimdall-20261031-090000"
+    ) > (cirdan.index(f"compose {HOME} homelab-cirdan up -d --remove-orphans"))
 
 
 def test_a_bad_copy_is_archived_and_the_source_restarted(
@@ -459,7 +583,7 @@ def test_a_bad_copy_is_archived_and_the_source_restarted(
         run_two(settings, tmp_path, nodes, Plan(operations=(HEIMDALL,)))
     assert source.calls[-1] == f"compose {HOME} docker start heimdall"
     assert target.calls[-1] == (
-        f"move {APPDATA}/{STAGING} {APPDATA}/archive/incoming-failed-20261031-090000"
+        f"move {APPDATA}/{STAGING} {APPDATA}/.labctl/archive/incoming-failed-20261031-090000"
     )
 
 
@@ -506,7 +630,7 @@ def test_a_renamed_volume_is_copied_while_down_and_archived_once_up(
     node = FakeNode()
     node.volumes = {"docker_db": True}
     run(settings, node, renamed(tmp_path))
-    entry = f"archive/volume-docker_db-{STAMP}"
+    entry = f".labctl/archive/volume-docker_db-{STAMP}"
     calls = node.calls
     labels = [("com.docker.compose.project", NEW.name), ("com.docker.compose.volume", "db")]
     assert calls[:5] == [
@@ -612,8 +736,8 @@ def test_a_same_node_restore_moves_the_directory_back(settings: Settings, tmp_pa
     node = FakeNode()
     run(settings, node, work(tmp_path, archive=()), plan=Plan(operations=(restore,)))
     assert node.calls[:2] == [
-        f"move {APPDATA}/archive/plexms-20261101-090000 {APPDATA}/plex",
-        f"helper {APPDATA}/archive plexms-20261101-090000",  # its sidecar: .restored
+        f"move {APPDATA}/.labctl/archive/plexms-20261101-090000 {APPDATA}/plex",
+        f"helper {APPDATA}/.labctl/archive plexms-20261101-090000",  # its sidecar: .restored
     ]
 
 
@@ -638,7 +762,7 @@ def test_a_restore_from_another_node_copies_into_a_new_volume(
     executor.run(nodes, [target], Plan(operations=(restore,)))  # type: ignore[arg-type]
     assert relayed == ["cirdan->aragorn"]
     assert nodes["aragorn"].calls[0].startswith("volume create aragorn_db")
-    assert reader.calls == [f"sums {APPDATA}/archive/volume-cirdan_db-20261101-090000"]
+    assert reader.calls == [f"sums {APPDATA}/.labctl/archive/volume-cirdan_db-20261101-090000"]
 
 
 # ── Services moving between stacks (real compose) ─────────────────────────────
@@ -680,8 +804,16 @@ def restack(
     )
     current = current_state(settings, "cirdan", node, dirs, projects)
     running = tuple(
-        Container(f"{name}-1", "running", project=name, files=files, managed=True)
-        for name, files in projects.items()
+        Container(
+            f"{service.stack}-{service.name}-1",
+            "running",
+            project=service.stack,
+            service=service.name,
+            files=projects[service.stack],
+            managed=True,
+        )
+        for service in current.services.values()
+        if service.stack in projects
     )
     collected = Collected(
         desired={"cirdan": desired},
@@ -777,3 +909,37 @@ def test_node_commands_name_paths_inside_the_helper(monkeypatch: pytest.MonkeyPa
     assert move[-2:] == ("/x/.labctl/incoming/op/heimdall", "/x/heimdall")
     assert state[4] == f"{APPDATA}:/x" and state[-1] == "heimdall"
     assert sums[4] == f"{APPDATA}/.labctl/incoming/op:/x:ro" and sums[-1] == "heimdall"
+
+
+def test_the_up_step_says_which_containers_changed(settings: Settings, tmp_path: Path) -> None:
+    said: list[str] = []
+    node = FakeNode()
+    node.snapshots = [
+        {  # before: plex in the old stack, a container compose removes as an orphan
+            ("docker", "plex"): Seen(frozenset({"a1"}), True),
+            ("homelab-cirdan", "old"): Seen(frozenset({"o1"}), True),
+        },
+        {  # after: plex moved in with a new container, heimdall made
+            ("homelab-cirdan", "plex"): Seen(frozenset({"b2"}), True),
+            ("homelab-cirdan", "heimdall"): Seen(frozenset({"h1"}), False),
+        },
+    ]
+    executor = Executor(settings, said.append, wait=5, when=datetime(2026, 10, 31, 9, 0))
+    executor.run({"cirdan": node}, [work(tmp_path)], Plan())  # type: ignore[dict-item]
+    assert (
+        "[green]✓[/] cirdan: up homelab-cirdan: 1/1 running, recreated plex; created heimdall; "
+        "removed old" in said
+    )
+
+
+def test_a_rollback_says_what_does_not_run_as_before(settings: Settings, tmp_path: Path) -> None:
+    said: list[str] = []
+    node = FakeNode(fail="archive")
+    node.snapshots = [
+        {("docker", "plex"): Seen(frozenset({"a1"}), True)},
+        {("docker", "plex"): Seen(frozenset({"a1"}), False)},
+    ]
+    executor = Executor(settings, said.append, wait=5, when=datetime(2026, 10, 31, 9, 0))
+    with pytest.raises(ApplyError):
+        executor.run({"cirdan": node}, [work(tmp_path)], Plan())  # type: ignore[dict-item]
+    assert "[yellow]![/] cirdan: not running as before the apply: plex" in said

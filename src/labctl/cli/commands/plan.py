@@ -31,6 +31,7 @@ from labctl.checks import (
     PathInfo,
     check_paths,
 )
+from labctl.cli import menu
 from labctl.cli.commands.settings import load_settings
 from labctl.cli.git_sync import (
     branch_notices,
@@ -45,14 +46,13 @@ from labctl.cli.render import (
     render_drift,
     render_files,
     render_findings,
+    render_held,
     render_moves,
     render_nodes,
     render_notices,
     render_problems,
-    render_repo,
     render_repo_notices,
     render_runtime,
-    render_services,
     render_stacks,
     render_summary,
 )
@@ -71,6 +71,7 @@ from labctl.planner import (
     Remove,
     make_plan,
 )
+from labctl.progress import Progress
 from labctl.remote import Remote, RemoteError, node_remote
 from labctl.repo import ConfigRepo, RepoError, TagInfo
 from labctl.restore import Ask, Restores, find_archives, plan_restores
@@ -101,10 +102,7 @@ def plan_cmd(options: Options, **kwargs: Any) -> None:
     "-y",
     "yes",
     is_flag=True,
-    help=(
-        "Do not ask before applying a plan with checks, notices, node edits, a first apply or an "
-        "unreachable node."
-    ),
+    help=("Do not ask before applying a plan with checks, notices, node edits or a first apply."),
 )
 @click.option(
     "--wait",
@@ -158,9 +156,7 @@ def _run(
     try:
         fetched = repo.fetch()
         catch_up(repo, options, ask=sys.stdin.isatty() and not yes, applying=not dry_run)
-        changes = repo.changes()
         notices = branch_notices(repo, fetched)
-        render_repo(repo, changes, fetched)
         # apply pins the working tree as it is now: what it plans, ships, and commits once applied
         tree = None if dry_run else repo.snapshot()
         with collect(settings, scope, secrets, prompt, repo, tree) as collected:
@@ -225,13 +221,8 @@ def _confirm(reasons: list[str], conflicts: bool = False) -> None:
         raise click.ClickException(
             f"The plan has {', '.join(reasons)}; confirm in a terminal, or pass --yes"
         )
-    if conflicts:  # the last reason says what apply does about them
-        *others, actions = reasons
-        question = f"The plan has {', '.join(others)}. " if others else ""
-        question += f"{actions[0].upper()}{actions[1:]}, and apply?"
-    else:
-        question = f"The plan has {', '.join(reasons)}. Apply it?"
-    if not click.confirm(f"\n{question}", default=False):
+    console.print()
+    if not menu.confirm("Apply plan?"):
         raise click.ClickException("Not applied")
 
 
@@ -274,9 +265,6 @@ def _apply(
                 raise ApplyError(
                     "Cannot plan again under the lock:\n  " + "\n  ".join(again.errors)
                 )
-            if again.scope != planned.scope:
-                gone = ", ".join(sorted(set(again.unreachable) - set(planned.unreachable)))
-                raise ApplyError(f"Cannot reach {gone or 'a node'} any more; run apply again")
             computed = _compute(again, options)
             if computed.works is None:
                 raise ApplyError(computed.work_error)
@@ -293,6 +281,7 @@ def _apply(
                 options.replace_stale,
                 tree=tree,
                 commit_with=lambda: commit_applied(repo, tree, base, message),
+                progress=Progress(console.print, console),
             )
             console.print()
             try:
@@ -304,6 +293,8 @@ def _apply(
             except RollbackFailed:
                 stuck = True
                 raise
+            except ApplyError as exc:  # already shown, with the rollback
+                raise click.ClickException("Not applied: everything was rolled back") from exc
             when = executor.when.isoformat(timespec="seconds")
             for work in computed.works:
                 if work.node not in executor.recorded:
@@ -313,7 +304,14 @@ def _apply(
                     if work.record_only
                     else work.runtime.start
                 )
-                info = TagInfo(when, by, _version(), tuple(sorted(up)), work.desired.dirs)
+                info = TagInfo(
+                    when,
+                    by,
+                    _version(),
+                    tuple(sorted(up)),
+                    work.desired.dirs,
+                    work.desired.env.host_ip,
+                )
                 tags.append((work.node, info))
     finally:
         if not stuck:
@@ -327,7 +325,8 @@ def _apply(
                 f"{executor.commit[:7]}, is not on it (its tags name it). Merge it:\n"
                 f"  git -C {repo.root} merge {executor.commit[:12]}[/]"
             )
-        publish_applied(repo, executor.commit, executor.stamp, tags, advanced)
+        committed = executor.commit != planned.base
+        publish_applied(repo, executor.commit, executor.stamp, tags, advanced, committed)
 
 
 def _version() -> str:
@@ -345,8 +344,7 @@ class Planned:
     files: object  # bundles and node files planned against: must not change before applying
     runtime: Runtime = Runtime()
     works: tuple[NodeWork, ...] = ()
-    scope: Scope = Scope()  # less the nodes found unreachable
-    unreachable: tuple[str, ...] = ()
+    scope: Scope = Scope()
     tree: str | None = None  # the snapshot planned (None: plan, the working tree)
     base: str = ""  # HEAD when planned: the snapshot is committed on it
     options: Options | None = None  # with the restore choices made
@@ -428,7 +426,6 @@ def _compute(collected: Collected, options: Options, ask: Ask | None = None) -> 
         listeners=collected.listeners,
         missing=collected.missing,
         work={work.node for work in works or () if not work.record_only},
-        start_all=options.start,
     )
     with_runtime = (
         tuple(replace(work, runtime=runtime.for_node(work.node)) for work in works)
@@ -471,9 +468,9 @@ def _plan_and_render(
     render_problems(plan.problems, placeholders)
     render_drift(collected)
     files_changed = render_files(collected, scope, options.verbose)
-    render_stacks(collected, runtime, work_nodes, options.verbose)
+    render_stacks(plan, collected, runtime, work_nodes, probes, options.verbose)
     render_moves(plan, probes)
-    render_services(plan, collected, probes)
+    render_held(plan, collected)
     for note in restores.notes:
         console.print(f"  [cyan]i[/] {escape(note)}")
     for error in restores.errors:
@@ -506,7 +503,7 @@ def _plan_and_render(
     for work in computed.works or ():
         if work.record_only:
             console.print(
-                f"  [dim]{work.node}: nothing to change; apply records {at} there, and tags it[/]"
+                f"  {work.node}: nothing to change; apply records {at} there, and tags it"
             )
 
     confirm = []
@@ -526,8 +523,6 @@ def _plan_and_render(
     first = [work.node for work in computed.works or () if _source(collected, work.node) == "first"]
     if first:
         confirm.append(f"a first apply on {', '.join(first)}")
-    if collected.unreachable:
-        confirm.append(f"{', '.join(collected.unreachable)} unreachable")
     if repo_notices:
         n = len(repo_notices)
         confirm.append(f"{n} repo notice{'s' if n > 1 else ''}")
@@ -539,7 +534,6 @@ def _plan_and_render(
         runtime,
         computed.works or (),
         scope,
-        collected.unreachable,
         collected.tree,
         collected.base,
         options,

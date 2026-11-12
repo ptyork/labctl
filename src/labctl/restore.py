@@ -1,9 +1,9 @@
 """Restoring archived data to a service that is added to a node.
 
-apply never deletes data: what no service uses any more is archived to APPDATA_DIR/archive (a
-volume as files), each entry with a sidecar, ``<entry>.labctl.json``: the node, the apply's stamp,
-why it was archived, and every mount it held (service, stack, container path, data key). That is
-what makes an archive restorable.
+apply never deletes data: what no service uses any more is archived to APPDATA_DIR/.labctl/archive
+(a volume as files), each entry with a sidecar, ``<entry>.labctl.json``: the node, the apply's
+stamp, why it was archived, and every mount it held (service, stack, container path, data key).
+That is what makes an archive restorable.
 
 When a stateful service is added to a node and the nodes read hold archived copies of its data,
 the newest copy is restored by default: the copies are matched by service and container path (the
@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 from labctl.checks import human_size
+from labctl.compose import ARCHIVE_DIR
 from labctl.planner import Add, Plan, Restore
 from labctl.remote import Remote, RemoteError
 from labctl.state import NodeState, is_volume, under
@@ -29,12 +30,12 @@ from labctl.state import NodeState, is_volume, under
 SIDECAR = ".labctl.json"
 
 # $1: APPDATA_DIR. Each sidecar whose entry is still there: entry, size, then the JSON on one line.
-_LIST = """\
-cd "$1/archive" 2>/dev/null || exit 0
+_LIST = f"""\
+cd "$1/{ARCHIVE_DIR}" 2>/dev/null || exit 0
 find . -name '*.labctl.json' -type f | while IFS= read -r f; do
-  e=${f%.labctl.json}
+  e=${{f%.labctl.json}}
   [ -e "$e" ] || continue
-  printf '%s\\t%s\\t' "${e#./}" "$(du -sb "$e" 2>/dev/null | cut -f1)"
+  printf '%s\\t%s\\t' "${{e#./}}" "$(du -sb "$e" 2>/dev/null | cut -f1)"
   tr -d '\\n' < "$f"
   echo
 done

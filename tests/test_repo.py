@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -86,6 +87,11 @@ def test_tag_message_round_trip_and_nothing_secret() -> None:
     assert parse_tag_message("some tag someone made by hand") is None
     # Made before DOCKER_HOME was renamed DEPLOY_DIR.
     assert parse_tag_message(message.replace("Deploy-Dir:", "Docker-Home:")) == INFO
+    # The node's address, when `_HOST_IP_` used it (a tag from before has none).
+    addressed = replace(INFO, host_ip="10.11.12.31")
+    assert "Host-IP: 10.11.12.31" in tag_message("frodo", addressed)
+    assert parse_tag_message(tag_message("frodo", addressed)) == addressed
+    assert "Host-IP" not in message
 
 
 def test_the_latest_apply_tag_of_a_node(tmp_path: Path, make_repo: MakeRepo) -> None:

@@ -15,7 +15,7 @@ from labctl.cli import cli
 from labctl.cli.commands import node as node_module
 from labctl.remote import Remote
 from labctl.settings import write_config
-from labctl.stack import ServiceStatus, compose_command, ps_rows, statuses
+from labctl.stack import Seen, ServiceStatus, compose_command, ps_rows, statuses
 from labctl.state import Stack
 
 POINTERS: dict[str, str] = {}  # node -> what its ~/.labctl-home says
@@ -59,7 +59,10 @@ def ran(
         return 1 if self.host in failing else 0
 
     def execute(self: Remote, args: Sequence[str], cwd: str) -> remote_module.Result:
-        """Only the ~/.labctl-home pointer is read this way: set in POINTERS."""
+        """The ~/.labctl-home pointer (set in POINTERS) and the containers (none) are read this
+        way."""
+        if tuple(args[:2]) == ("docker", "ps"):
+            return remote_module.Result("", "", 0)
         home = POINTERS.get(self.host)
         if home:
             return remote_module.Result(home + "\n", "", 0)
@@ -129,6 +132,25 @@ def test_services_run_in_their_own_stacks(ran: list[tuple[str, str]]) -> None:
         ("frodo", compose_command("/srv/frodo", MEDIA, *pull, "tdarr")),
     ]
     assert "frodo: no stack has sonarr" in invoke("up", "frodo", "-s", "sonarr").output
+
+
+def test_update_pulls_ups_and_prunes(ran: list[tuple[str, str]]) -> None:
+    assert invoke("update", "frodo/media", "-s", "plex").exit_code == 0
+    assert commands(ran) == [
+        ("frodo", compose_command("/srv/frodo", MEDIA, "pull", "--ignore-pull-failures", "plex")),
+        ("frodo", compose_command("/srv/frodo", MEDIA, "up", "-d", "--remove-orphans", "plex")),
+        ("frodo", "docker image prune --force"),  # node-wide, also for one stack
+    ]
+
+
+@pytest.mark.usefixtures("failing")
+def test_update_goes_no_further_on_a_node_that_fails(ran: list[tuple[str, str]]) -> None:
+    result = invoke("update", "cirdan", "frodo")
+    assert result.exit_code == 1
+    assert [command.split()[-1] for host, command in commands(ran) if host == "cirdan"] == [
+        "--ignore-pull-failures"
+    ]
+    assert len(commands(ran)) == 1 + 4 + 1  # frodo: pull and up on two stacks, then prune
 
 
 def test_several_targets(ran: list[tuple[str, str]]) -> None:
@@ -308,3 +330,18 @@ def test_every_file_in_deploy_dir_counts(monkeypatch: pytest.MonkeyPatch) -> Non
     settings = Settings(lab_config=Path("/unused"), config_dir=Path("/unused"))
     stack_module.deployed(settings, "cirdan", Remote("cirdan"))
     assert seen == [["docker-compose.yml", "stack.yml", "apps"]]
+
+
+def test_up_says_which_containers_changed(
+    ran: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = [
+        {("homelab-cirdan", "heimdall"): Seen(frozenset({"1"}), True)},
+        {("homelab-cirdan", "heimdall"): Seen(frozenset({"2"}), True)},
+    ]
+    monkeypatch.setattr(node_module, "read_snapshot", lambda remote, project: seen.pop(0))
+    result = invoke("up", "cirdan")
+    assert result.exit_code == 0, result.output
+    assert "✓ cirdan: recreated heimdall" in result.output
+    seen.extend([{}, {}])
+    assert "✓ cirdan: no containers changed" in invoke("up", "cirdan").output

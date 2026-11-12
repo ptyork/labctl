@@ -19,14 +19,14 @@ One run, in phases across the nodes it changes:
       volume on either side (a service in another stack mounts another volume) is a copy;
    c. files: every top-level name in DEPLOY_DIR except .labctl and data goes to
       DEPLOY_DIR/.labctl/previous/ (the config backup), the bundle takes their place;
-   d. up: the stacks that run after apply (those up before, or that a running service moves into;
-      `up -d --remove-orphans`, compose itself recreates only what changed), then wait until their
-      services run (and are healthy, where they have a healthcheck). Services publishing a port
-      held outside Docker are created, not started. The other stacks get their files only (checked
-      with `config`): a stack that was down, or is new, stays down.
+   d. up: the stacks that run after apply (see runtime.py; `up -d --remove-orphans`, compose
+      itself recreates only what changed), then wait until their services run (and are healthy,
+      where they have a healthcheck). Services publishing a port held outside Docker, and stopped
+      services their restart policy leaves down, are created, not started. The other stacks get
+      their files only (checked with `config`): a stack that was down stays down.
 3. archive: data of removed services, the sources of migrates and the old side of volume renames
-   go to APPDATA_DIR/archive/<path>-<timestamp> (a volume: copied to archive/volume-<name>-<ts>,
-   checked, then removed; one another container still uses stays). Each entry gets a sidecar,
+   go to APPDATA_DIR/.labctl/archive/<path>-<timestamp> (a volume: copied to volume-<name>-<ts>
+   there, checked, then removed; one another container still uses stays). Each entry gets a sidecar,
    <entry>.labctl.json, saying what it held, for restoring it. Names the bundle does not have
    (stack files left from before, ...) go from .labctl/previous to
    DEPLOY_DIR/.labctl/archive/<name>-<timestamp>.
@@ -48,6 +48,7 @@ created removed on undo, and a migrate's copy that does not stay is archived as
 from __future__ import annotations
 
 import json
+import logging
 import posixpath
 import tempfile
 import time
@@ -57,6 +58,8 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import Any
+
+from rich.markup import escape
 
 from labctl.bundle import Desired, stack_args, top_level
 from labctl.checks import archive_name, key_label, move_paths
@@ -72,12 +75,21 @@ from labctl.collect import (
 from labctl.compose import ARCHIVE_DIR
 from labctl.moves import VOLUME, Move
 from labctl.planner import Migrate, Plan, Remove, Restore, archived_keys
+from labctl.progress import Progress, Step
 from labctl.remote import Remote, execute, node_remote, relay
 from labctl.repo import tag_name
 from labctl.restore import SIDECAR
 from labctl.runtime import NodeRuntime
 from labctl.settings import Settings
-from labctl.stack import compose_command, ps_rows
+from labctl.stack import (
+    SNAPSHOT_COMMAND,
+    Snapshot,
+    compose_command,
+    container_changes,
+    not_up_again,
+    ps_rows,
+    snapshot,
+)
 from labctl.state import (
     NodeState,
     Scope,
@@ -267,13 +279,38 @@ class Node:
             raise ApplyError(f"{self.name}: {' '.join(args)}: {result.stderr.strip()}")
         return result.stdout
 
+    def snapshot(self) -> Snapshot:
+        """The node's compose containers now."""
+        return snapshot(self.run(*SNAPSHOT_COMMAND))
+
     def script(self, script: str, *args: str) -> None:
         self.run("sh", "-c", script, "sh", *args)
 
-    def compose(self, home: str, stack: Stack, *args: str) -> None:
-        """A compose command with its output shown as it runs."""
-        if self.remote.run(compose_command(home, stack, *args)):
-            raise ApplyError(f"{self.name}: docker compose {' '.join(args)} failed ({stack.name})")
+    def compose(
+        self, home: str, stack: Stack, *args: str, watch: Callable[[str], None] | None = None
+    ) -> None:
+        """A compose command. Its output is read, line by line (to ``watch``), and shown only when
+        it fails; with debug logging it goes straight to the terminal."""
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            if self.remote.run(compose_command(home, stack, *args)):
+                raise ApplyError(
+                    f"{self.name}: docker compose {' '.join(args)} failed ({stack.name})"
+                )
+            return
+        proc = self.remote.stream(compose_command(home, stack, *args, progress="plain"))
+        assert proc.stdout is not None
+        lines = []
+        for raw in proc.stdout:
+            line = raw.strip()
+            if line:
+                lines.append(line)
+                if watch is not None:
+                    watch(line)
+        if proc.wait():
+            shown = "\n".join(f"    {line}" for line in lines[-20:])
+            raise ApplyError(
+                f"{self.name}: docker compose {' '.join(args)} failed ({stack.name}):\n{shown}"
+            )
 
     def upload(self, local: Path, dest: str) -> None:
         self.remote.upload(local, dest)
@@ -396,6 +433,16 @@ class Executor:
     tree: str = ""  # the lab config's tree applied (named in archive sidecars)
     # Makes the commit once everything is up, before the records name it (sets ``commit``).
     commit_with: Callable[[], str] | None = None
+    # The steps as they run (default: each finished step printed with ``say``).
+    progress: Progress | None = None
+    # Each node's containers before this run touched it.
+    before: dict[str, Snapshot] = field(default_factory=dict)
+
+    @property
+    def steps(self) -> Progress:
+        if self.progress is None:
+            self.progress = Progress(self.say)
+        return self.progress
 
     @property
     def stamp(self) -> str:
@@ -424,31 +471,40 @@ class Executor:
         migrates = [op for op in plan.operations if isinstance(op, Migrate)]
         restores = [op for op in plan.operations if isinstance(op, Restore)]
         changes = [work for work in works if not work.record_only]
+        for work in changes:
+            self.before[work.node] = nodes[work.node].snapshot()
         try:
-            for work in changes:
-                self._clear_the_way(nodes[work.node], work, undo)
-            for index, op in enumerate(migrates):
-                self._migrate(nodes, by_node, op, index, undo)
-            for restore in restores:
-                self._restore(nodes, by_node, restore, undo)
-            for work in changes:
-                self._node(nodes[work.node], work, undo)
-            for work in changes:
-                self._archive(nodes[work.node], work, undo)
+            with self.steps:
+                for work in changes:
+                    self._clear_the_way(nodes[work.node], work, undo)
+                for index, op in enumerate(migrates):
+                    self._migrate(nodes, by_node, op, index, undo)
+                for restore in restores:
+                    self._restore(nodes, by_node, restore, undo)
+                for work in changes:
+                    self._node(nodes[work.node], work, undo)
+                for work in changes:
+                    self._archive(nodes[work.node], work, undo)
+            self.say("")
+            for work in works:
+                done = "recorded (nothing to change)" if work.record_only else "applied"
+                self.say(f"[green]✓[/] {work.node}: {done}")
+            self.say("")
             if self.commit_with is not None:
                 self.commit = self.commit_with()
             for work in works:
                 self._record(nodes[work.node], work)
         except Exception as exc:
-            self.say(f"[red]✗ {exc}[/]")
-            self.say("[yellow]Rolling back[/]")
+            self.say(f"[bold red]✗[/] {escape(str(exc))}")
+            self.say("Rolling back")
             failures = []
             for label, action in reversed(undo):
-                self.say(f"  [dim]undo: {label}[/]")
+                self.say(f"  undo: {escape(label)}")
                 try:
                     action()
                 except Exception as undo_exc:  # keep undoing the rest
                     failures.append(f"{label}: {undo_exc}")
+            self._check_rolled_back(nodes, changes)
             if failures:
                 raise RollbackFailed(
                     "apply failed and the rollback did too; the locks stay in place:\n  "
@@ -456,20 +512,43 @@ class Executor:
                 ) from exc
             raise
         for work in changes:
-            self._report_deferred(work)
+            self._report_not_started(work)
+
+    def _check_rolled_back(self, nodes: Mapping[str, Node], works: Sequence[NodeWork]) -> None:
+        """After a rollback: a warning for each service that ran before the apply and does not
+        now."""
+        for work in works:
+            try:
+                missing = not_up_again(self.before[work.node], nodes[work.node].snapshot())
+            except Exception:  # the node may be the reason for the rollback
+                continue
+            if missing:
+                self.say(
+                    f"[yellow]![/] {work.node}: not running as before the apply: "
+                    f"{escape(', '.join(missing))}"
+                )
 
     def _as_before(
-        self, node: Node, home: str, stack: Stack, was_up: bool
+        self, node: Node, home: str, stack: Stack, was_up: bool, work: NodeWork
     ) -> tuple[str, Callable[[], object]]:
-        """The undo that brings a stack back as it was: up, or with its containers stopped."""
-        if was_up:
+        """The undo that brings a stack back as it was: up (but the services that were stopped),
+        or with its containers stopped."""
+        if not was_up:
+            return (f"{stack.name} back, stopped", partial(self._stopped, node, home, stack))
+        services = work.runtime.partly_up.get(stack.name)
+        if services is None:
             return (f"up {stack.name}", partial(node.compose, home, stack, "up", "-d"))
-        return (f"{stack.name} back, stopped", partial(self._stopped, node, home, stack))
+        return (f"up {stack.name}", partial(self._partly_up, node, home, stack, services))
 
     @staticmethod
     def _stopped(node: Node, home: str, stack: Stack) -> None:
         node.compose(home, stack, "up", "--no-start", "--remove-orphans")
         node.compose(home, stack, "stop")
+
+    @staticmethod
+    def _partly_up(node: Node, home: str, stack: Stack, services: Sequence[str]) -> None:
+        node.compose(home, stack, "up", "--no-start", "--remove-orphans")
+        node.compose(home, stack, "up", "-d", *services)
 
     ##########################################################################
 
@@ -481,13 +560,13 @@ class Executor:
         for down in work.runtime.take_down:
             project = Stack(down.project, down.files)
             node.log(f"down {down.project} in {down.working_dir}")
-            self.say(f"[bold]{work.node}[/]: down {down.project} (from {down.working_dir})")
-            node.compose(down.working_dir, project, "down")
-            undo.append(self._as_before(node, down.working_dir, project, down.running))
+            with self.steps.step(work.node, f"down {down.project} (from {down.working_dir})"):
+                node.compose(down.working_dir, project, "down")
+            undo.append(self._as_before(node, down.working_dir, project, down.running, work))
         for stop in work.runtime.stops:
             name, restart = stop.container.name, stop.container.restart
             node.log(f"stop {name}")
-            self.say(f"[bold]{work.node}[/]: stop {name}")
+            self.steps.note(f"{work.node}: stop {name}")
             if restart != "no":
                 node.run("docker", "update", "--restart=no", name)
                 undo.append(
@@ -501,13 +580,13 @@ class Executor:
                 undo.append((f"start {name}", partial(node.run, "docker", "start", name)))
             if stop.rename:
                 aside = f"{name}-labctl-{self.stamp}"
-                self.say(f"[bold]{work.node}[/]: rename {name} → {aside}")
+                self.steps.note(f"{work.node}: rename {name} → {aside}")
                 node.run("docker", "rename", name, aside)
                 undo.append(
                     (f"rename {aside} back", partial(node.run, "docker", "rename", aside, name))
                 )
 
-    def _report_deferred(self, work: NodeWork) -> None:
+    def _report_not_started(self, work: NodeWork) -> None:
         services = sorted(work.runtime.defer)
         if services:
             self.say(
@@ -515,6 +594,13 @@ class Executor:
                 f"held outside Docker); once it is free: labctl node up {work.node} "
                 + " ".join(f"-s {service}" for service in services)
             )
+        for stack in work.desired.state.stacks:
+            if stack not in work.runtime.start:
+                target = f"{work.node}/{stack}"
+                self.say(
+                    f"{target} was not running, so we didn't automatically start it. Use labctl "
+                    f"node up {target} to start it."
+                )
 
     ##########################################################################
 
@@ -550,7 +636,7 @@ class Executor:
                 continue
             stack = next(old_stack for old_stack in src.old_stacks if old_stack.name == name)
             source.log(f"stop {' '.join(services)}")
-            self.say(f"[bold]{op.source}[/]: stop {', '.join(services)}")
+            self.steps.note(f"{op.source}: stop {', '.join(services)}")
             source.compose(src.old_home, stack, "stop", *services)
             undo.append(
                 (
@@ -562,7 +648,7 @@ class Executor:
         # Copy into the target's staging dir (a volume: straight into it), check it arrived intact.
         staging = f".labctl/incoming/{op.source}-{self.stamp}-{index}"
         target.log(f"copy {label}")
-        self.say(f"[bold]migrate[/] {label}: copying {', '.join(key_label(k) for k, _ in pairs)}")
+        self.steps.note(f"migrate {label}: copying {', '.join(key_label(k) for k, _ in pairs)}")
         undo.append(
             (
                 f"archive the partial copy on {op.target}",
@@ -611,12 +697,14 @@ class Executor:
                 raise ApplyError(
                     f"migrate {label}: the copy on {op.target} differs from the source"
                 )
-            self.say(f"[bold]migrate[/] {label}: verified ({len(sent.splitlines())} files)")
+            self.steps.note(
+                f"[green]✓[/] migrate {label}: verified ({len(sent.splitlines())} files)"
+            )
             staged += [(key, to_target.get(key, key)) for key in keys]
         for key, new_key in streams:
             spec = mount_spec(src_root, key)
             if not self._data_there(source, src_root, key):
-                self.say(
+                self.steps.note(
                     f"[yellow]![/] migrate {label}: {key_label(key)} is not on {op.source}; "
                     "nothing to copy"
                 )
@@ -648,8 +736,8 @@ class Executor:
                     f"migrate {label}: the copy of {key_label(key)} on {op.target} differs from "
                     "the source"
                 )
-            self.say(
-                f"[bold]migrate[/] {label}: {key_label(new_key)} verified "
+            self.steps.note(
+                f"[green]✓[/] migrate {label}: {key_label(new_key)} verified "
                 f"({len(sent.splitlines())} files)"
             )
 
@@ -685,7 +773,9 @@ class Executor:
                 (
                     f"archive the copy of {new_key} on {op.target}",
                     partial(
-                        target.move, final, f"{dst_root}/archive/{new_key}-failed-{self.stamp}"
+                        target.move,
+                        final,
+                        f"{dst_root}/{ARCHIVE_DIR}/{new_key}-failed-{self.stamp}",
                     ),
                 )
             )
@@ -715,6 +805,7 @@ class Executor:
                     return  # empty: compose (or Docker) made it; used as it is
                 self._refuse_stale(node, key)
                 self._archive_volume(node, root, name, "replaced", work.old_services, undo)
+                self.steps.note(f"{node.name}: volume {name} was in the way; archived")
             node.volume_create(name, labels)
             undo.append((f"remove volume {name} on {node.name}", partial(node.volume_remove, name)))
             return
@@ -770,9 +861,8 @@ class Executor:
         for entry, key in op.entries:
             archived = f"{op.root}/{ARCHIVE_DIR}/{entry}"
             target.log(f"restore {entry} to {key}")
-            self.say(
-                f"[bold]restore[/] {label}: {key_label(key)} from {op.source}'s "
-                f"{ARCHIVE_DIR}/{entry}"
+            self.steps.note(
+                f"restore {label}: {key_label(key)} from {op.source}'s {ARCHIVE_DIR}/{entry}"
             )
             if op.source == op.node and not is_volume(key):
                 self._clear(target, root, key, undo, work)
@@ -812,8 +902,8 @@ class Executor:
             sent = source.sums(archived)
             if sent != target.sums(spec):
                 raise ApplyError(f"restore {label}: the copy of {entry} differs from the archive")
-            self.say(
-                f"[bold]restore[/] {label}: {key_label(key)} verified "
+            self.steps.note(
+                f"[green]✓[/] restore {label}: {key_label(key)} verified "
                 f"({len(sent.splitlines())} files)"
             )
 
@@ -826,7 +916,7 @@ class Executor:
         services: Mapping[str, Service],
         undo: Undo,
     ) -> None:
-        """Copy a volume into APPDATA_DIR/archive (checked), then remove it."""
+        """Copy a volume into the APPDATA_DIR archive (checked), then remove it."""
         key = volume_key(name)
         entry = f"{ARCHIVE_DIR}/{archive_name(key)}-{self.stamp}"
         node.log(f"archive volume {name}")
@@ -843,7 +933,6 @@ class Executor:
                 partial(self._unarchive_volume, node, root, name, entry, labels),
             )
         )
-        self.say(f"[bold]{node.name}[/]: archive volume {name} → {entry}")
 
     @staticmethod
     def _unarchive(node: Node, entry: str, path: str) -> None:
@@ -892,7 +981,7 @@ class Executor:
 
     def _archive_if_there(self, node: Node, root: str, path: str, name: str) -> None:
         if node.exists(f"{root}/{path}"):
-            node.move(f"{root}/{path}", f"{root}/archive/{name}-{self.stamp}")
+            node.move(f"{root}/{path}", f"{root}/{ARCHIVE_DIR}/{name}-{self.stamp}")
 
     ##########################################################################
 
@@ -912,9 +1001,9 @@ class Executor:
         stopping = active if work.moves else going
         for stack in reversed(stopping):
             node.log(f"down {stack.name}")
-            self.say(f"[bold]{work.node}[/]: down {stack.name}")
-            node.compose(work.old_home, stack, "down")
-            undo.append(self._as_before(node, work.old_home, stack, stack.name in was_up))
+            with self.steps.step(work.node, f"down {stack.name}") as step:
+                node.compose(work.old_home, stack, "down", watch=step.update)
+            undo.append(self._as_before(node, work.old_home, stack, stack.name in was_up, work))
 
         # b. Moves. A volume rename is a copy; the old side is archived with the rest (phase 3).
         for move, now, new in work.moves:
@@ -922,8 +1011,8 @@ class Executor:
                 self._copy_renamed(node, work, move.old, move.new, undo)
                 continue
             node.log(f"move {now} -> {new}")
-            self.say(f"[bold]{work.node}[/]: move {now} → {new}")
-            node.move(now, new)
+            with self.steps.step(work.node, f"move {now} → {new}"):
+                node.move(now, new)
             undo.append((f"move {new} back", partial(node.move, new, now)))
 
         # c. Files. On undo, once the old files are back, the stacks that kept their containers and
@@ -931,46 +1020,60 @@ class Executor:
         kept = [stack for stack in active if stack not in stopping]
         for stack in kept:
             if stack.name in start:
-                undo.append(self._as_before(node, home, stack, stack.name in was_up))
+                undo.append(self._as_before(node, home, stack, stack.name in was_up, work))
         node.log("files")
-        self.say(f"[bold]{work.node}[/]: files")
-        node.run("mkdir", "-p", f"{home}/.labctl")
-        node.run("rm", "-rf", f"{home}/.labctl/incoming")
-        node.upload(desired.bundle, f"{home}/.labctl/incoming")
-        node.script(_SWAP_IN, home, *work.replace)
-        undo.append(("restore files", partial(node.script, _SWAP_OUT, home, *desired.top_level)))
+        with self.steps.step(work.node, "files"):
+            node.run("mkdir", "-p", f"{home}/.labctl")
+            node.run("rm", "-rf", f"{home}/.labctl/incoming")
+            node.upload(desired.bundle, f"{home}/.labctl/incoming")
+            node.script(_SWAP_IN, home, *work.replace)
+            undo.append(
+                ("restore files", partial(node.script, _SWAP_OUT, home, *desired.top_level))
+            )
         if work.keep_drift:  # .labctl/previous is replaced by the next apply; this copy is not
             edits = f"{FILES_ARCHIVE}/node-edits-{self.stamp}"
             node.run("mkdir", "-p", f"{home}/{FILES_ARCHIVE}")
             node.run("cp", "-a", f"{home}/.labctl/previous", f"{home}/{edits}")
-            self.say(f"[bold]{work.node}[/]: files edited on the node archived to {edits}")
+            self.steps.note(f"{work.node}: files edited on the node archived to {edits}")
 
-        # d. Up: the stacks that run after apply. The others stay down with their new files.
+        # d. Up: the stacks that run after apply, each waited for. The others stay down with their
+        # new files.
         had_containers = {stack.name for stack in kept}
-        deferred = set(work.runtime.defer)
-        started = []
+        deferred = {*work.runtime.defer, *work.runtime.stay_down}
         for stack in wanted:
             if stack.name not in start:
                 node.log(f"check {stack.name}")
-                self.say(f"[bold]{work.node}[/]: {stack.name} stays down (files only)")
-                node.compose(home, stack, "config", "--quiet")
+                with self.steps.step(work.node, f"{stack.name}: files only, stays down"):
+                    node.compose(home, stack, "config", "--quiet")
                 continue
             node.log(f"up {stack.name}")
-            self.say(f"[bold]{work.node}[/]: up {stack.name}")
             if stack.name not in had_containers:  # a new stack goes again; others are restored
                 undo.append((f"down {stack.name}", partial(node.compose, home, stack, "down")))
             services = [s for s, svc in desired.state.services.items() if svc.stack == stack.name]
             held = [service for service in services if service in deferred]
-            if not held:
-                node.compose(home, stack, "up", "-d", "--remove-orphans")
-            elif len(held) == len(services):
-                node.compose(home, stack, "up", "--no-start", "--remove-orphans")
-            else:
-                rest = [service for service in services if service not in deferred]
-                node.compose(home, stack, "up", "-d", "--remove-orphans", *rest)
-                node.compose(home, stack, "up", "--no-start", *held)
-            started.append(stack)
-        self._wait_up(node, work, started)
+            with self.steps.step(work.node, f"up {stack.name}") as step:
+                if not held:
+                    node.compose(home, stack, "up", "-d", "--remove-orphans", watch=step.update)
+                elif len(held) == len(services):
+                    node.compose(
+                        home, stack, "up", "--no-start", "--remove-orphans", watch=step.update
+                    )
+                else:
+                    rest = [service for service in services if service not in deferred]
+                    node.compose(
+                        home, stack, "up", "-d", "--remove-orphans", *rest, watch=step.update
+                    )
+                    node.compose(home, stack, "up", "--no-start", *held, watch=step.update)
+                self._wait_up(node, work, stack, step)
+                changes = container_changes(
+                    self.before.get(work.node, {}),
+                    node.snapshot(),
+                    stack.name,
+                    came_from=work.old_projects,
+                    staying=desired.state.services,
+                )
+                if changes:
+                    step.result = f"{step.result}, {changes}" if step.result else str(changes)
 
     def _copy_renamed(self, node: Node, work: NodeWork, old: str, new: str, undo: Undo) -> None:
         """Renamed data with a volume on either side: copied (and checked) while it is stopped."""
@@ -978,55 +1081,50 @@ class Executor:
         label = f"{key_label(old)} → {key_label(new)}"
         node.log(f"copy {label}")
         if not self._data_there(node, root, old):
-            self.say(f"[yellow]![/] {work.node}: {key_label(old)} is not there; nothing to copy")
+            self.steps.note(
+                f"[yellow]![/] {work.node}: {key_label(old)} is not there; nothing to copy"
+            )
             return
-        self.say(f"[bold]{work.node}[/]: copy {label}")
-        self._make_room(node, root, new, compose_labels(work.desired.state, new), undo, work)
-        source, target = mount_spec(root, old), mount_spec(root, new)
-        node.copy(source, target)
-        if node.sums(source) != node.sums(target):
-            raise ApplyError(f"{work.node}: the copy {label} differs from the original")
+        with self.steps.step(work.node, f"copy {label}"):
+            self._make_room(node, root, new, compose_labels(work.desired.state, new), undo, work)
+            source, target = mount_spec(root, old), mount_spec(root, new)
+            node.copy(source, target)
+            if node.sums(source) != node.sums(target):
+                raise ApplyError(f"{work.node}: the copy {label} differs from the original")
 
-    def _wait_up(self, node: Node, work: NodeWork, stacks: list[Stack]) -> None:
-        """Until every service of these stacks runs (healthy, where it has a healthcheck), but those
-        left created and not started."""
+    def _wait_up(self, node: Node, work: NodeWork, stack: Stack, step: Step) -> None:
+        """Until every service of the stack runs (healthy, where it has a healthcheck), but those
+        left created and not started; the step says what is still pending."""
         home = work.desired.dirs.deploy_dir
-        expected = {
-            stack.name: [
-                service.name
-                for service in work.desired.state.services.values()
-                if service.stack == stack.name and service.name not in work.runtime.defer
-            ]
-            for stack in stacks
-        }
+        expected = [
+            service.name
+            for service in work.desired.state.services.values()
+            if service.stack == stack.name
+            and service.name not in {*work.runtime.defer, *work.runtime.stay_down}
+        ]
         deadline = time.monotonic() + self.wait
         while True:
             pending, failed = [], []
-            for stack in stacks:
-                ps = node.run(
-                    "docker",
-                    "compose",
-                    *stack_args(stack),
-                    "ps",
-                    "--all",
-                    "--format",
-                    "json",
-                    cwd=home,
-                )
-                rows: dict[str, dict[str, Any]] = {row["Service"]: row for row in ps_rows(ps)}
-                for service in expected[stack.name]:
-                    row = rows.get(service, {})
-                    state, health = row.get("State", ""), row.get("Health", "")
-                    if state in ("exited", "dead") or health == "unhealthy":
-                        failed.append(f"{service} ({state}{', ' + health if health else ''})")
-                    elif state != "running" or health not in ("", "healthy"):
-                        pending.append(f"{service} ({state or 'no container'})")
+            ps = node.run(
+                "docker", "compose", *stack_args(stack), "ps", "--all", "--format", "json", cwd=home
+            )
+            rows: dict[str, dict[str, Any]] = {row["Service"]: row for row in ps_rows(ps)}
+            for service in expected:
+                row = rows.get(service, {})
+                state, health = row.get("State", ""), row.get("Health", "")
+                if state in ("exited", "dead") or health == "unhealthy":
+                    failed.append(f"{service} ({state}{', ' + health if health else ''})")
+                elif state != "running" or health not in ("", "healthy"):
+                    pending.append(f"{service} ({state or 'no container'})")
             if failed:
                 raise ApplyError(f"{work.node}: not running: {', '.join(failed)}")
+            running = f"{len(expected) - len(pending)}/{len(expected)} running"
             if not pending:
+                step.result = running
                 return
             if time.monotonic() > deadline:
                 raise ApplyError(f"{work.node}: not up after {self.wait}s: {', '.join(pending)}")
+            step.update(f"{running}, waiting for {', '.join(pending)}")
             time.sleep(2)
 
     ##########################################################################
@@ -1036,6 +1134,16 @@ class Executor:
     ##########################################################################
 
     def _archive(self, node: Node, work: NodeWork, undo: Undo) -> None:
+        """Data no service uses any more, and files the bundle does not have: one step, naming
+        what went to the archive."""
+        if not (work.archive or work.discard):
+            return
+        with self.steps.step(work.node, "archive") as step:
+            archived = self._archive_all(node, work, undo)
+            step.result = ", ".join(archived) or "nothing there"
+
+    def _archive_all(self, node: Node, work: NodeWork, undo: Undo) -> list[str]:
+        archived: list[str] = []
         appdata = work.desired.dirs.appdata_dir
         for key, reason in work.archive:
             if is_volume(key):
@@ -1044,24 +1152,25 @@ class Executor:
                     continue
                 users = node.volume_users(name)
                 if users:
-                    self.say(
+                    self.steps.note(
                         f"[yellow]![/] {work.node}: volume {name} stays: {', '.join(users)} "
                         f"{'uses' if len(users) == 1 else 'use'} it"
                     )
                     continue
                 self._archive_volume(node, appdata, name, reason, work.old_services, undo)
+                archived.append(f"volume {name}")
                 continue
             now = f"{appdata}/{key}"
             if not node.exists(now):
                 continue
-            new = f"{appdata}/archive/{key}-{self.stamp}"
+            new = f"{appdata}/{ARCHIVE_DIR}/{key}-{self.stamp}"
             node.log(f"archive {now}")
-            self.say(f"[bold]{work.node}[/]: archive {now} → {new}")
             node.move(now, new)
             undo.append(
                 (f"unarchive {key} on {work.node}", partial(self._unarchive, node, new, now))
             )
             self._sidecar(node, appdata, key, reason, work.old_services)
+            archived.append(f"{key}/")
         home = work.desired.dirs.deploy_dir
         if work.discard:
             node.run("mkdir", "-p", f"{home}/{FILES_ARCHIVE}")
@@ -1069,11 +1178,12 @@ class Executor:
             now = f"{home}/.labctl/previous/{name}"
             new = f"{home}/{FILES_ARCHIVE}/{name}-{self.stamp}"
             node.log(f"archive {name}")
-            self.say(f"[bold]{work.node}[/]: archive {name} → {FILES_ARCHIVE}/{name}-{self.stamp}")
             node.run("mv", "-T", "--", now, new)
             undo.append(
                 (f"unarchive {name} on {work.node}", partial(node.run, "mv", "-T", "--", new, now))
             )
+            archived.append(name)
+        return archived
 
     def _record(self, node: Node, work: NodeWork) -> None:
         desired = work.desired
@@ -1088,5 +1198,3 @@ class Executor:
             node.upload(Path(tmp), home)
         node.script(f'printf "%s\\n" "$1" > "$HOME/{HOME_POINTER}"', home)
         self.recorded.append(work.node)
-        done = "recorded" if work.record_only else "applied"
-        self.say(f"[green]✓[/] {work.node}: {done}")
