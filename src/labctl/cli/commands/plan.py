@@ -80,16 +80,24 @@ from labctl.state import Scope
 
 
 @click.command(name="plan")
-@PlanOptions().options
+@PlanOptions(all_by_default=True).options
+@click.option(
+    "--detailed-exitcode",
+    is_flag=True,
+    help="Exit 0 when apply would change nothing, 1 on an error or a blocked plan, 2 when it "
+    "would change something.",
+)
 @DebugOptions().options
-def plan_cmd(options: Options, **kwargs: Any) -> None:
+def plan_cmd(options: Options, detailed_exitcode: bool = False, **kwargs: Any) -> None:
     """Show what apply would change on the nodes named, or 'all' (apply --dry-run).
 
-    Plans the lab config as it is now, uncommitted changes included. The nodes not named are read
-    too, so a service moving between them is seen: a migrate needs both of its nodes named. Never
-    changes a node.
+    No node named means 'all'. Plans the lab config as it is now, uncommitted changes included.
+    The nodes not named are read too, so a service moving between them is seen: a migrate needs
+    both of its nodes named. Never changes a node.
     """
-    _run(options, dry_run=True)
+    changes = _run(options, dry_run=True)
+    if detailed_exitcode and changes:
+        sys.exit(2)
 
 
 @click.command(name="apply")
@@ -97,11 +105,10 @@ def plan_cmd(options: Options, **kwargs: Any) -> None:
 @click.option("--dry-run", is_flag=True, help="Only show the plan (the same as `labctl plan`).")
 @click.option(
     "--yes",
-    "--force",
     "-y",
-    "yes",
     is_flag=True,
-    help=("Do not ask before applying a plan with checks, notices, node edits or a first apply."),
+    help="Apply without asking: the plan is approved and other questions take their defaults "
+    "(--ff to fast-forward). Conflicts still need a terminal.",
 )
 @click.option(
     "--wait",
@@ -140,8 +147,14 @@ def _run(
     yes: bool = False,
     wait: int = 120,
     message: str | None = None,
-) -> None:
-    """plan → (confirm) → lock → plan again → apply → commit → unlock → tag."""
+) -> bool:
+    """plan → (confirm) → lock → plan again → apply → commit → unlock → tag.
+
+    Returns:
+        bool:
+            With ``dry_run``, whether apply would change anything (any node with work, a record
+            to write included); otherwise False.
+    """
     settings = load_settings()
     try:
         nodes = set(settings.node_names())
@@ -164,11 +177,11 @@ def _run(
             if planned.reasons:
                 sys.exit(1)
             if dry_run:
-                return
+                return bool(planned.works)
             targets = [work.node for work in planned.works]
         if not targets:
             console.print("Nothing to apply.")
-            return
+            return False
         conflicts = _conflicts(planned.runtime)
         if conflicts:
             _confirm([*([] if yes else planned.confirm), conflicts], conflicts=True)
@@ -187,6 +200,7 @@ def _run(
                 commit_message, repo, planned.base, planned.tree, options.nodes, message, not yes
             ),
         )
+        return False
     except (ComposeError, EnvError, ApplyError, RemoteError, RepoError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:

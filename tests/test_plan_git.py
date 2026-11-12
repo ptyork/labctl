@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -192,3 +193,60 @@ def test_in_a_terminal_the_fast_forward_is_offered(
     assert git(behind, "log", "-1", "--format=%s") == "first"  # goes on behind, asked first
     git_sync.catch_up(repo, options, ask=True, applying=True)
     assert git(behind, "log", "-1", "--format=%s") == "theirs"
+
+
+#############################################################################
+# Which nodes, and plan's exit code (as tofu's)
+#############################################################################
+
+
+@pytest.fixture
+def scopes(monkeypatch: pytest.MonkeyPatch) -> list[Scope]:
+    """The scope each collect was asked for; collect itself stops the command there."""
+    found: list[Scope] = []
+
+    def stop(*args: Any, **kwargs: Any) -> Iterator[None]:
+        found.append(args[1])
+        raise RepoError("stopped here")
+
+    monkeypatch.setattr(plan_module, "collect", stop)
+    return found
+
+
+def test_plan_with_no_node_named_plans_all(root: Path, scopes: list[Scope]) -> None:
+    run("plan")
+    run("plan", "all")
+    assert scopes == [Scope(), Scope()]
+
+
+def test_apply_still_needs_its_nodes_named(root: Path, scopes: list[Scope]) -> None:
+    code, output = run("apply")
+    assert code == 1 and "Name the nodes, or 'all'" in output and scopes == []
+
+
+@pytest.mark.parametrize(
+    ("works", "reasons", "flag", "expected"),
+    [
+        ((), [], True, 0),  # nothing to change
+        (("work",), [], True, 2),  # something to change
+        (("work",), [], False, 0),  # without the flag, changes exit 0 as before
+        (("work",), ["problems above"], True, 1),  # blocked
+    ],
+)
+def test_detailed_exitcode(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    works: tuple[Any, ...],
+    reasons: list[str],
+    flag: bool,
+    expected: int,
+) -> None:
+    @contextmanager
+    def collected(*args: Any, **kwargs: Any) -> Iterator[None]:
+        yield None
+
+    planned = plan_module.Planned(Plan(), reasons, [], None, works=works)
+    monkeypatch.setattr(plan_module, "collect", collected)
+    monkeypatch.setattr(plan_module, "_plan_and_render", lambda *args, **kwargs: planned)
+    code, output = run("plan", *(["--detailed-exitcode"] if flag else []))
+    assert code == expected, output

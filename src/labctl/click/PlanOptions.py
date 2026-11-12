@@ -7,6 +7,8 @@ from typing import Any
 
 import click
 
+from labctl.state import ALL
+
 
 @dataclass(frozen=True)
 class Options:
@@ -27,10 +29,19 @@ class PlanOptions:
 
     The command gets them as one ``options`` keyword argument (an ``Options``) instead of one
     keyword argument each.
+
+    Args:
+        all_by_default (bool):
+            No node named means 'all' (plan; apply requires its nodes). Default: False.
     """
 
+    def __init__(self, all_by_default: bool = False):
+        self.all_by_default = all_by_default
+
     def options(self, func: Callable[..., Any]) -> Callable[..., Any]:
-        @click.argument("nodes", nargs=-1, metavar="NODE...|all")
+        metavar = "[NODE...|all]" if self.all_by_default else "NODE...|all"
+
+        @click.argument("nodes", nargs=-1, metavar=metavar)
         @click.option(
             "--replace-stale",
             is_flag=True,
@@ -67,8 +78,9 @@ class PlanOptions:
         )
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            nodes = kwargs.pop("nodes")
             options = Options(
-                nodes=kwargs.pop("nodes"),
+                nodes=nodes or ((ALL,) if self.all_by_default else ()),
                 replace_stale=kwargs.pop("replace_stale"),
                 no_migrate=kwargs.pop("no_migrate"),
                 verbose=kwargs.pop("verbose"),
