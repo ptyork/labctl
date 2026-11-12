@@ -223,3 +223,47 @@ def test_fast_forward_keeps_uncommitted_changes_unless_git_would_overwrite_them(
     assert repo.fast_forward("origin/main") is None
     assert (tmp_path / "a/apps/plex.yml").read_text() == "theirs\n"
     assert (tmp_path / "a/run.sh").read_text() == "mine\n"
+
+
+def test_a_node_whose_folder_is_gone_is_retiring_until_a_retired_tag(
+    tmp_path: Path, make_repo: MakeRepo
+) -> None:
+    repo = make_repo(tmp_path, FILES)
+    with_cirdan = repo.head()
+    repo.tag_applied("cirdan", "20261101-090000", with_cirdan, INFO)
+    assert repo.retiring(["cirdan"]) == []
+    assert repo.retiring([]) == ["cirdan"]  # nodes/cirdan gone, not retired yet
+    retired = replace(INFO, stacks_up=(), retired=True)
+    message = tag_message("cirdan", retired)
+    assert (
+        "Retired: yes" in message and parse_tag_message(message.replace(": \n", ":\n")) == retired
+    )
+    repo.tag_applied("cirdan", "20261102-090000", with_cirdan, retired)
+    assert repo.retiring([]) == []  # retired: labctl no longer knows it
+    assert [a.tag for a in repo.applied_tags("cirdan")] == [
+        "applied/cirdan/20261102-090000",
+        "applied/cirdan/20261101-090000",
+    ]
+
+
+def test_a_folder_comes_back_from_a_commit(tmp_path: Path, make_repo: MakeRepo) -> None:
+    repo = make_repo(tmp_path, FILES)
+    first = repo.head()
+    git(tmp_path, "rm", "-rq", "nodes/cirdan")
+    repo.commit("remove cirdan")
+    assert repo.has_path(first, "nodes/cirdan") and not repo.has_path(repo.head(), "nodes/cirdan")
+    repo.restore_path(first, "nodes/cirdan")
+    assert (tmp_path / "nodes/cirdan/node.env").read_text() == FILES["nodes/cirdan/node.env"]
+    assert git(tmp_path, "diff", "--cached", "--name-only") == ""  # the index is left alone
+
+
+def test_stash_puts_every_change_away(tmp_path: Path, make_repo: MakeRepo) -> None:
+    repo = make_repo(tmp_path, FILES)
+    (tmp_path / "apps/plex.yml").write_text("changed\n")
+    (tmp_path / "new.yml").write_text("new\n")
+    (tmp_path / "x.swp").write_text("ignored\n")
+    repo.stash("labctl discard 20261112-090000")
+    assert repo.changes() == [] and (tmp_path / "x.swp").exists()
+    assert "labctl discard 20261112-090000" in git(tmp_path, "stash", "list")
+    git(tmp_path, "stash", "pop", "-q")
+    assert (tmp_path / "new.yml").read_text() == "new\n"

@@ -100,6 +100,29 @@ def top_level(files: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted({path.split("/", 1)[0] for path in files}))
 
 
+def retired(node: str, dirs: Dirs, workdir: Path, values: Mapping[str, str]) -> Desired:
+    """
+    A node being retired (its folder is gone from nodes/): nothing on it, its env as last applied
+    (so the folders it points at, LOGS_DIR and the like, stay data).
+
+    Args:
+        node (str):
+            The node.
+        dirs (Dirs):
+            DEPLOY_DIR and APPDATA_DIR, from its latest apply tag.
+        workdir (Path):
+            Where its (empty) bundle folder is made.
+        values (Mapping[str, str]):
+            Its env at its latest apply (no secrets needed: only paths count).
+    """
+    bundle = workdir / node / (PurePosixPath(dirs.deploy_dir).name or "docker")
+    bundle.mkdir(parents=True)
+    env = CompiledEnv(
+        values={**values, "DEPLOY_DIR": dirs.deploy_dir, "APPDATA_DIR": dirs.appdata_dir}
+    )
+    return Desired(node, bundle, env, {}, NodeState.of(node), {})
+
+
 @dataclass(frozen=True)
 class Location:
     """A folder of compose files: on this machine, or on a node when ``remote`` is set."""

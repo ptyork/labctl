@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -25,9 +26,10 @@ from labctl.cli import cli, menu
 from labctl.cli.commands import add as add_module
 from labctl.collect import OnNode
 from labctl.remote import MARK
+from labctl.repo import ConfigRepo, TagInfo
 from labctl.runtime import Container
 from labctl.settings import LAB_CONFIG_ENV, Secrets, Settings
-from labctl.state import Stack
+from labctl.state import Dirs, Stack
 
 docker = pytest.mark.skipif(shutil.which("docker") is None, reason="needs the docker CLI")
 
@@ -320,13 +322,31 @@ def test_unreachable_in_a_terminal_offers_what_most_nodes_use(
         offered.append(f"{prompt}={value}")
         return value
 
+    asked: list[str] = []
+
+    def confirm(prompt: str, **kwargs: object) -> bool:
+        asked.append(prompt)
+        return True
+
     monkeypatch.setattr(add_module, "_tty", lambda: True)
     monkeypatch.setattr(menu, "edit_text", edit_text)
+    monkeypatch.setattr(menu, "confirm", confirm)
     add("aragorn")
+    assert asked == ["Add aragorn anyway?"]
     assert offered == [
         "DEPLOY_DIR for aragorn=/srv/docker",
         "APPDATA_DIR for aragorn=$DEPLOY_DIR/app_data",
     ]
+
+
+def test_unreachable_in_a_terminal_is_asked_first(
+    lab: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(add_module, "_tty", lambda: True)
+    monkeypatch.setattr(menu, "confirm", lambda *args, **kwargs: False)
+    monkeypatch.setattr(menu, "edit_text", lambda *args, **kwargs: 1 / 0)  # never reached
+    assert "Not added" in add("bob", ok=False).output
+    assert not (lab / "nodes/bob").exists()
 
 
 @pytest.mark.parametrize(
@@ -363,3 +383,86 @@ def test_what_the_lab_config_root_has_is_left_to_it(lab: Path, imported: Importe
     )
     assert "not imported: apps/web.yml: the lab config's apps has it, different" in out
     assert not (lab / "nodes/new/apps").exists()
+
+
+#############################################################################
+# remove, add's restore, discard
+#############################################################################
+
+
+def test_remove_deletes_only_the_folder(lab: Path) -> None:
+    result = CliRunner().invoke(cli.main, ["remove", "cirdan"])
+    assert result.exit_code == 0 and "removed nodes/cirdan" in result.output
+    assert not (lab / "nodes/cirdan").exists()
+    assert (
+        git(lab, "status", "--porcelain")
+        == " D nodes/cirdan/docker-compose.yml\n D nodes/cirdan/node.env".strip()
+    )
+    result = CliRunner().invoke(cli.main, ["remove", "cirdan"])
+    assert result.exit_code == 1 and "has no node 'cirdan'" in result.output
+
+
+def test_remove_refuses_changes_no_apply_committed(lab: Path) -> None:
+    (lab / "nodes/frodo/node.env").write_text("DEPLOY_DIR=/elsewhere\n")
+    result = CliRunner().invoke(cli.main, ["remove", "frodo"])
+    assert result.exit_code == 1 and "labctl discard" in result.output
+    assert (lab / "nodes/frodo").exists()
+
+
+def test_add_restores_a_node_the_lab_config_had(lab: Path) -> None:
+    repo = ConfigRepo.open(lab)
+    info = TagInfo("2026-11-01T09:00:00", "me", "0.1.0", (), Dirs("/home/me/docker", "/a"))
+    repo.tag_applied("cirdan", "20261101-090000", repo.head(), info)
+    git(lab, "rm", "-rq", "nodes/cirdan")
+    repo.commit("retire cirdan")
+    repo.tag_applied("cirdan", "20261102-090000", repo.head(), replace(info, retired=True))
+    result = add("cirdan")  # no terminal: restored, no dirs needed
+    assert "restored nodes/cirdan from applied/cirdan/20261101-090000" in result.output
+    assert (lab / "nodes/cirdan/node.env").read_text() == FILES["nodes/cirdan/node.env"]
+    shutil.rmtree(lab / "nodes/cirdan")
+    assert (
+        "--no-restore"
+        in add("cirdan", "--deploy-dir", "/x", "--appdata-dir", "/y", ok=False).output
+    )
+    add("cirdan", "--deploy-dir", "/x", "--appdata-dir", "/y", "--no-restore")
+    assert (lab / "nodes/cirdan/node.env").read_text().startswith("DEPLOY_DIR=/x\n")
+
+
+def test_discard(lab: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    run = CliRunner().invoke
+    assert run(cli.main, ["discard"]).output == "Nothing to discard\n"
+    (lab / "nodes/frodo/node.env").write_text("DEPLOY_DIR=/elsewhere\n")
+    (lab / "nodes/new").mkdir()
+    (lab / "nodes/new/node.env").write_text("X=1\n")
+    shown = run(cli.main, ["discard", "--dry-run"]).output
+    assert "changed  nodes/frodo/node.env" in shown and "new      nodes/new/" in shown
+    assert git(lab, "status", "--porcelain") != ""
+    result = run(cli.main, ["discard"])
+    assert result.exit_code == 1 and "Confirm in a terminal, or pass --yes" in result.output
+    result = run(cli.main, ["discard", "--yes"])
+    assert (
+        result.exit_code == 0 and "discarded 2 changes (git stash: labctl discard " in result.output
+    )
+    assert git(lab, "status", "--porcelain") == ""
+
+
+def test_forget_a_node_that_is_gone(lab: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    repo = ConfigRepo.open(lab)
+    info = TagInfo("2026-11-03T21:25:37", "me", "0.1.0", (), Dirs("/srv/docker", "/a"))
+    repo.tag_applied("ghost", "20261103-212537", repo.head(), info)  # applied; folder never here
+    assert repo.retiring(["frodo", "bilbo", "cirdan"]) == ["ghost"]
+    run = CliRunner().invoke
+    assert "has no node 'ghost'" in run(cli.main, ["remove", "ghost"]).output
+    assert "Confirm in a terminal" in run(cli.main, ["remove", "ghost", "--forget"]).output
+    result = run(cli.main, ["remove", "ghost", "--forget", "--yes"])
+    assert result.exit_code == 0 and "forgot ghost: tagged applied/ghost/" in result.output
+    assert repo.retiring(["frodo", "bilbo", "cirdan"]) == []
+    last = repo.last_applied("ghost")
+    assert last is not None and last.info is not None and last.info.retired
+    # A node in the lab config: forgotten, and its folder removed.
+    repo.tag_applied("cirdan", "20261101-090000", repo.head(), info)
+    result = run(cli.main, ["remove", "cirdan", "--forget", "--yes"])
+    assert result.exit_code == 0 and not (lab / "nodes/cirdan").exists()
+    assert repo.retiring(["frodo", "bilbo"]) == []

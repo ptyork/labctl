@@ -34,6 +34,7 @@ from labctl.compose import ComposeError
 from labctl.console import console
 from labctl.envfile import node_env_file, parse_env, read_sources
 from labctl.remote import Remote, RemoteError, node_remote
+from labctl.repo import Applied, ConfigRepo, RepoError
 from labctl.settings import Secrets, SettingsError
 from labctl.state import ALL
 
@@ -50,17 +51,29 @@ DEPLOY, APPDATA = REQUIRED_VARS
     help="APPDATA_DIR: the services' data, migrated with them (may start with $DEPLOY_DIR).",
 )
 @click.option("--no-import", is_flag=True, help="Start the node empty, though it runs stacks.")
+@click.option(
+    "--no-restore",
+    is_flag=True,
+    help="Add the node anew, though the lab config's history has its folder.",
+)
 @DebugOptions().options
 def add_cmd(
-    name: str, deploy_dir: str | None, appdata_dir: str | None, no_import: bool, **kwargs: Any
+    name: str,
+    deploy_dir: str | None,
+    appdata_dir: str | None,
+    no_import: bool,
+    no_restore: bool,
+    **kwargs: Any,
 ) -> None:
     """Add a node to the lab config, taking in the stacks it already runs.
 
-    NAME is the node's ssh host. In a terminal, asks for DEPLOY_DIR and APPDATA_DIR, offering what
-    the node runs suggests; with no terminal, pass both (nothing is guessed). The stack files at
-    the top of DEPLOY_DIR are copied into nodes/NAME, with what they refer to, and their .env
-    becomes node.env (a terminal is asked which values are secrets). Nothing is committed: the
-    first apply does that.
+    NAME is the node's ssh host. A node the lab config had before (removed, or retired) gets its
+    folder back as its last apply had it (asked in a terminal; --no-restore adds it anew).
+    Otherwise, in a terminal, asks for DEPLOY_DIR and APPDATA_DIR, offering what the node runs
+    suggests; with no terminal, pass both (nothing is guessed). The stack files at the top of
+    DEPLOY_DIR are copied into nodes/NAME, with what they refer to, and their .env becomes
+    node.env (a terminal is asked which values are secrets). Nothing is committed: the first apply
+    does that.
     """
     settings = load_settings()
     if name == ALL or not _NODE_NAME.fullmatch(name):
@@ -70,8 +83,15 @@ def add_cmd(
         raise click.ClickException(f"{folder} already exists")
     try:
         others = settings.node_names()
-    except SettingsError as exc:
+        repo = ConfigRepo.open(settings.lab_config)
+        past = None if no_restore else _past(repo, settings.nodes_dir, name)
+    except (SettingsError, RepoError) as exc:
         raise click.ClickException(str(exc)) from exc
+    if past is not None and _restore(repo, past, folder, deploy_dir or appdata_dir):
+        with tempfile.TemporaryDirectory(prefix="labctl-add-") as tmp:
+            if not check_node(settings, name, Secrets.load(settings.secrets_file), Path(tmp)):
+                sys.exit(1)
+        return
     if not _tty() and not (deploy_dir and appdata_dir):
         raise click.ClickException(
             "No terminal to ask in: pass --deploy-dir and --appdata-dir (labctl does not guess "
@@ -82,6 +102,12 @@ def add_cmd(
     remote = node_remote(name)
     try:
         host = _check_node(name, remote)
+        usable = host is not None and host.docker and bool(host.compose)
+        if not usable and _tty():
+            # Nothing to offer or import: usually a typo, or a node not set up yet.
+            answer = menu.confirm(f"Add {name} anyway?", default=False)
+            if not answer:
+                raise click.ClickException("Not added")
         if host is not None and host.projects and not (deploy_dir and appdata_dir):
             console.print(f"{escape(name)} runs:")
             for project in host.projects:
@@ -155,6 +181,43 @@ def add_cmd(
     with tempfile.TemporaryDirectory(prefix="labctl-add-") as tmp:
         if not check_node(settings, name, Secrets.load(settings.secrets_file), Path(tmp)):
             sys.exit(1)
+
+
+def _past(repo: ConfigRepo, nodes_dir: Path, name: str) -> tuple[Applied, str] | None:
+    """The node's latest apply tag whose commit has its folder, and the folder's repo path (None:
+    the lab config never had it)."""
+    path = f"{nodes_dir.relative_to(repo.root).as_posix()}/{name}"
+    for applied in repo.applied_tags(name):
+        if repo.has_path(applied.commit, path):
+            return applied, path
+    return None
+
+
+def _restore(
+    repo: ConfigRepo, past: tuple[Applied, str], folder: Path, dirs_given: str | None
+) -> bool:
+    """Bring the node's folder back from ``past`` (asked in a terminal); False: add it anew."""
+    applied, path = past
+    if _tty():
+        answer = menu.confirm(
+            f"{folder.name} was in the lab config at {applied.tag}. Restore it from there?",
+            default=True,
+        )
+        if answer is None:
+            raise click.ClickException("Not added")
+        if not answer:
+            return False
+    if dirs_given:
+        raise click.ClickException(
+            f"{path} comes back from {applied.tag}, with its own DEPLOY_DIR and APPDATA_DIR; pass "
+            "--no-restore to add the node anew"
+        )
+    try:
+        repo.restore_path(applied.commit, path)
+    except RepoError as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print(f"[green]✓[/] restored {escape(path)} from {escape(applied.tag)}")
+    return True
 
 
 def _leave_to_the_root(lab_config: Path, imported: Imported) -> None:
@@ -301,7 +364,8 @@ def _ask(node: str, var: str, suggestion: str, what: str) -> str:
 
 def _check_node(node: str, remote: Remote) -> Host | None:
     """What the node runs, with a warning when it cannot be reached (None), has no docker
-    compose, or its ssh user may not run docker."""
+    compose, or its ssh user may not run docker (a terminal is then asked whether to add it
+    anyway; without one it is added, both dirs being given)."""
     try:
         host = read_host(remote)
     except RemoteError as exc:

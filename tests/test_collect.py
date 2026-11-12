@@ -611,3 +611,16 @@ def test_nodes_are_read_together_and_those_not_named_get_less_time(
 def test_ssh_waits_as_long_as_the_remote_says() -> None:
     assert "ConnectTimeout=2" in Remote("frodo", connect_timeout=2).argv("true")
     assert f"ConnectTimeout={CONNECT_TIMEOUT}" in Remote("frodo").argv("true")
+
+
+def test_nothing_there_for_a_node_being_retired() -> None:
+    from labctl.collect import NodeRead, _nothing_there
+
+    assert _nothing_there(NodeRead("x"))
+    assert _nothing_there(NodeRead("x", OnNode(None, {}, exists=False)))
+    data_only = OnNode(None, {}, names={"app_data": "data"})
+    assert _nothing_there(NodeRead("x", data_only, state=NodeState.of("x")))
+    files = OnNode(None, {}, names={"docker-compose.yml": "file", "app_data": "data"})
+    assert not _nothing_there(NodeRead("x", files, state=NodeState.of("x")))
+    running = NodeState.of("x", Service("plex"))
+    assert not _nothing_there(NodeRead("x", data_only, state=running))

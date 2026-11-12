@@ -5,6 +5,9 @@ it is applied, and only then (labctl commits nothing else, but init's first comm
 apply records gets an annotated tag, `applied/<node>/<stamp>`, on that commit (the stamp is the
 apply's own, as in its archive names). Tags never move; apply pushes them with the branch.
 
+A node with apply tags whose folder is gone from nodes/ is being retired: plan wants nothing on
+it, and the apply that empties it is tagged `Retired: yes`; after that labctl no longer knows it.
+
 A node that is not read (not named, or unreachable) is planned against its latest tag's tree,
 rebuilt the way its bundle was. The tag message carries what the tree cannot say (which stacks were
 up, where DEPLOY_DIR and APPDATA_DIR were) and nothing secret: no manifest, no hashes of the
@@ -45,6 +48,7 @@ class TagInfo:
     stacks_up: tuple[str, ...]
     dirs: Dirs
     host_ip: str = ""  # the address `_HOST_IP_` had ("": none used, or a tag from before)
+    retired: bool = False  # nodes/<node> was gone: everything on the node was removed
 
 
 @dataclass(frozen=True)
@@ -73,7 +77,9 @@ def tag_message(node: str, info: TagInfo) -> str:
         f"Stacks-Up: {' '.join(info.stacks_up)}\n"
         f"Deploy-Dir: {info.dirs.deploy_dir}\n"
         f"Appdata-Dir: {info.dirs.appdata_dir}\n"
-    ) + (f"Host-IP: {info.host_ip}\n" if info.host_ip else "")
+        + (f"Host-IP: {info.host_ip}\n" if info.host_ip else "")
+        + ("Retired: yes\n" if info.retired else "")
+    )
 
 
 def parse_tag_message(text: str) -> TagInfo | None:
@@ -91,6 +97,7 @@ def parse_tag_message(text: str) -> TagInfo | None:
             # Docker-Home: tags made before DOCKER_HOME was renamed DEPLOY_DIR
             Dirs(fields.get("Deploy-Dir") or fields["Docker-Home"], fields["Appdata-Dir"]),
             fields.get("Host-IP", ""),
+            fields.get("Retired") == "yes",
         )
     except KeyError:
         return None
@@ -335,6 +342,45 @@ class ConfigRepo:
         if not tags:
             return None
         return Applied(tags[0].name, tags[0].commit, parse_tag_message(tags[0].message))
+
+    def applied_tags(self, node: str) -> list[Applied]:
+        """The node's apply tags, newest first."""
+        with _errors("git for-each-ref"):
+            tags = self.git.list_tags(f"{TAG_PREFIX}/{node}/", sort="-refname")
+        return [Applied(tag.name, tag.commit, parse_tag_message(tag.message)) for tag in tags]
+
+    def retiring(self, nodes: Sequence[str]) -> list[str]:
+        """
+        The nodes being retired: applied (they have tags), not in ``nodes`` (the folders in
+        nodes/), and not retired by an apply yet.
+
+        Args:
+            nodes (Sequence[str]):
+                The nodes the lab config defines.
+        """
+        with _errors("git for-each-ref"):
+            names = {tag.name.split("/")[1] for tag in self.git.list_tags(f"{TAG_PREFIX}/")}
+        found = []
+        for node in sorted(names - set(nodes)):
+            last = self.last_applied(node)
+            if last is not None and last.info is not None and not last.info.retired:
+                found.append(node)
+        return found
+
+    def has_path(self, rev: str, path: str) -> bool:
+        """Whether ``path`` (a file or folder) exists at ``rev``."""
+        return self.git.run("cat-file", "-e", f"{rev}:{path}", check=False).returncode == 0
+
+    def restore_path(self, rev: str, path: str) -> None:
+        """``path`` as it was at ``rev``, into the working tree (the index is left alone)."""
+        with _errors(f"git restore {path}"):
+            self.git.run("restore", f"--source={rev}", "--worktree", "--", path)
+
+    def stash(self, message: str) -> None:
+        """Put every uncommitted change (untracked files included) in a stash named ``message``:
+        the working tree is HEAD's again."""
+        with _errors("git stash"):
+            self.git.run("stash", "push", "--include-untracked", "--message", message)
 
     def tag_applied(self, node: str, stamp: str, commit: str, info: TagInfo) -> str:
         """

@@ -157,9 +157,11 @@ def _run(
     """
     settings = load_settings()
     try:
-        nodes = set(settings.node_names())
-        scope = Scope.build(nodes, options.nodes)
         repo = ConfigRepo.open(settings.lab_config)
+        defined = settings.node_names()
+        # A node being retired (applied, its folder gone) can be named until its retiring apply.
+        nodes = {*defined, *repo.retiring(defined)}
+        scope = Scope.build(nodes, options.nodes)
     except (SettingsError, ValueError, RepoError) as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -324,6 +326,7 @@ def _apply(
                     tuple(sorted(up)),
                     work.desired.dirs,
                     work.desired.env.host_ip,
+                    retired=work.node in again.retiring,
                 )
                 tags.append((work.node, info))
     finally:
@@ -537,6 +540,9 @@ def _plan_and_render(
     first = [work.node for work in computed.works or () if _source(collected, work.node) == "first"]
     if first:
         confirm.append(f"a first apply on {', '.join(first)}")
+    retiring = sorted(node for node in collected.retiring if scope.in_scope(node))
+    if retiring:
+        confirm.append(f"{', '.join(retiring)} retired")
     if repo_notices:
         n = len(repo_notices)
         confirm.append(f"{n} repo notice{'s' if n > 1 else ''}")

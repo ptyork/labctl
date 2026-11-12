@@ -54,11 +54,12 @@ from labctl.bundle import (
     include_paths,
     resolve_desired,
     resolve_stacks,
+    retired,
     stack_candidates,
     top_level,
 )
 from labctl.compose import ComposeError, reduce_stacks
-from labctl.envfile import EnvError, Prompt
+from labctl.envfile import EnvError, Prompt, preview_env
 from labctl.remote import (
     CONNECT_TIMEOUT,
     MARK,
@@ -94,6 +95,7 @@ UNREAD = "-"
 # Where the source tree is exported in the work folder (node names never start with a dot).
 _TREE = ".tree"
 _BASELINES = ".baselines"
+_RETIRED = ".retired"
 # Seconds ssh waits for a node not named: it is only looked at.
 NOT_NAMED_TIMEOUT = 2
 
@@ -272,6 +274,8 @@ class Collected:
     untracked: set[str] = field(default_factory=set)
     # About the repo and the nodes' commits: apply asks about them first.
     repo_notices: list[str] = field(default_factory=list)
+    # The nodes being retired: applied, their folder gone from nodes/ (wanted empty).
+    retiring: frozenset[str] = frozenset()
 
 
 @contextmanager
@@ -321,14 +325,47 @@ def collect(
             repo.export_worktree(source)
         else:
             repo.export(tree, source)
-        nodes = node_names(source / "nodes")
+        defined = node_names(source / "nodes")
         desired = {
-            node: resolve_desired(settings, node, secrets, work, prompt, source) for node in nodes
+            node: resolve_desired(settings, node, secrets, work, prompt, source) for node in defined
         }
+        # A node applied before whose folder is gone is being retired: wanted empty, with the env
+        # its last apply used.
+        retiring = repo.retiring(defined)
+        for node in retiring:
+            last = repo.last_applied(node)
+            assert last is not None and last.info is not None  # what retiring() checked
+            then = work / _RETIRED / node
+            repo.export(last.commit, then)
+            values = preview_env(then / "nodes", node) if (then / "nodes" / node).is_dir() else {}
+            desired[node] = retired(node, last.info.dirs, work, values)
+        nodes = sorted(desired)
         if tree is not None and any(wanted.env.new_node_vars for wanted in desired.values()):
             tree = repo.snapshot()  # with the answers just written to node.env
-        result = Collected(desired=desired, recorded={}, tree=tree, base=repo.head())
+        result = Collected(
+            desired=desired,
+            recorded={},
+            tree=tree,
+            base=repo.head(),
+            retiring=frozenset(retiring),
+        )
         reads = _read_all(settings, nodes, desired, work, scope)
+        # A node being retired is planned only when it can be read and labctl has something there
+        # to remove. Otherwise it is left out; named, that is an error saying how to forget it.
+        for node in sorted(result.retiring):
+            read = reads[node]
+            gone = bool(read.unreachable or read.error)
+            if not (gone or _nothing_there(read)):
+                continue
+            nodes.remove(node)
+            del desired[node]
+            result.retiring -= {node}
+            if node in scope.named:
+                why = "cannot be read" if gone else "has nothing of labctl's left"
+                result.errors.append(
+                    f"{node} is being retired but {why}; if it is gone for good: "
+                    f"`labctl remove --forget {node}`"
+                )
         for node in nodes:
             named = scope.in_scope(node)
             why = _collect_remote(
@@ -448,6 +485,15 @@ def read_remote(
             node, on_node, home, moved_from, error=f"cannot read the stacks in {home}: {exc}"
         )
     return NodeRead(node, on_node, home, moved_from, state)
+
+
+def _nothing_there(read: NodeRead) -> bool:
+    """No DEPLOY_DIR, or one with no services and nothing in it but data and labctl's own."""
+    on_node = read.on_node
+    if on_node is None or not on_node.exists:
+        return True
+    services = read.state is not None and bool(read.state.services)
+    return not services and all(kind == "data" for kind in on_node.names.values())
 
 
 def _collect_remote(

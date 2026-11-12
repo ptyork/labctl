@@ -8,9 +8,11 @@ from .commands import (
     add_cmd,
     apply_cmd,
     archive_cmd,
+    discard_cmd,
     init_cmd,
     node_cmd,
     plan_cmd,
+    remove_cmd,
     secrets_cmd,
     settings_cmd,
     status_cmd,
@@ -38,7 +40,9 @@ main.add_command(secrets_cmd)
 main.add_command(plan_cmd)
 main.add_command(validate_cmd)
 main.add_command(apply_cmd)
+main.add_command(discard_cmd)
 main.add_command(add_cmd)
+main.add_command(remove_cmd)
 main.add_command(node_cmd)
 main.add_command(archive_cmd)
 main.add_command(unlock_cmd)

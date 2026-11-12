@@ -149,6 +149,7 @@ class Scope:
     """
 
     skipped: frozenset[str] = frozenset()
+    named: frozenset[str] = frozenset()  # the nodes named one by one (none for 'all')
 
     @classmethod
     def build(cls, nodes: set[str], targets: Iterable[str]) -> Scope:
@@ -167,11 +168,11 @@ class Scope:
             raise ValueError(
                 f"Unknown node(s): {', '.join(sorted(unknown))}. Nodes: {', '.join(sorted(nodes))}"
             )
-        return cls(skipped=frozenset(nodes - named))
+        return cls(skipped=frozenset(nodes - named), named=frozenset(named))
 
     def without(self, nodes: Iterable[str]) -> Scope:
         """This scope with ``nodes`` skipped too."""
-        return Scope(self.skipped | frozenset(nodes))
+        return Scope(self.skipped | frozenset(nodes), self.named)
 
     def in_scope(self, node: str) -> bool:
         return node not in self.skipped

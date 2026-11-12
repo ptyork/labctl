@@ -64,6 +64,12 @@ def render_nodes(collected: Collected) -> None:
     console.print(f"Nodes included:  {', '.join(included) or 'none'}")
     if skipped:
         console.print(f"Nodes skipped:   {', '.join(skipped)}")
+    for node in sorted(collected.retiring):
+        console.print(
+            f"[yellow]![/] {node} is being retired (nodes/{node} is gone): labctl removes "
+            "everything it put there",
+            highlight=False,
+        )
     for node, why in sorted(collected.unread.items()):
         console.print(
             f"[yellow]![/] {node} not read ({escape(why)}): planned as of its last apply",
