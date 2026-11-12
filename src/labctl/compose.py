@@ -150,7 +150,7 @@ def reduce_config(
                     continue
                 kind, source = "bind", device
             if kind == "bind":
-                relative = _data_path(PurePosixPath(source), root, name)
+                relative = _data_path(PurePosixPath(source), root, f"{node}: {name}")
                 if relative is None:
                     continue
                 if relative not in data_paths:
@@ -251,16 +251,17 @@ def fingerprint(value: object) -> str:
     return hashlib.sha256(canonical(value).encode()).hexdigest()
 
 
-def _data_path(source: PurePosixPath, root: PurePosixPath, service: str) -> str | None:
-    """A bind source as a data path relative to APPDATA_DIR, or None when outside it."""
+def _data_path(source: PurePosixPath, root: PurePosixPath, label: str) -> str | None:
+    """A bind source as a data path relative to APPDATA_DIR, or None when outside it. ``label``
+    (NODE: SERVICE) starts the error."""
     if source == root:
         raise ComposeError(
-            f"{service}: mounts APPDATA_DIR '{root}' itself; moving it would copy every "
+            f"{label}: mounts APPDATA_DIR '{root}' itself; moving it would copy every "
             "service's data"
         )
     if not source.is_relative_to(root):
         return None
     relative = source.relative_to(root)
     if relative.parts[0] == LABCTL_DIR:
-        raise ComposeError(f"{service}: mounts {source}, but {root}/{LABCTL_DIR}/ is labctl's")
+        raise ComposeError(f"{label}: mounts {source}, but {root}/{LABCTL_DIR}/ is labctl's")
     return str(relative)

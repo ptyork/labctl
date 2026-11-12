@@ -52,6 +52,9 @@ REQUIRED_VARS = ("DEPLOY_DIR", "APPDATA_DIR")
 # Prompt defaults for missing variables: offer another variable's value (not used silently).
 SUGGESTIONS = {"DEPLOY_DIR": "APPDATA_DIR"}
 
+# Why a top-level yml that resolves is not a stack.
+NO_SERVICES = "defines no services"
+
 # Host environment passed to a local docker CLI. Everything else is dropped so the controller's
 # shell (TZ, PUID, ...) cannot leak into interpolation: compose prefers the shell over .env.
 _PASS_ENV = (
@@ -145,6 +148,7 @@ def resolve_desired(
     source: Path | None = None,
     baseline: bool = False,
     address: str = "",
+    offline: bool = False,
 ) -> Desired:
     """
     The node's bundle, built from a copy of the lab config, and resolved.
@@ -168,6 +172,10 @@ def resolve_desired(
         baseline (bool):
             Rebuilding what an earlier apply shipped: no prompt, nothing written, and `_HOST_IP_`
             is not looked up (default: False).
+        address (str):
+            With ``baseline``, the `_HOST_IP_` the earlier apply used (default: a placeholder).
+        offline (bool):
+            `_HOST_IP_` is not looked up, but left a placeholder (validate) (default: False).
 
     Returns:
         Desired:
@@ -205,7 +213,7 @@ def resolve_desired(
         None if baseline else prompt,
         SUGGESTIONS,
         host_ip=(lambda: address or PLACEHOLDER_PREFIX + HOST_IP)
-        if baseline
+        if baseline or offline
         else lambda: host_ip(node_remote(node)),
     )
     # One-time local writes of answers given at the prompt.
@@ -276,7 +284,7 @@ def find_stacks(
             not_stacks[name] = str(exc)
             continue
         if not config.get("services"):
-            not_stacks[name] = "defines no services"
+            not_stacks[name] = NO_SERVICES
             continue
         files_by_name.setdefault(str(config["name"]), []).append(name)
     stacks = [Stack(name, tuple(files)) for name, files in sorted(files_by_name.items())]

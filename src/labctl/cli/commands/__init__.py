@@ -6,3 +6,5 @@ from .plan import plan_cmd as plan_cmd
 from .secrets import secrets_cmd as secrets_cmd
 from .settings import settings_cmd as settings_cmd
 from .status import status_cmd as status_cmd
+from .unlock import unlock_cmd as unlock_cmd
+from .validate import validate_cmd as validate_cmd

@@ -6,6 +6,7 @@ from collections.abc import Iterable, Mapping
 
 from rich.markup import escape
 
+from labctl.bundle import NO_SERVICES
 from labctl.changes import definition_changes, network_changes
 from labctl.checks import (
     Finding,
@@ -96,6 +97,12 @@ def render_problems(
                 )
     for node, names in sorted(placeholders.items()):
         console.print(f"  [red]✗[/] {node}: no value for {', '.join(names)}")
+
+
+def not_a_stack(node: str, file: str, why: str) -> str:
+    """A top-level yml of the node's bundle that is not a stack, and why (markup)."""
+    reason = NO_SERVICES if why == NO_SERVICES else "does not resolve"
+    return f"{node}: {escape(file)} is not a stack ({reason}); copied as is"
 
 
 def render_drift(collected: Collected) -> None:
@@ -289,9 +296,8 @@ def render_stacks(
                 lines.append(f"  - {node}/{escape(name)}{how}")
                 lines.extend(f"    {line}" for line in body)
         for file, why in sorted(bundle.not_stacks.items()):
-            reason = "defines no services" if why == "defines no services" else "does not resolve"
-            lines.append(f"  - {node}: {escape(file)} is not a stack ({reason}); copied as is")
-            if verbose and reason != why:
+            lines.append(f"  - {not_a_stack(node, file, why)}")
+            if verbose and why != NO_SERVICES:
                 lines.extend(f"      {escape(line)}" for line in why.splitlines()[-3:])
     if lines:
         console.print("\n[bold]Stacks[/]")

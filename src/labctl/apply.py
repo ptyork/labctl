@@ -77,7 +77,7 @@ from labctl.compose import ARCHIVE_DIR
 from labctl.moves import VOLUME, Move
 from labctl.planner import Migrate, Plan, Remove, Restore, archived_keys
 from labctl.progress import Progress, Step
-from labctl.remote import Remote, execute, node_remote, relay
+from labctl.remote import MARK, Remote, RemoteError, execute, node_remote, relay
 from labctl.repo import tag_name
 from labctl.restore import SIDECAR
 from labctl.runtime import NodeRuntime
@@ -469,12 +469,49 @@ def lock(remote: Remote, owner: str) -> None:
     if execute(["sh", "-c", script, "sh", owner], "/", remote).code:
         raise ApplyError(
             f"{remote.host}: ~/{LOCK} exists: another apply is running, or one was interrupted "
-            f"(see `labctl plan {remote.host}`)"
+            f"(see `labctl plan {remote.host}`; once nothing runs there, `labctl unlock "
+            f"{remote.host}`)"
         )
 
 
 def unlock(remote: Remote) -> None:
     execute(["sh", "-c", f'rm -rf "$HOME/{LOCK}"'], "/", remote)
+
+
+@dataclass(frozen=True)
+class HeldLock:
+    """A node's apply lock: who took it and when, and the steps its run recorded."""
+
+    owner: str
+    steps: tuple[str, ...]
+
+
+def read_lock(remote: Remote) -> HeldLock | None:
+    """
+    The node's apply lock, or None when it is not locked.
+
+    Args:
+        remote (Remote):
+            The node's shell.
+
+    Raises:
+        RemoteError:
+            The node cannot be reached, or the lock cannot be read.
+    """
+    script = (
+        f'[ -d "$HOME/{LOCK}" ] || exit 3; '
+        f'cat "$HOME/{LOCK}/owner" 2>/dev/null; echo {MARK}; cat "$HOME/{LOCK}/steps" 2>/dev/null; '
+        "exit 0"
+    )
+    result = execute(["sh", "-c", script], "/", remote)
+    if result.code == 3:
+        return None
+    if result.code:
+        raise RemoteError(f"{remote.host}: cannot read ~/{LOCK}: {result.stderr.strip()}")
+    owner, _, steps = result.stdout.partition(f"{MARK}\n")
+    return HeldLock(
+        owner.strip() or "unknown", tuple(line for line in steps.splitlines() if line.strip())
+    )
 
 
 @dataclass

@@ -13,6 +13,8 @@ from .commands import (
     secrets_cmd,
     settings_cmd,
     status_cmd,
+    unlock_cmd,
+    validate_cmd,
 )
 
 MODULE_NAME = "labctl"
@@ -33,9 +35,11 @@ main.add_command(init_cmd)
 main.add_command(settings_cmd)
 main.add_command(secrets_cmd)
 main.add_command(plan_cmd)
+main.add_command(validate_cmd)
 main.add_command(apply_cmd)
 main.add_command(node_cmd)
 main.add_command(archive_cmd)
+main.add_command(unlock_cmd)
 
 
 if __name__ == "__main__":

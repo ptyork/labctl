@@ -479,7 +479,7 @@ def _collect_remote(
         done = "; ".join(on_node.lock) or "nothing recorded"
         result.errors.append(
             f"{node}: an apply holds ~/{LOCK} (running now, or interrupted). Its log: {done}. "
-            f"Once nothing runs there and the node is checked, remove ~/{LOCK}"
+            f"Once nothing runs there and the node is checked: `labctl unlock {node}`"
         )
         return ""
     if found.error or on_node is None:
