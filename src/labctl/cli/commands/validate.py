@@ -17,6 +17,7 @@ from labctl.click import DebugOptions
 from labctl.compose import ComposeError
 from labctl.console import console
 from labctl.envfile import EnvError
+from labctl.ports import lab_clashes
 from labctl.repo import ConfigRepo, RepoError
 from labctl.settings import Secrets, Settings, SettingsError, node_names
 from labctl.state import ALL, Scope
@@ -29,8 +30,9 @@ def validate_cmd(nodes: tuple[str, ...], **kwargs: Any) -> None:
     """Check the lab config without touching a node. Exits 1 when a node is not valid.
 
     No node named means 'all'. Each node's stacks are built and resolved as plan does (the working
-    tree, uncommitted changes included), with every value they need. Never asks, writes nothing,
-    and leaves _HOST_IP_ unresolved.
+    tree, uncommitted changes included), with every value they need, and no two of a node's
+    services may publish the same host port. Never asks, writes nothing, and leaves _HOST_IP_
+    unresolved.
     """
     settings = load_settings()
     try:
@@ -88,6 +90,11 @@ def check_node(
     missing = desired.env.placeholders
     if missing:
         console.print(f"[red]✗[/] {node}: no value for {', '.join(missing)}")
+        return False
+    clashes = lab_clashes(desired)
+    for clash in clashes:
+        console.print(f"[red]✗[/] {escape(clash)}")
+    if clashes:
         return False
     stacks, services = len(desired.configs), len(desired.state.services)
     console.print(

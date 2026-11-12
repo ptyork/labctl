@@ -44,7 +44,7 @@ from labctl.planner import (
     UnknownNode,
     Update,
 )
-from labctl.runtime import Runtime
+from labctl.runtime import DEFER, Conflict, Runtime, TakeDown
 from labctl.state import NodeState, Scope, Service, is_volume
 
 
@@ -78,9 +78,11 @@ def render_nodes(collected: Collected) -> None:
 
 
 def render_problems(
-    problems: tuple[Problem, ...], placeholders: dict[str, tuple[str, ...]]
+    problems: tuple[Problem, ...],
+    placeholders: dict[str, tuple[str, ...]],
+    port_clashes: list[str] | None = None,
 ) -> None:
-    if not (problems or placeholders):
+    if not (problems or placeholders or port_clashes):
         return
     console.print("\n[bold]Problems (block apply)[/]")
     for problem in problems:
@@ -103,6 +105,8 @@ def render_problems(
                 )
     for node, names in sorted(placeholders.items()):
         console.print(f"  [red]✗[/] {node}: no value for {', '.join(names)}")
+    for clash in port_clashes or ():
+        console.print(f"  [red]✗[/] {escape(clash)}")
 
 
 def not_a_stack(node: str, file: str, why: str) -> str:
@@ -328,41 +332,23 @@ def render_runtime(runtime: Runtime) -> None:
                 )
     if runtime.conflicts or runtime.blocked:
         console.print(
-            "\n[bold]In the way of what apply starts[/] (apply asks in a terminal, all or "
-            "nothing; without one it stops)"
+            "\n[bold]In the way of what apply starts[/] (apply asks about each in a terminal; "
+            "without one, --stop-unmanaged and --defer-blocked answer them, else it stops)"
         )
-    for down in runtime.take_down:
-        services = ", ".join(down.services) or "no compose services"
-        if down.in_repo and len(down.in_repo) == len(down.services):
-            likely = "the same services as the repo's: likely this stack moving into DEPLOY_DIR"
-        elif down.in_repo:
-            likely = f"{len(down.in_repo)} of them in the repo's {down.project}"
+    for conflict in runtime.in_the_way:
+        answer = runtime.answer(conflict)
+        if answer:
+            then = choice_label(conflict, answer, done=True)
         else:
-            likely = "none of them in the repo's: likely an unrelated stack with the same name"
-        mark = "[red]✗[/]" if down.missing else "[yellow]![/]"
-        then = "" if down.missing else " → taken down (undo brings it back)"
-        console.print(
-            f"  {mark} {down.node}: compose project {escape(down.project)} runs from "
-            f"{escape(down.working_dir)} ({escape(services)}; {likely}){then}"
-        )
-        for note in down.data:
+            asks = [choice_label(conflict, choice, short=True) for choice in conflict.choices]
+            then = f"apply asks: {' / '.join(asks)} / cancel"
+        console.print(f"  [yellow]![/] {escape(describe(conflict))} → {escape(then)}")
+        for note in conflict.take_down.data if conflict.take_down else ():
             console.print(f"      [yellow]![/] {escape(note)}")
+    for down in runtime.stuck:
+        console.print(f"  [red]✗[/] {escape(_project(down))}")
     for blocked in runtime.blocked:
         console.print(f"      [red]✗[/] {escape(blocked)}")
-    for stop in runtime.stops:
-        then = "stopped, restart policy set to no"
-        if stop.rename:
-            then += f", renamed {stop.container.name}-labctl-<timestamp>"
-        console.print(
-            f"  [yellow]![/] {stop.node}: container {escape(stop.container.name)} "
-            f"({escape(stop.container.image)}) {escape('; '.join(stop.why))} → {then}"
-        )
-    for defer in runtime.defers:
-        services = ", ".join(defer.services)
-        console.print(
-            f"  [yellow]![/] {defer.node}: {escape('; '.join(defer.why))} → {escape(services)} "
-            "created, not started (start it once the port is free)"
-        )
     if runtime.later:
         console.print("\n[bold]Would be in the way[/] (nothing to do now)")
         for line in runtime.later:
@@ -371,6 +357,75 @@ def render_runtime(runtime: Runtime) -> None:
         console.print(
             f"\n[yellow]![/] {node}: no `ss` there; ports held outside Docker not checked"
         )
+
+
+def describe(conflict: Conflict) -> str:
+    """One conflict: what is in the way, and of what."""
+    if conflict.take_down:
+        return _project(conflict.take_down)
+    if conflict.stop:
+        stop = conflict.stop
+        return (
+            f"{stop.node}: container {stop.container.name} ({stop.container.image}) "
+            f"{'; '.join(stop.why)}"
+        )
+    return f"{conflict.node}: {'; '.join(why for defer in conflict.defer for why in defer.why)}"
+
+
+def choice_label(conflict: Conflict, choice: str, short: bool = False, done: bool = False) -> str:
+    """
+    One answer to a conflict, as the terminal offers it, or as the plan names it.
+
+    Args:
+        conflict (Conflict):
+            The conflict.
+        choice (str):
+            STOP, DEFER, or "" (cancel the apply).
+        short (bool):
+            Just what is done (default: False).
+        done (bool):
+            As the plan says it once answered (default: False).
+
+    Returns:
+        str:
+            The label.
+    """
+    if not choice:
+        return "Cancel the apply"
+    if choice == DEFER:
+        names = ", ".join(dict.fromkeys(s for defer in conflict.defer for s in defer.services))
+        if done:
+            return f"{names} created, not started (labctl node up starts it once the port is free)"
+        return f"don't start {names}" if short else f"Don't start {names} (created, not started)"
+    if conflict.take_down:
+        if done:
+            return "taken down (undo brings it back)"
+        return "take it down" if short else "Take it down (undo brings it back)"
+    stop = conflict.stop
+    rename = bool(stop and stop.rename)
+    if done:
+        renamed = f", renamed {stop.container.name}-labctl-<timestamp>" if stop and rename else ""
+        return f"stopped, restart policy set to no{renamed}"
+    if short:
+        return "stop it"
+    return (
+        f"Stop it (restart policy set to no{', renamed' if rename else ''}; undo starts it again)"
+    )
+
+
+def _project(down: TakeDown) -> str:
+    """A compose project from elsewhere with one of the node's stack names."""
+    services = ", ".join(down.services) or "no compose services"
+    if down.in_repo and len(down.in_repo) == len(down.services):
+        likely = "the same services as the repo's: likely this stack moving into DEPLOY_DIR"
+    elif down.in_repo:
+        likely = f"{len(down.in_repo)} of them in the repo's {down.project}"
+    else:
+        likely = "none of them in the repo's: likely an unrelated stack with the same name"
+    return (
+        f"{down.node}: compose project {down.project} runs from {down.working_dir} "
+        f"({services}; {likely})"
+    )
 
 
 def render_moves(plan: Plan, probes: dict[str, dict[str, PathInfo]], verbose: bool = False) -> None:

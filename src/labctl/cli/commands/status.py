@@ -16,6 +16,7 @@ from labctl.console import console
 from labctl.envfile import HOST_IP, preview_env
 from labctl.hostip import local_ip, ssh_address
 from labctl.remote import node_remote
+from labctl.repo import ConfigRepo, RepoError
 from labctl.settings import Settings, SettingsError, config_file
 
 _MODULE_NAME = "labctl"
@@ -60,6 +61,11 @@ def status_cmd(**kwargs: Any) -> None:
     except SettingsError as exc:
         console.print(f"[red]{escape(str(exc))}[/]")
         return
+    try:
+        repo: ConfigRepo | None = ConfigRepo.open(settings.lab_config)
+        head = repo.head() if repo else ""
+    except RepoError:
+        repo, head = None, ""
     node_rows = []
     notes = []
     for node in nodes:
@@ -74,6 +80,7 @@ def status_cmd(**kwargs: Any) -> None:
                 escape(host),
                 ip or "[red]does not resolve[/]",
                 *(escape(values[var]) if values.get(var) else _NOT_SET for var in _NODE_VARS),
+                _last_applied(repo, node, head),
             ]
         )
         server_ip = values.get("SERVER_IP")
@@ -86,9 +93,9 @@ def status_cmd(**kwargs: Any) -> None:
         Panel(
             get_table(
                 node_rows,
-                header_row=["Node", "SSH Host", "IP Address", *_NODE_VARS],
-                # Name, host and IP sized to their data; the path columns share the rest.
-                col_defs=["", "", "", *["A"] * len(_NODE_VARS)],
+                header_row=["Node", "SSH Host", "IP Address", *_NODE_VARS, "Last Applied"],
+                # Name, host, IP and last apply sized to their data; the paths share the rest.
+                col_defs=["", "", "", *["A"] * len(_NODE_VARS), ""],
                 table_width=width,
             ),
             title="Nodes (paths from node.env; missing values are asked for by plan)",
@@ -97,6 +104,23 @@ def status_cmd(**kwargs: Any) -> None:
     )
     for note in notes:
         console.print(note)
+
+
+def _last_applied(repo: ConfigRepo | None, node: str, head: str) -> str:
+    """The node's latest apply: its stamp and commit, and how far the lab config has moved on."""
+    if repo is None:
+        return "?"
+    try:
+        last = repo.last_applied(node)
+        if last is None:
+            return "[yellow]never[/]"
+        # Commits that change nothing in the end (an edit and its undo) are not "behind".
+        changed = bool(head) and bool(repo.changed_paths(last.commit, head))
+        behind = repo.count_between(last.commit, head) if changed else 0
+    except RepoError:
+        return "?"
+    moved = f", [yellow]{behind} behind[/]" if behind else ""
+    return f"{last.stamp} {last.commit[:7]}{moved}"
 
 
 def _package_version() -> str:

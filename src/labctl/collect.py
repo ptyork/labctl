@@ -71,8 +71,7 @@ from labctl.remote import (
 )
 from labctl.repo import ConfigRepo, RepoError, TagInfo
 from labctl.runtime import (
-    CONTAINER_FORMAT,
-    UNAVAILABLE,
+    READ_RUNTIME,
     Container,
     Listener,
     parse_containers,
@@ -111,12 +110,7 @@ if [ -d "$HOME/{LOCK}" ]; then
   echo "{MARK} locked"; cat "$HOME/{LOCK}/owner" "$HOME/{LOCK}/steps" 2>/dev/null
 fi
 echo "{MARK} pointer"; cat "$HOME/{HOME_POINTER}" 2>/dev/null
-echo "{MARK} containers"
-docker ps -aq </dev/null 2>/dev/null |
-  xargs -r docker inspect --format '{CONTAINER_FORMAT}' 2>/dev/null
-echo "{MARK} listeners"
-if command -v ss >/dev/null 2>&1; then ss -Htulnp </dev/null 2>/dev/null
-else echo "{UNAVAILABLE}"; fi
+{READ_RUNTIME}
 echo "{MARK} missing"
 docker ps -a --format '{{{{.Label "com.docker.compose.project.config_files"}}}}' \\
   </dev/null 2>/dev/null | tr ',' '\\n' | sort -u | while IFS= read -r file; do

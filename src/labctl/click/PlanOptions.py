@@ -21,6 +21,11 @@ class Options:
     fresh: tuple[str, ...] = ()
     restore: tuple[str, ...] = ()  # SERVICE or SERVICE@STAMP
     ff: bool = False
+    stop_unmanaged: bool = False
+    defer_blocked: bool = False
+    # Conflicts answered in a terminal, by key (runtime.Conflict).
+    stop: tuple[str, ...] = ()
+    defer: tuple[str, ...] = ()
 
 
 class PlanOptions:
@@ -76,6 +81,18 @@ class PlanOptions:
             help="Fast-forward the branch to its upstream first, without asking (a terminal is "
             "asked).",
         )
+        @click.option(
+            "--stop-unmanaged",
+            is_flag=True,
+            help="Stop the containers labctl does not manage that are in the way of what apply "
+            "starts (and take down projects from elsewhere with a stack's name), without asking.",
+        )
+        @click.option(
+            "--defer-blocked",
+            is_flag=True,
+            help="Don't start the services whose ports are held by something else, without "
+            "asking; start them later with 'labctl node up'.",
+        )
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             nodes = kwargs.pop("nodes")
@@ -87,6 +104,8 @@ class PlanOptions:
                 fresh=kwargs.pop("fresh"),
                 restore=kwargs.pop("restore"),
                 ff=kwargs.pop("ff"),
+                stop_unmanaged=kwargs.pop("stop_unmanaged"),
+                defer_blocked=kwargs.pop("defer_blocked"),
             )
             return func(*args, options=options, **kwargs)
 

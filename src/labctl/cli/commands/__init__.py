@@ -1,10 +1,12 @@
 from .add import add_cmd as add_cmd
 from .archive import archive_cmd as archive_cmd
 from .discard import discard_cmd as discard_cmd
+from .history import history_cmd as history_cmd
 from .init import init_cmd as init_cmd
 from .node import node_cmd as node_cmd
 from .plan import apply_cmd as apply_cmd
 from .plan import plan_cmd as plan_cmd
+from .ports import ports_cmd as ports_cmd
 from .remove import remove_cmd as remove_cmd
 from .secrets import secrets_cmd as secrets_cmd
 from .settings import settings_cmd as settings_cmd

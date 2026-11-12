@@ -42,6 +42,8 @@ from labctl.cli.git_sync import (
 )
 from labctl.cli.prompts import ask_restore, prompt_value
 from labctl.cli.render import (
+    choice_label,
+    describe,
     remote_sharing,
     render_drift,
     render_files,
@@ -70,11 +72,12 @@ from labctl.planner import (
     Remove,
     make_plan,
 )
+from labctl.ports import lab_clashes
 from labctl.progress import Progress
 from labctl.remote import Remote, RemoteError, node_remote
 from labctl.repo import ConfigRepo, RepoError, TagInfo
 from labctl.restore import Ask, Restores, find_archives, plan_restores
-from labctl.runtime import Runtime, analyse
+from labctl.runtime import STOP, Answers, Runtime, analyse, resolve
 from labctl.settings import Secrets, Settings, SettingsError
 from labctl.state import Scope
 
@@ -108,7 +111,7 @@ def plan_cmd(options: Options, detailed_exitcode: bool = False, **kwargs: Any) -
     "-y",
     is_flag=True,
     help="Apply without asking: the plan is approved and other questions take their defaults "
-    "(--ff to fast-forward). Conflicts still need a terminal.",
+    "(--ff to fast-forward). Conflicts need a terminal, or --stop-unmanaged/--defer-blocked.",
 )
 @click.option(
     "--wait",
@@ -184,10 +187,8 @@ def _run(
         if not targets:
             console.print("Nothing to apply.")
             return False
-        conflicts = _conflicts(planned.runtime)
-        if conflicts:
-            _confirm([*([] if yes else planned.confirm), conflicts], conflicts=True)
-        elif planned.confirm and not yes:
+        planned, asked = _answer_conflicts(planned, options, sys.stdin.isatty())
+        if (planned.confirm or asked) and not yes:
             _confirm(planned.confirm)
         _apply(
             settings,
@@ -209,30 +210,59 @@ def _run(
         Remote.close_all(nodes)
 
 
-def _conflicts(runtime: Runtime) -> str:
-    """What apply does about the conflicts, for the question; "" when there are none."""
-    parts = []
-    if runtime.take_down:
-        n = len(runtime.take_down)
-        parts.append(f"take down {n} compose project{'s' if n > 1 else ''} from elsewhere")
-    if runtime.stops:
-        n = len(runtime.stops)
-        parts.append(f"stop {n} container{'s' if n > 1 else ''} labctl does not manage")
-    if runtime.defers:
-        n = sum(len(defer.services) for defer in runtime.defers)
-        parts.append(f"leave {n} service{'s' if n > 1 else ''} created but not started")
-    return ", ".join(parts)
+def _answer_conflicts(planned: Planned, options: Options, terminal: bool) -> tuple[Planned, bool]:
+    """
+    Ask about each conflict the flags left unanswered (--yes answers none of them).
+
+    Args:
+        planned (Planned):
+            The plan.
+        options (Options):
+            The options it was planned with (when the plan kept none).
+        terminal (bool):
+            Whether there is a terminal to ask in.
+
+    Returns:
+        tuple[Planned, bool]:
+            The plan with the answers (in its options too: apply plans again with them), and
+            whether anything was asked.
+
+    Raises:
+        click.ClickException:
+            A conflict is left without an answer: no terminal, or the apply was cancelled.
+    """
+    unresolved = planned.runtime.unresolved
+    if not unresolved:
+        return planned, False
+    if not terminal:
+        n = len(unresolved)
+        raise click.ClickException(
+            f"The plan has {n} conflict{'s' if n > 1 else ''} with what labctl does not manage "
+            "(listed above): answer in a terminal, or pass --stop-unmanaged or --defer-blocked"
+        )
+    options = planned.options or options
+    stop, defer = list(options.stop), list(options.defer)
+    console.print()
+    for conflict in unresolved:
+        choices = [*conflict.choices, ""]  # "": cancel
+        labels = [choice_label(conflict, choice) for choice in choices]
+        index = menu.choose(f"In the way on {conflict.node}", labels, header=describe(conflict))
+        if index is None or not choices[index]:
+            raise click.ClickException("Not applied")
+        (stop if choices[index] == STOP else defer).append(conflict.key)
+    options = replace(options, stop=tuple(stop), defer=tuple(defer))
+    runtime = resolve(planned.runtime, _answers(options))
+    works = tuple(replace(work, runtime=runtime.for_node(work.node)) for work in planned.works)
+    return replace(planned, runtime=runtime, works=works, options=options), True
 
 
-def _confirm(reasons: list[str], conflicts: bool = False) -> None:
-    """Ask in a terminal. Conflicts always need the answer there: --yes does not cover stopping
-    what labctl does not manage."""
+def _answers(options: Options) -> Answers:
+    return Answers(options.stop, options.defer, options.stop_unmanaged, options.defer_blocked)
+
+
+def _confirm(reasons: list[str]) -> None:
+    """Ask in a terminal; without one, --yes is needed."""
     if not sys.stdin.isatty():
-        if conflicts:
-            raise click.ClickException(
-                "The plan has conflicts with containers or ports labctl does not manage (listed "
-                "above); resolve them by hand, or run apply in a terminal to have it do it"
-            )
         raise click.ClickException(
             f"The plan has {', '.join(reasons)}; confirm in a terminal, or pass --yes"
         )
@@ -446,6 +476,7 @@ def _compute(collected: Collected, options: Options, ask: Ask | None = None) -> 
         listeners=_named(collected.listeners, scope),
         missing=_named(collected.missing, scope),
         work={work.node for work in works or () if not work.record_only},
+        answers=_answers(options),
     )
     with_runtime = (
         tuple(replace(work, runtime=runtime.for_node(work.node)) for work in works)
@@ -485,7 +516,14 @@ def _plan_and_render(
         n: d.env.placeholders for n, d in collected.desired.items() if d.env.placeholders
     }
 
-    render_problems(plan.problems, placeholders)
+    # Two of a node's services publishing one port: `up` would fail on it.
+    port_clashes = [
+        clash
+        for node, bundle in sorted(collected.desired.items())
+        if scope.in_scope(node)
+        for clash in lab_clashes(bundle)
+    ]
+    render_problems(plan.problems, placeholders, port_clashes)
     render_drift(collected)
     files_changed = render_files(collected, scope, options.verbose)
     render_stacks(plan, collected, runtime, work_nodes, probes, options.verbose)
@@ -507,7 +545,7 @@ def _plan_and_render(
     render_runtime(runtime)
 
     reasons = []
-    if plan.problems or placeholders or restores.errors:
+    if plan.problems or placeholders or restores.errors or port_clashes:
         reasons.append("problems above")
     blocking = [finding for finding in findings if finding.level is Level.BLOCK]
     if blocking:

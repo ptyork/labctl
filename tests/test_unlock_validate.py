@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from click.testing import CliRunner
 from conftest import MakeRepo
+from test_runtime import Services, desired
 
 from labctl.apply import HeldLock
+from labctl.bundle import Desired
 from labctl.cli import cli
 from labctl.cli.commands import unlock as unlock_module
 from labctl.cli.commands import validate as validate_module
 from labctl.compose import ComposeError
+from labctl.envfile import PLACEHOLDER_PREFIX
 from labctl.settings import LAB_CONFIG_ENV
 
 FILES = {
@@ -83,13 +86,12 @@ def test_unlock_needs_its_nodes_named(root: Path, locks: dict[str, HeldLock]) ->
 #############################################################################
 
 
-def _desired(services: int = 2, placeholders: tuple[str, ...] = (), **not_stacks: str) -> Any:
-    return SimpleNamespace(
-        configs={"homelab": {}},
-        state=SimpleNamespace(services={f"s{i}": None for i in range(services)}),
-        env=SimpleNamespace(placeholders=placeholders),
-        not_stacks=not_stacks,
-    )
+def _desired(
+    services: Services | None = None, placeholders: tuple[str, ...] = (), **not_stacks: str
+) -> Desired:
+    built = desired("frodo", {"homelab": services or {"s0": {}, "s1": {}}})
+    env = replace(built.env, placeholders=placeholders)
+    return replace(built, env=env, not_stacks=not_stacks)
 
 
 @pytest.fixture
@@ -122,6 +124,25 @@ def test_validate_reports_every_node_and_fails(root: Path, resolved: dict[str, A
     assert "✗ cirdan: APPDATA_DIR must be an absolute path" in output
     assert "! frodo: notes.yml is not a stack (defines no services)" in output
     assert "✗ frodo: no value for TOKEN" in output
+
+
+def test_validate_fails_on_services_publishing_one_port(
+    root: Path, resolved: dict[str, Any]
+) -> None:
+    def published(port: str, host_ip: str = "") -> dict[str, Any]:
+        return {"ports": [{"published": port, "target": 80, "host_ip": host_ip}]}
+
+    resolved["frodo"] = _desired(
+        {
+            "web": published("80"),
+            "proxy": published("80", f"{PLACEHOLDER_PREFIX}HOST_IP"),
+            "dns": published("53"),
+            "other": published("53", "10.0.0.9") | {"network_mode": "host"},  # publishes nothing
+        }
+    )
+    code, output = run("validate", "frodo")
+    assert code == 1
+    assert output == "✗ frodo: 80/tcp is published by proxy (on the host IP) and web\n"
 
 
 def test_validate_only_the_nodes_named(root: Path, resolved: dict[str, Any]) -> None:

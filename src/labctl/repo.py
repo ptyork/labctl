@@ -64,6 +64,35 @@ class Applied:
         return self.tag.rsplit("/", 1)[-1]
 
 
+@dataclass(frozen=True)
+class Apply:
+    """One apply in the history: the tags it made (one per node it recorded), its commit."""
+
+    stamp: str
+    commit: str
+    subject: str
+    tags: tuple[Applied, ...]
+    again: bool = False  # an earlier apply applied this commit already: nothing new in the repo
+
+    @property
+    def nodes(self) -> tuple[str, ...]:
+        return tuple(applied.tag.split("/")[1] for applied in self.tags)
+
+    @property
+    def retired(self) -> tuple[str, ...]:
+        """The nodes it retired (or forgot)."""
+        return tuple(
+            applied.tag.split("/")[1]
+            for applied in self.tags
+            if applied.info is not None and applied.info.retired
+        )
+
+    @property
+    def info(self) -> TagInfo | None:
+        """The first tag's message (when and by whom are the same on every tag)."""
+        return next((applied.info for applied in self.tags if applied.info), None)
+
+
 def tag_name(node: str, stamp: str) -> str:
     return f"{TAG_PREFIX}/{node}/{stamp}"
 
@@ -381,6 +410,80 @@ class ConfigRepo:
         the working tree is HEAD's again."""
         with _errors("git stash"):
             self.git.run("stash", "push", "--include-untracked", "--message", message)
+
+    # History
+
+    def applies(self) -> list[Apply]:
+        """Every apply, newest first: the tags one apply made (one stamp), as one."""
+        with _errors("git for-each-ref"):
+            tags = self.git.list_tags(f"{TAG_PREFIX}/", sort="-refname")
+        by_stamp: dict[str, list[Applied]] = {}
+        for tag in tags:
+            applied = Applied(tag.name, tag.commit, parse_tag_message(tag.message))
+            by_stamp.setdefault(applied.stamp, []).append(applied)
+        subjects: dict[str, str] = {}
+        found = []
+        for stamp in sorted(by_stamp):  # oldest first: the first at a commit is not "again"
+            tagged = sorted(by_stamp[stamp], key=lambda applied: applied.tag)
+            commit = tagged[0].commit
+            again = commit in subjects
+            if not again:
+                subjects[commit] = next(iter(self.subjects(f"{commit}^!")), "").split("\n")[0]
+            found.append(Apply(stamp, commit, subjects[commit], tuple(tagged), again))
+        return found[::-1]
+
+    def resolve(self, ref: str, applies: Sequence[Apply]) -> tuple[str, Apply | None]:
+        """
+        A reference: `last`, `previous`, an apply's stamp, a tag, or a commit.
+
+        Args:
+            ref (str):
+                The reference.
+            applies (Sequence[Apply]):
+                Every apply, newest first (``applies()``).
+
+        Returns:
+            tuple[str, Apply | None]:
+                The commit, and the apply it is (the newest at that commit; None: no apply).
+
+        Raises:
+            RepoError:
+                It names nothing.
+        """
+        if ref in ("last", "previous"):
+            index = 0 if ref == "last" else 1
+            if len(applies) <= index:
+                raise RepoError(f"There is no {ref} apply")
+            return applies[index].commit, applies[index]
+        for apply in applies:
+            if ref == apply.stamp or ref in (applied.tag for applied in apply.tags):
+                return apply.commit, apply
+        try:
+            commit = self.git.resolve_commit(ref)
+        except ValueError:
+            commit = None
+        if commit is None:
+            raise RepoError(
+                f"'{ref}' names no apply or commit (last, previous, a timestamp, a tag, a commit)"
+            )
+        return commit, next((apply for apply in applies if apply.commit == commit), None)
+
+    def path_names(self, rev: str, path: str) -> list[str]:
+        """The names in folder ``path`` at ``rev`` (none when it is not there)."""
+        result = self.git.run("ls-tree", "--name-only", f"{rev}:{path}", check=False)
+        return result.stdout.split() if result.returncode == 0 else []
+
+    def restore_tree(self, rev: str) -> None:
+        """The working tree as ``rev`` has it: changed files back, files ``rev`` does not have
+        removed (the index is left alone)."""
+        with _errors(f"git restore {rev}"):
+            self.git.run("restore", f"--source={rev}", "--worktree", "--", ".")
+
+    def diff(self, rev: str, pathspecs: Sequence[str]) -> int:
+        """`git diff rev -- pathspecs` straight to the terminal (git's colour and pager)."""
+        return subprocess.run(
+            ["git", "-C", str(self.root), "diff", rev, "--", *pathspecs], check=False
+        ).returncode
 
     def tag_applied(self, node: str, stamp: str, commit: str, info: TagInfo) -> str:
         """

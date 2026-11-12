@@ -9,7 +9,10 @@ from labctl.bundle import Desired
 from labctl.envfile import CompiledEnv
 from labctl.planner import Migrate, Plan
 from labctl.runtime import (
+    DEFER,
+    STOP,
     UNAVAILABLE,
+    Answers,
     Container,
     Listener,
     NetworkInUse,
@@ -20,10 +23,12 @@ from labctl.runtime import (
     parse_containers,
     parse_listeners,
     published,
+    resolve,
 )
 from labctl.state import Network, NodeState, Service, Stack
 
 HOME, APPDATA = "/srv/docker", "/srv/appdata"
+STOP_ALL, DEFER_ALL = Answers(stop_unmanaged=True), Answers(defer_blocked=True)
 
 
 def row(name: str, **fields: Any) -> str:
@@ -137,6 +142,7 @@ def run(
     plan: Plan | None = None,
     work: set[str] | None = None,
     missing: dict[str, frozenset[str]] | None = None,
+    answers: Answers | None = None,
 ) -> Runtime:
     return analyse(
         want,
@@ -146,6 +152,7 @@ def run(
         listeners=listeners or {},
         missing=missing or {},
         work=set(containers) if work is None else work,
+        answers=answers,
     )
 
 
@@ -270,7 +277,15 @@ def test_containers_in_the_way_are_stopped_and_others_left_alone() -> None:
             Container("loopback", "running", ports=(Port("tcp", 443, "127.0.0.1"),)),
         )
     }
-    runtime = run(want, have, containers)
+    asked = run(want, have, containers)
+    assert asked.stops == () and len(asked.unresolved) == 3
+    assert [(c.key, c.choices) for c in asked.in_the_way] == [
+        ("cirdan/container/heimdall", (STOP,)),  # a name: in the way whether started or not
+        ("cirdan/container/loopback", (STOP, DEFER)),
+        ("cirdan/container/nginx", (STOP, DEFER)),
+    ]
+    runtime = run(want, have, containers, answers=Answers(stop_unmanaged=True))
+    assert runtime.unresolved == ()
     assert [(s.container.name, s.rename, s.why) for s in runtime.stops] == [
         ("heimdall", True, ("has the container name heimdall uses",)),
         ("loopback", False, ("holds 443/tcp, which proxy publishes",)),
@@ -304,13 +319,18 @@ def test_a_port_held_outside_docker_defers_the_service_and_its_dependents() -> N
             Listener(Port("tcp", 8080), "docker-proxy"),
         )
     }
-    runtime = run(want, have, containers, listeners)
+    asked = run(want, have, containers, listeners)
+    assert [(c.key, c.choices) for c in asked.in_the_way] == [("cirdan/service/heimdall", (DEFER,))]
+    assert (
+        asked.defers == () and run(want, have, containers, listeners, answers=STOP_ALL).defers == ()
+    )
+    runtime = run(want, have, containers, listeners, answers=Answers(defer_blocked=True))
     assert [(d.services, d.why) for d in runtime.defers] == [
         (("heimdall",), ("80/tcp is held by nginx outside Docker",))
     ]
     listeners["cirdan"] = (Listener(Port("tcp", 443, "10.0.0.5"), "haproxy"),)
     containers["cirdan"] = (ours("web"),)
-    deferred = run(want, have, containers, listeners).for_node("cirdan").defer
+    deferred = run(want, have, containers, listeners, answers=DEFER_ALL).for_node("cirdan").defer
     assert deferred == ("cron", "proxy", "worker")
     assert run(want, have, containers, {"cirdan": None}).no_port_check == ("cirdan",)
 
@@ -341,7 +361,7 @@ def test_a_project_from_elsewhere_with_a_stacks_name_is_taken_down() -> None:
         binds=(("/config", "/opt/media/sonarr"),),
     )
     other_name = Container("x", "running", project="unrelated", files=("/opt/u/compose.yml",))
-    runtime = run(want, have, {"cirdan": (elsewhere, other_name)})
+    runtime = run(want, have, {"cirdan": (elsewhere, other_name)}, answers=STOP_ALL)
     assert starts(runtime) == {"media": (True, "up")}  # the project of that name is up
     assert runtime.take_down == (
         TakeDown(
@@ -362,6 +382,24 @@ def test_a_project_from_elsewhere_with_a_stacks_name_is_taken_down() -> None:
     assert runtime.blocked == ()
     gone = run(want, have, {"cirdan": (elsewhere,)}, missing={"cirdan": frozenset(elsewhere.files)})
     assert "its files are gone" in gone.blocked[0]
+
+
+def test_each_conflict_is_answered_by_its_key_before_the_flags() -> None:
+    want, have = web_node()
+    nginx = Container("nginx", "running", ports=(Port("tcp", 80),))
+    holder = (Listener(Port("tcp", 443), "haproxy"),)
+    containers = {"cirdan": (ours("web"), nginx)}
+    keyed = Answers(defer=("cirdan/container/nginx",), stop_unmanaged=True, defer_blocked=True)
+    runtime = run(want, have, containers, {"cirdan": holder}, answers=keyed)
+    assert runtime.stops == () and runtime.unresolved == ()
+    assert runtime.answered == (
+        ("cirdan/container/nginx", DEFER),
+        ("cirdan/service/proxy", DEFER),
+    )
+    assert runtime.for_node("cirdan").defer == ("cron", "heimdall", "proxy", "worker")
+    # resolve answers again: the plan asked in a terminal, apply plans again with the answers.
+    again = resolve(run(want, have, containers), Answers(stop=("cirdan/container/nginx",)))
+    assert [s.container.name for s in again.stops] == ["nginx"]
 
 
 def test_conflicts_of_stacks_that_stay_down_are_only_noted() -> None:

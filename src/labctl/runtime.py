@@ -14,18 +14,22 @@ starts it; `no`, `unless-stopped` and `on-failure` leave it down, but `on-failur
 ran out of retries (a non-zero exit after N restarts).
 
 Containers labctl does not manage: everything not run from a stack file in DEPLOY_DIR. They are
-listed and left alone (other tools may manage them; the same image is fine), unless they clash with
-what apply starts:
+listed and left alone (other tools may manage them; the same image is fine), unless they are in
+the way of what apply starts. Each of those is a conflict, and each needs an answer:
 
-- a container named like a service's container_name, or holding a host port a service publishes:
-  stopped, its restart policy set to "no" (and renamed, for a name), never removed;
-- a compose project elsewhere with the name of one of the node's stacks: taken down, its files
-  bring it back on undo. Usually the same stack moving into DEPLOY_DIR; rarely an unrelated one;
-- a port held outside Docker (a host service, or a container on the host network): the services
-  publishing it are created but not started, so a replacement can be phased in.
+- a container holding a host port a service publishes: stop it (its restart policy set to "no";
+  never removed, and undo starts it again), or don't start the services publishing the port
+  (created, not started: `labctl node up` starts them once the port is free);
+- a container named like a service's container_name: stop it (and rename it);
+- a compose project elsewhere with the name of one of the node's stacks: take it down (its files
+  bring it back on undo). Usually the same stack moving into DEPLOY_DIR; rarely an unrelated one;
+- a port held outside Docker (a host service, or a container on the host network): don't start
+  the services publishing it, so a replacement can be phased in.
 
-Each needs an answer in a terminal: apply resolves all of them, or none (no terminal: it stops).
-One it cannot resolve: a network whose definition changes (compose removes and recreates it) with
+Leaving a conflict as it is is no answer: `up` would fail on it. A terminal is asked about each
+(cancel stops the apply); flags answer them all (Answers); with neither, apply stops.
+Two it cannot resolve: a project from elsewhere whose files are gone (nothing could bring it back
+on undo), and a network whose definition changes (compose removes and recreates it) with
 containers of other stacks attached. Docker refuses to remove it, and `up` would fail with the
 stack already stopped; the plan stops and says how to free it.
 Pure functions only; collect.py runs the commands.
@@ -36,13 +40,14 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Collection, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any
 
 from labctl.bundle import Desired
 from labctl.changes import network_changes
 from labctl.planner import Migrate, Plan
+from labctl.remote import MARK
 from labctl.state import NodeState
 
 # `docker inspect --format`: one JSON object per container, only what labctl uses (no env: it can
@@ -59,11 +64,27 @@ CONTAINER_FORMAT = (
 )
 # The listener section when the node has no `ss`.
 UNAVAILABLE = "-unavailable"
+# Shell lines printing the node's containers and the ports held on its host, as the sections
+# "containers" (CONTAINER_FORMAT lines) and "listeners" (`ss` lines, or UNAVAILABLE). ss names
+# another user's process only as root: sudo when it needs no password, else as the ssh user.
+READ_RUNTIME = f"""\
+echo "{MARK} containers"
+docker ps -aq </dev/null 2>/dev/null |
+  xargs -r docker inspect --format '{CONTAINER_FORMAT}' 2>/dev/null
+echo "{MARK} listeners"
+if command -v ss >/dev/null 2>&1; then
+  sudo -n ss -Htulnp </dev/null 2>/dev/null || ss -Htulnp </dev/null 2>/dev/null
+else echo "{UNAVAILABLE}"; fi"""
 
 _UP = frozenset({"running", "restarting", "paused"})
 _ANY_ADDRESS = frozenset({"", "0.0.0.0", "::", "*"})
 # What holds a published port for Docker itself.
-_DOCKER_PROCESSES = frozenset({"docker-proxy", "rootlesskit", "rootlessport"})
+DOCKER_PROCESSES = frozenset({"docker-proxy", "rootlesskit", "rootlessport"})
+
+
+def is_any_address(host_ip: str) -> bool:
+    """Whether a bound address means every address ("", 0.0.0.0, ::, *)."""
+    return host_ip in _ANY_ADDRESS
 
 
 @dataclass(frozen=True, order=True)
@@ -300,6 +321,55 @@ class NetworkInUse:
         )
 
 
+# A conflict's answers (cancelling is not one: it stops the apply).
+STOP = "stop"  # stop the container, or take the project down
+DEFER = "defer"  # don't start the services that need the port
+
+
+@dataclass(frozen=True)
+class Conflict:
+    """Something labctl does not manage in the way of what apply starts, and what it can do."""
+
+    key: str  # stable from plan to plan: how an answer names it
+    node: str
+    stop: Stop | None = None  # a container in the way
+    take_down: TakeDown | None = None  # a project from elsewhere
+    defer: tuple[Defer, ...] = ()  # what not starting the services means (none: not an answer)
+
+    @property
+    def choices(self) -> tuple[str, ...]:
+        return (
+            *((STOP,) if self.stop or self.take_down else ()),
+            *((DEFER,) if self.defer else ()),
+        )
+
+
+@dataclass(frozen=True)
+class Answers:
+    """How apply resolves the conflicts: each by its key (asked in a terminal), else by the flags.
+
+    ``stop_unmanaged`` answers STOP wherever it can; ``defer_blocked`` answers DEFER to the rest.
+    """
+
+    stop: tuple[str, ...] = ()  # keys answered STOP
+    defer: tuple[str, ...] = ()  # keys answered DEFER
+    stop_unmanaged: bool = False
+    defer_blocked: bool = False
+
+    def choice(self, conflict: Conflict) -> str:
+        """The conflict's answer; "" when it has none yet."""
+        offered = conflict.choices
+        if conflict.key in self.stop and STOP in offered:
+            return STOP
+        if conflict.key in self.defer and DEFER in offered:
+            return DEFER
+        if self.stop_unmanaged and STOP in offered:
+            return STOP
+        if self.defer_blocked and DEFER in offered:
+            return DEFER
+        return ""
+
+
 @dataclass(frozen=True)
 class NodeRuntime:
     """One node's part, for apply."""
@@ -317,9 +387,14 @@ class NodeRuntime:
 @dataclass(frozen=True)
 class Runtime:
     stacks: tuple[StackRun, ...] = ()
+    # What apply does about the conflicts answered.
     stops: tuple[Stop, ...] = ()
     take_down: tuple[TakeDown, ...] = ()
     defers: tuple[Defer, ...] = ()
+    # Every conflict, and the answers: (key, STOP or DEFER).
+    in_the_way: tuple[Conflict, ...] = ()
+    answered: tuple[tuple[str, str], ...] = ()
+    stuck: tuple[TakeDown, ...] = ()  # projects from elsewhere whose files are gone
     networks: tuple[NetworkInUse, ...] = ()
     # Conflicts of stacks that stay down (or nodes apply does not change): shown, nothing done.
     later: tuple[str, ...] = field(default=(), compare=False)
@@ -332,7 +407,16 @@ class Runtime:
 
     @property
     def conflicts(self) -> int:
-        return len(self.stops) + len(self.take_down) + len(self.defers)
+        return len(self.in_the_way)
+
+    @property
+    def unresolved(self) -> tuple[Conflict, ...]:
+        """The conflicts without an answer."""
+        answered = dict(self.answered)
+        return tuple(c for c in self.in_the_way if c.key not in answered)
+
+    def answer(self, conflict: Conflict) -> str:
+        return dict(self.answered).get(conflict.key, "")
 
     @property
     def blocked(self) -> tuple[str, ...]:
@@ -342,8 +426,7 @@ class Runtime:
                 f"{down.node}: project {down.project} runs from {down.working_dir}, but its files "
                 f"are gone ({', '.join(down.missing)}): nothing could bring it back on undo; take "
                 "it down by hand"
-                for down in self.take_down
-                if down.missing
+                for down in self.stuck
             ),
             *(str(network) for network in self.networks),
         )
@@ -387,6 +470,7 @@ def analyse(
     listeners: Mapping[str, tuple[Listener, ...] | None],
     missing: Mapping[str, Collection[str]],
     work: Collection[str],
+    answers: Answers | None = None,
 ) -> Runtime:
     """
     What runs after apply on each node read, and what is in the way.
@@ -406,12 +490,14 @@ def analyse(
             The compose files containers name that are gone, per node.
         work (Collection[str]):
             The nodes apply changes; only their stacks are started.
+        answers (Answers | None):
+            How the conflicts are resolved (default: none answered).
 
     Returns:
         Runtime:
-            Whether each stack runs and which of its services stay down, the conflicts apply
-            resolves (stops, projects taken down, deferred services), those it cannot
-            (``blocked``), and what is only noted.
+            Whether each stack runs and which of its services stay down, the conflicts and what
+            apply does about those answered (stops, projects taken down, deferred services), those
+            it cannot resolve (``blocked``), and what is only noted.
     """
     running = {
         node: frozenset(
@@ -431,7 +517,10 @@ def analyse(
     stacks: list[StackRun] = []
     stops: dict[tuple[str, str], Stop] = {}
     take_down: list[TakeDown] = []
+    stuck: list[TakeDown] = []
     defers: list[Defer] = []
+    # The services a container in the way holds a port of: what not starting them means.
+    held_by: dict[tuple[str, str], list[Defer]] = {}
     networks: list[NetworkInUse] = []
     later: list[str] = []
     unmanaged: dict[str, tuple[Container, ...]] = {}
@@ -526,7 +615,7 @@ def analyse(
                 _data_moved(want, found, in_repo),
             )
             if route(project, f"compose project {project} also runs from {down.working_dir}"):
-                take_down.append(down)
+                (stuck if down.missing else take_down).append(down)
 
         # Containers in the way of a service, and ports held outside Docker.
         loose = [other for other in others if other.project not in foreign]
@@ -542,7 +631,7 @@ def analyse(
         held = [
             listener
             for listener in found_listeners or ()
-            if listener.process not in _DOCKER_PROCESSES
+            if listener.process not in DOCKER_PROCESSES
             and (listener.port.protocol, listener.port.port) not in docker_ports
         ]
         for name, service in sorted(want.state.services.items()):
@@ -555,12 +644,12 @@ def analyse(
                 )
                 if rename:
                     clashes.append(f"has the container name {name} uses")
-                if squatter.up:
-                    clashes += [
-                        f"holds {port}, which {name} publishes"
-                        for port in ports
-                        if any(port.clashes(other) for other in squatter.ports)
-                    ]
+                held_ports = [
+                    port
+                    for port in ports
+                    if squatter.up and any(port.clashes(other) for other in squatter.ports)
+                ]
+                clashes += [f"holds {port}, which {name} publishes" for port in held_ports]
                 if clashes and route(
                     service.stack, f"container {squatter.name} {'; '.join(clashes)}"
                 ):
@@ -571,6 +660,15 @@ def analyse(
                         rename or bool(before and before.rename),
                         (*(before.why if before else ()), *clashes),
                     )
+                    if held_ports:
+                        held_by.setdefault((node, squatter.name), []).append(
+                            Defer(
+                                node,
+                                service.stack,
+                                (name, *_dependents(want, name)),
+                                tuple(f"container {squatter.name} holds {p}" for p in held_ports),
+                            )
+                        )
             holders = [
                 f"{port} is held by {listener.process or 'a process'} outside Docker"
                 for port in ports
@@ -596,17 +694,58 @@ def analyse(
             if attached and route(change.stack, message):
                 networks.append(NetworkInUse(node, change.name, change.stack, attached))
 
-    return Runtime(
+    in_the_way = (
+        *(Conflict(f"{d.node}/project/{d.project}", d.node, take_down=d) for d in take_down),
+        *(
+            Conflict(
+                f"{node}/container/{name}",
+                node,
+                stop=stop,
+                # A name in the way is in the way whether the service starts or not.
+                defer=() if stop.rename else tuple(held_by.get((node, name), ())),
+            )
+            for (node, name), stop in sorted(stops.items())
+        ),
+        *(Conflict(f"{d.node}/service/{d.services[0]}", d.node, defer=(d,)) for d in defers),
+    )
+    runtime = Runtime(
         stacks=tuple(stacks),
-        stops=tuple(stops[key] for key in sorted(stops)),
-        take_down=tuple(take_down),
-        defers=tuple(defers),
+        in_the_way=in_the_way,
+        stuck=tuple(stuck),
         networks=tuple(networks),
         later=tuple(later),
         unmanaged=unmanaged,
         running=running,
         no_port_check=tuple(no_port_check),
         partly_up=partly_up,
+    )
+    return resolve(runtime, answers or Answers())
+
+
+def resolve(runtime: Runtime, answers: Answers) -> Runtime:
+    """The runtime with the conflicts ``answers`` resolves resolved (any answered before are
+    answered again)."""
+    stops: list[Stop] = []
+    take_down: list[TakeDown] = []
+    defers: list[Defer] = []
+    answered: list[tuple[str, str]] = []
+    for conflict in runtime.in_the_way:
+        choice = answers.choice(conflict)
+        if not choice:
+            continue
+        answered.append((conflict.key, choice))
+        if choice == DEFER:
+            defers += conflict.defer
+        elif conflict.stop:
+            stops.append(conflict.stop)
+        elif conflict.take_down:
+            take_down.append(conflict.take_down)
+    return replace(
+        runtime,
+        stops=tuple(stops),
+        take_down=tuple(take_down),
+        defers=tuple(defers),
+        answered=tuple(answered),
     )
 
 

@@ -9,9 +9,11 @@ from .commands import (
     apply_cmd,
     archive_cmd,
     discard_cmd,
+    history_cmd,
     init_cmd,
     node_cmd,
     plan_cmd,
+    ports_cmd,
     remove_cmd,
     secrets_cmd,
     settings_cmd,
@@ -45,6 +47,8 @@ main.add_command(add_cmd)
 main.add_command(remove_cmd)
 main.add_command(node_cmd)
 main.add_command(archive_cmd)
+main.add_command(ports_cmd)
+main.add_command(history_cmd)
 main.add_command(unlock_cmd)
 
 
