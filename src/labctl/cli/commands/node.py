@@ -8,9 +8,7 @@ have it.
 from __future__ import annotations
 
 import sys
-import threading
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from typing import Any
 
 import click
@@ -19,39 +17,28 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-from labctl import docker
 from labctl.cli.common import is_terminal, load_settings, services_option, target_nodes
 from labctl.click import AliasedGroup, DebugOptions
 from labctl.compose import ComposeError
 from labctl.console import console
-from labctl.remote import Remote, RemoteError, node_remote
+from labctl.remote import Remote, RemoteError
 from labctl.settings import SettingsError
 from labctl.stack import (
-    Deployed,
+    PULL,
+    UP,
+    Runs,
     ServiceStatus,
-    container_changes,
-    deployed,
-    read_services,
-    read_snapshot,
-    stack_services,
-    unbacked_projects,
+    Target,
+    follow_logs,
+    log_streams,
+    prune_images,
+    run_compose,
+    select_target,
+    show_logs,
+    target_services,
 )
-from labctl.state import Stack
 
 targets_argument = click.argument("targets", nargs=-1, required=True, metavar="NODE[/STACK]...|all")
-
-# The stacks a command runs on, each with the services named in it (none named: all of them).
-Runs = list[tuple[Stack, tuple[str, ...]]]
-
-
-@dataclass(frozen=True)
-class Target:
-    """One node's part of a command: where its stacks are, and the ones selected."""
-
-    deployed: Deployed
-    stacks: tuple[Stack, ...]
-    remote: Remote
-    whole: bool  # the node was named without a stack
 
 
 @click.group(name="node", cls=AliasedGroup)
@@ -69,7 +56,7 @@ def node_cmd() -> None:
 @DebugOptions().options
 def up_cmd(targets: tuple[str, ...], services: tuple[str, ...], **kwargs: Any) -> None:
     """Start the stacks (or some services), removing containers no longer in them."""
-    _compose(targets, services, "up", "-d", "--remove-orphans", report=True)
+    _compose(targets, services, *UP, report=True)
 
 
 @node_cmd.command(name="down")
@@ -96,7 +83,7 @@ def restart_cmd(targets: tuple[str, ...], services: tuple[str, ...], **kwargs: A
 @DebugOptions().options
 def pull_cmd(targets: tuple[str, ...], services: tuple[str, ...], **kwargs: Any) -> None:
     """Pull the stacks' images (or some services'). Run 'up' afterwards to use them."""
-    _compose(targets, services, "pull", "--ignore-pull-failures")
+    _compose(targets, services, *PULL)
 
 
 @node_cmd.command(name="prune")
@@ -108,7 +95,7 @@ def prune_cmd(targets: tuple[str, ...], **kwargs: Any) -> None:
     def prune(t: Target, runs: Runs) -> int:
         if not t.whole:
             raise SettingsError("prune is node-wide; give the node without a stack")
-        return t.remote.run(docker.PRUNE_IMAGES)
+        return prune_images(t)
 
     _each_node(targets, prune)
 
@@ -122,11 +109,11 @@ def update_cmd(targets: tuple[str, ...], services: tuple[str, ...], **kwargs: An
     node-wide, also for NODE/STACK or -s."""
 
     def update(t: Target, runs: Runs) -> int:
-        failed = _run_stacks(t, runs, "pull", "--ignore-pull-failures")
-        failed = failed or _run_stacks(t, runs, "up", "-d", "--remove-orphans", report=True)
+        failed = _run_stacks(t, runs, *PULL)
+        failed = failed or _run_stacks(t, runs, *UP, report=True)
         if failed:
             return failed
-        return t.remote.run(docker.PRUNE_IMAGES)
+        return prune_images(t)
 
     _each_node(targets, update, services=services)
 
@@ -142,28 +129,28 @@ def logs_cmd(
 ) -> None:
     """Show the stacks' logs (or some services'). Following several stacks, each line starts
     with the stack it comes from."""
-    args = ["logs", "--tail", tail, *(["--follow"] if follow else [])]
     resolved, failed = _resolve(targets, services)
-    streams = [
-        (
-            t.deployed.label(stack),
-            t.remote,
-            docker.compose_command(t.deployed.deploy_dir, stack, *args, *names),
-        )
-        for t, runs in resolved
-        for stack, names in runs
-    ]
+    streams = [stream for t, runs in resolved for stream in log_streams(t, runs, tail, follow)]
     try:
         if follow and len(streams) > 1:
-            failed += [label for label, code in _follow(streams) if code]
+            width = max(len(stream.label) for stream in streams)
+
+            def emit(label: str, line: str) -> None:
+                # The line's own colors kept, as the node's terminal would show them.
+                prefix = Text(label.ljust(width), style="cyan") + " | "
+                console.print(
+                    prefix + Text.from_ansi(line.rstrip()), soft_wrap=True, highlight=False
+                )
+
+            failed += [label for label, code in follow_logs(streams, emit) if code]
         else:
-            for label, remote, command in streams:
+            for stream in streams:
                 if len(streams) > 1:
-                    console.rule(f"[bold]{escape(label)}[/]")
-                if remote.run(command, is_terminal()):
-                    failed.append(label)
+                    console.rule(f"[bold]{escape(stream.label)}[/]")
+                if show_logs(stream, is_terminal()):
+                    failed.append(stream.label)
     finally:
-        Remote.close_all([*(t.deployed.node for t, _ in resolved), *failed])
+        Remote.close_all([*(t.node for t, _ in resolved), *failed])
     _finish(failed, len(streams) > 1)
 
 
@@ -174,15 +161,9 @@ def status_cmd(targets: tuple[str, ...], **kwargs: Any) -> None:
     """Show each service's container state."""
 
     def show(t: Target, runs: Runs) -> int:
-        found = [
-            status for stack in t.stacks for status in read_services(t.deployed.location, stack)
-        ]
+        found, unbacked = target_services(t)
         rows = [[status.stack, *_status_row(status)] for status in found]
-        if t.whole:
-            rows += [
-                [name, _NO_FILE, "", status, ""]
-                for name, status in unbacked_projects(t.deployed).items()
-            ]
+        rows += [[name, _NO_FILE, "", status, ""] for name, status in unbacked.items()]
         header = ["Stack", "Service", "State", "Status", "Image"]
         colors = [_colored(_flagged), _colored(_flagged), _colored(_state_color), _plain, _plain]
         if len({row[0] for row in rows}) <= 1:  # one stack: its name is in the title
@@ -273,28 +254,12 @@ def _run_stacks(
         label = t.deployed.label(stack)
         if len(runs) > 1:
             console.rule(f"[bold]{escape(label)}[/]")
-        before = read_snapshot(t.remote, stack.name) if report else {}
-        command = docker.compose_command(t.deployed.deploy_dir, stack, *args, *names)
-        code = t.remote.run(command, is_terminal())
+        code, changes = run_compose(t, stack, names, *args, terminal=is_terminal(), report=report)
         failed |= code
         if report and not code:
-            changes = container_changes(before, read_snapshot(t.remote, stack.name), stack.name)
             said = str(changes) if changes else "no containers changed"
             console.print(f"[green]✓[/] {escape(label)}: {escape(said)}")
     return failed
-
-
-def _with_services(t: Target, services: tuple[str, ...]) -> Runs:
-    """(stack, the named services in it) for each of the target's stacks that has any."""
-    if not services:
-        return [(stack, ()) for stack in t.stacks]
-    by_stack = {
-        stack: tuple(
-            service for service in stack_services(t.deployed.location, stack) if service in services
-        )
-        for stack in t.stacks
-    }
-    return [(stack, names) for stack, names in by_stack.items() if names]
 
 
 def _resolve(
@@ -313,15 +278,7 @@ def _resolve(
     try:
         for name, selectors in chosen.items():
             try:
-                remote = node_remote(name)
-                where = deployed(settings, name, remote)
-                whole = "" in selectors
-                picked = {
-                    stack for selector in selectors if selector for stack in where.select(selector)
-                }
-                stacks = tuple(stack for stack in where.stacks if whole or stack in picked)
-                target = Target(where, stacks, remote, whole)
-                resolved.append((target, _with_services(target, services)))
+                resolved.append(select_target(settings, name, selectors, services))
             except (RemoteError, SettingsError, ComposeError) as exc:
                 console.print(f"[red]{escape(str(exc))}[/]")
                 failed.append(name)
@@ -357,7 +314,7 @@ def _each_node(
             if status:
                 failed.append(name)
     finally:
-        Remote.close_all([*(t.deployed.node for t, _ in resolved), *failed])
+        Remote.close_all([*(t.node for t, _ in resolved), *failed])
     _finish(failed, len(resolved) + len(failed) > 1)
 
 
@@ -366,36 +323,3 @@ def _finish(failed: list[str], several: bool) -> None:
         if several:
             console.print(f"[red]Failed on: {', '.join(failed)}[/]")
         sys.exit(1)
-
-
-def _follow(streams: Sequence[tuple[str, Remote, str]]) -> list[tuple[str, int]]:
-    """Run the commands at once, each output line printed after its label, until all end (or
-    Ctrl-C). Returns each label's exit status."""
-    width = max(len(label) for label, _, _ in streams)
-    lock = threading.Lock()
-    procs = [(label, remote.stream(command)) for label, remote, command in streams]
-
-    def pump(label: str, out: Any) -> None:
-        prefix = Text(label.ljust(width), style="cyan") + " | "
-        for line in out:
-            with lock:  # the line's own colors kept, as the node's terminal would show them
-                console.print(
-                    prefix + Text.from_ansi(line.rstrip()), soft_wrap=True, highlight=False
-                )
-
-    threads = [
-        threading.Thread(target=pump, args=(label, proc.stdout), daemon=True)
-        for label, proc in procs
-    ]
-    for thread in threads:
-        thread.start()
-    try:
-        for thread in threads:
-            thread.join()
-    except KeyboardInterrupt:  # stopping them is not a failure
-        for _, proc in procs:
-            proc.terminate()
-        for _, proc in procs:
-            proc.wait()
-        raise
-    return [(label, proc.wait()) for label, proc in procs]

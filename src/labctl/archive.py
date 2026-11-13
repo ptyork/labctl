@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from labctl.envfile import preview_env
 from labctl.layout import ARCHIVE_DIR, FILES_ARCHIVE, RECORD, SIDECAR
 from labctl.node import Node, lock, unlock
-from labctl.remote import Remote, execute
+from labctl.remote import Remote, execute, node_remote
 from labctl.settings import Settings, SettingsError
 from labctl.stack import deploy_dir_on
 
@@ -293,6 +293,21 @@ def archive_dirs(settings: Settings, node: str, remote: Remote) -> tuple[str, st
     return f"{appdata}/{ARCHIVE_DIR}", f"{deploy}/{FILES_ARCHIVE}"
 
 
+def read_node_archive(settings: Settings, name: str) -> NodeArchive:
+    """
+    Read what the archives of the node named hold (read-only).
+
+    Raises:
+        SettingsError:
+            Neither the node nor the lab config says where its archives are.
+        RemoteError:
+            The node could not be reached.
+    """
+    remote = node_remote(name)
+    data_dir, files_dir = archive_dirs(settings, name, remote)
+    return read_archive(name, Node(remote), data_dir, files_dir)
+
+
 def read_archive(name: str, node: Node, data_dir: str, files_dir: str) -> NodeArchive:
     """
     Read what a node's archives hold (read-only).
@@ -346,6 +361,18 @@ def _sidecar(text: str) -> Mapping[str, object]:
     except ValueError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def prune_archive(archive: NodeArchive, doomed: Iterable[Entry]) -> None:
+    """
+    Delete entries, and the orphaned sidecars, on the node the archive was read from.
+
+    Raises:
+        NodeError:
+            The node's apply lock is held, or a deletion failed.
+    """
+    owner = f"labctl archive prune {datetime.now().isoformat(timespec='seconds')}"
+    delete_entries(Node(node_remote(archive.node)), archive, doomed, owner)
 
 
 def delete_entries(node: Node, archive: NodeArchive, doomed: Iterable[Entry], owner: str) -> None:

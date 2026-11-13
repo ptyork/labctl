@@ -9,7 +9,8 @@ and after edits made on the node.
 from __future__ import annotations
 
 import json
-from collections.abc import Collection, Mapping
+import threading
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -20,7 +21,7 @@ from labctl.collect import projects_in
 from labctl.compose import ComposeError
 from labctl.envfile import preview_env
 from labctl.layout import HOME_POINTER
-from labctl.remote import Remote, execute
+from labctl.remote import Remote, execute, node_remote
 from labctl.settings import Settings, SettingsError
 from labctl.state import Stack
 
@@ -313,3 +314,202 @@ def not_up_again(before: Snapshot, after: Snapshot) -> list[str]:
     """Services up in ``before`` that are not up in ``after`` (in any project)."""
     up_now = {service for (_, service), seen in after.items() if seen.up}
     return sorted({service for (_, service), seen in before.items() if seen.up} - up_now)
+
+
+#############################################################################
+
+
+# The day-to-day commands (labctl node)
+
+
+#############################################################################
+
+UP = ("up", "-d", "--remove-orphans")
+PULL = ("pull", "--ignore-pull-failures")
+
+# The stacks a command runs on, each with the services named in it (none named: all of them).
+Runs = list[tuple[Stack, tuple[str, ...]]]
+
+
+@dataclass(frozen=True)
+class Target:
+    """One node's part of a command: where its stacks are, and the ones selected."""
+
+    deployed: Deployed
+    stacks: tuple[Stack, ...]
+    remote: Remote
+    whole: bool  # the node was named without a stack
+
+    @property
+    def node(self) -> str:
+        return self.deployed.node
+
+
+@dataclass(frozen=True)
+class LogStream:
+    """One stack's logs: the label its lines go under, and the command that shows them."""
+
+    label: str
+    remote: Remote
+    command: str
+
+
+def select_target(
+    settings: Settings, node: str, selectors: Collection[str], services: Collection[str] = ()
+) -> tuple[Target, Runs]:
+    """
+    Read a node's deployed stacks and pick those a command runs on.
+
+    Args:
+        settings (Settings):
+            labctl's settings.
+        node (str):
+            The node.
+        selectors (Collection[str]):
+            The stacks named ("" is all of them).
+        services (Collection[str]):
+            The services named (default: every service).
+
+    Returns:
+        tuple[Target, Runs]:
+            The node's part of the command, and each selected stack with the named services in it
+            (stacks that have none are left out).
+
+    Raises:
+        SettingsError:
+            The node has no stacks, or a selector does not name one.
+        RemoteError:
+            The node could not be reached.
+        ComposeError:
+            A stack's services could not be read.
+    """
+    remote = node_remote(node)
+    where = deployed(settings, node, remote)
+    whole = "" in selectors
+    picked = {stack for selector in selectors if selector for stack in where.select(selector)}
+    stacks = tuple(stack for stack in where.stacks if whole or stack in picked)
+    target = Target(where, stacks, remote, whole)
+    if not services:
+        return target, [(stack, ()) for stack in stacks]
+    runs: Runs = []
+    for stack in stacks:
+        names = tuple(name for name in stack_services(where.location, stack) if name in services)
+        if names:
+            runs.append((stack, names))
+    return target, runs
+
+
+def run_compose(
+    target: Target,
+    stack: Stack,
+    names: tuple[str, ...],
+    *args: str,
+    terminal: bool = False,
+    report: bool = False,
+) -> tuple[int, ContainerChanges | None]:
+    """
+    Run one compose command on one of a target's stacks, its output going straight to the terminal.
+
+    Args:
+        target (Target):
+            The node's part of the command.
+        stack (Stack):
+            The stack.
+        names (tuple[str, ...]):
+            The services it is for (none: the whole stack).
+        *args (str):
+            The compose command and its options.
+        terminal (bool):
+            Whether the node's side gets a terminal (progress output, Ctrl-C).
+        report (bool):
+            Whether to work out which containers the command changed.
+
+    Returns:
+        tuple[int, ContainerChanges | None]:
+            The command's exit status, and with ``report``, when it succeeded, what it recreated,
+            created or removed.
+    """
+    before = read_snapshot(target.remote, stack.name) if report else {}
+    command = docker.compose_command(target.deployed.deploy_dir, stack, *args, *names)
+    code = target.remote.run(command, terminal)
+    if not report or code:
+        return code, None
+    after = read_snapshot(target.remote, stack.name)
+    return code, container_changes(before, after, stack.name)
+
+
+def prune_images(target: Target) -> int:
+    """Remove the node's dangling images (all of docker, not just the stacks); returns the exit
+    status."""
+    return target.remote.run(docker.PRUNE_IMAGES)
+
+
+def target_services(target: Target) -> tuple[list[ServiceStatus], dict[str, str]]:
+    """Each service of the target's stacks with its container state, and, for a whole node, the
+    compose projects running there with no stack file (name -> status)."""
+    found = [
+        status
+        for stack in target.stacks
+        for status in read_services(target.deployed.location, stack)
+    ]
+    return found, unbacked_projects(target.deployed) if target.whole else {}
+
+
+def log_streams(target: Target, runs: Runs, tail: str, follow: bool) -> list[LogStream]:
+    """The logs of each stack a command runs on."""
+    args = ["logs", "--tail", tail, *(["--follow"] if follow else [])]
+    return [
+        LogStream(
+            target.deployed.label(stack),
+            target.remote,
+            docker.compose_command(target.deployed.deploy_dir, stack, *args, *names),
+        )
+        for stack, names in runs
+    ]
+
+
+def show_logs(stream: LogStream, terminal: bool = False) -> int:
+    """Show one stack's logs, straight to the terminal; returns the exit status."""
+    return stream.remote.run(stream.command, terminal)
+
+
+def follow_logs(
+    streams: Sequence[LogStream], emit: Callable[[str, str], None]
+) -> list[tuple[str, int]]:
+    """
+    Follow several stacks' logs at once, until all end (or Ctrl-C).
+
+    Args:
+        streams (Sequence[LogStream]):
+            The logs to follow.
+        emit (Callable[[str, str], None]):
+            Called with a stream's label and each line of it, one call at a time.
+
+    Returns:
+        list[tuple[str, int]]:
+            Each label's exit status.
+    """
+    one_at_a_time = threading.Lock()
+    procs = [(stream.label, stream.remote.stream(stream.command)) for stream in streams]
+
+    def pump(label: str, out: Any) -> None:
+        for line in out:
+            with one_at_a_time:
+                emit(label, line)
+
+    threads = [
+        threading.Thread(target=pump, args=(label, proc.stdout), daemon=True)
+        for label, proc in procs
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        for thread in threads:
+            thread.join()
+    except KeyboardInterrupt:  # stopping them is not a failure
+        for _, proc in procs:
+            proc.terminate()
+        for _, proc in procs:
+            proc.wait()
+        raise
+    return [(label, proc.wait()) for label, proc in procs]

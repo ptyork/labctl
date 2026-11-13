@@ -222,12 +222,12 @@ def run_cli(monkeypatch: pytest.MonkeyPatch) -> Any:
     """labctl archive against one node holding OLD and NEW; deletions are recorded, not made."""
     archive = NodeArchive("cirdan", (OLD, NEW))
     removed: list[tuple[str, frozenset[Entry]]] = []
-    monkeypatch.setattr(commands, "_read", lambda targets: ({"cirdan": "node"}, [archive], []))
+    monkeypatch.setattr(commands, "_read", lambda targets: ([archive], []))
     monkeypatch.setattr(commands.Remote, "close_all", lambda names: None)
     monkeypatch.setattr(
         commands,
-        "delete_entries",
-        lambda node, found, doomed, owner: removed.append((found.node, frozenset(doomed))),
+        "prune_archive",
+        lambda found, doomed: removed.append((found.node, frozenset(doomed))),
     )
 
     def run(*args: str, **options: Any) -> Any:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Collection, Iterable, Sequence
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 import click
@@ -16,19 +16,18 @@ from labctl.archive import (
     Entry,
     Group,
     NodeArchive,
-    archive_dirs,
-    delete_entries,
     group_entries,
     parse_age,
-    read_archive,
+    prune_archive,
+    read_node_archive,
     select,
 )
 from labctl.cli.common import confirm_or_yes, load_settings, services_option, target_nodes
 from labctl.click import AliasedGroup, DebugOptions
 from labctl.compose import ComposeError
 from labctl.console import console
-from labctl.node import Node, NodeError
-from labctl.remote import Remote, RemoteError, node_remote
+from labctl.node import NodeError
+from labctl.remote import Remote, RemoteError
 from labctl.settings import SettingsError
 from labctl.text import human_size
 
@@ -51,7 +50,7 @@ def archive_cmd() -> None:
 @DebugOptions().options
 def list_cmd(targets: tuple[str, ...], services: tuple[str, ...], **kwargs: Any) -> None:
     """Show what the nodes' archives hold (-s: only these services' data)."""
-    nodes, archives, failed = _read(targets)
+    archives, failed = _read(targets)
     try:
         shown = {archive.node: _shown(archive, services) for archive in archives}
         _check_services(services, shown)
@@ -62,7 +61,7 @@ def list_cmd(targets: tuple[str, ...], services: tuple[str, ...], **kwargs: Any)
         holding = sum(1 for groups in shown.values() if groups)
         console.print(f"[bold]{_count(entries)}, {_size(entries)} on {_nodes(holding)}[/]")
     finally:
-        Remote.close_all([*nodes, *failed])
+        Remote.close_all([*(archive.node for archive in archives), *failed])
     _finish(failed)
 
 
@@ -98,7 +97,7 @@ def prune_cmd(
 
     This cannot be undone. It shows what it will delete and asks first.
     """
-    nodes, archives, failed = _read(targets)
+    archives, failed = _read(targets)
     try:
         shown = {archive.node: _shown(archive, services) for archive in archives}
         _check_services(services, shown)
@@ -123,9 +122,9 @@ def prune_cmd(
             )
             if not dry_run:
                 confirm_or_yes("Delete these entries?", yes, "Not deleted")
-                failed += _delete(nodes, archives, doomed)
+                failed += _delete(archives, doomed)
     finally:
-        Remote.close_all([*nodes, *failed])
+        Remote.close_all([*(archive.node for archive in archives), *failed])
     _finish(failed)
 
 
@@ -138,8 +137,8 @@ def _age(value: str | None) -> timedelta | None:
         raise click.BadParameter(str(exc)) from exc
 
 
-def _read(targets: Sequence[str]) -> tuple[dict[str, Node], list[NodeArchive], list[str]]:
-    """Each named node, what its archives hold, and the nodes that could not be read (reported)."""
+def _read(targets: Sequence[str]) -> tuple[list[NodeArchive], list[str]]:
+    """What each named node's archives hold, and the nodes that could not be read (reported)."""
     settings = load_settings()
     try:
         chosen = target_nodes(targets, settings.node_names())
@@ -147,17 +146,12 @@ def _read(targets: Sequence[str]) -> tuple[dict[str, Node], list[NodeArchive], l
         raise click.ClickException(str(exc)) from exc
     if any(selectors != ("",) for selectors in chosen.values()):
         raise click.ClickException("Archives belong to a node: give NODE, not NODE/STACK")
-    nodes: dict[str, Node] = {}
     archives: list[NodeArchive] = []
     failed: list[str] = []
     try:
         for name in chosen:
             try:
-                remote = node_remote(name)
-                node = Node(remote)
-                data_dir, files_dir = archive_dirs(settings, name, remote)
-                archives.append(read_archive(name, node, data_dir, files_dir))
-                nodes[name] = node
+                archives.append(read_node_archive(settings, name))
             except _FAILURES as exc:
                 console.print(f"[red]{escape(str(exc))}[/]")
                 failed.append(name)
@@ -167,7 +161,7 @@ def _read(targets: Sequence[str]) -> tuple[dict[str, Node], list[NodeArchive], l
     if not archives:  # every node failed, and each has said why
         Remote.close_all(chosen)
         _finish(failed)
-    return nodes, archives, failed
+    return archives, failed
 
 
 def _shown(archive: NodeArchive, services: Collection[str]) -> list[Group]:
@@ -219,18 +213,15 @@ def _row(group: Group, entry: Entry) -> list[str]:
     return [entry.stamp, entry.reason, size]
 
 
-def _delete(
-    nodes: dict[str, Node], archives: Sequence[NodeArchive], doomed: dict[str, frozenset[Entry]]
-) -> list[str]:
+def _delete(archives: Sequence[NodeArchive], doomed: dict[str, frozenset[Entry]]) -> list[str]:
     """Delete on each node that has something to delete; returns the nodes that failed."""
     failed: list[str] = []
-    owner = f"labctl archive prune {datetime.now().isoformat(timespec='seconds')}"
     for archive in archives:
         going = doomed[archive.node]
         if not going and not archive.orphans:
             continue
         try:
-            delete_entries(nodes[archive.node], archive, going, owner)
+            prune_archive(archive, going)
         except _FAILURES as exc:
             console.print(f"[red]{escape(str(exc))}[/]")
             failed.append(archive.node)

@@ -13,7 +13,6 @@ from labctl import remote as remote_module
 from labctl import stack as stack_module
 from labctl.bundle import Location
 from labctl.cli import cli
-from labctl.cli.commands import node as node_module
 from labctl.remote import Remote
 from labctl.settings import write_config
 from labctl.stack import Seen, ServiceStatus, parse_restarts, ps_rows, statuses
@@ -74,7 +73,7 @@ def ran(
     monkeypatch.setattr(Remote, "execute", execute)
     monkeypatch.setattr(Remote, "run", run)
     monkeypatch.setattr(Remote, "close_all", staticmethod(lambda hosts: None))
-    monkeypatch.setattr(node_module, "stack_services", lambda loc, stack: SERVICES[stack.name])
+    monkeypatch.setattr(stack_module, "stack_services", lambda loc, stack: SERVICES[stack.name])
     return calls
 
 
@@ -373,7 +372,7 @@ def test_up_says_which_containers_changed(
         {("homelab-cirdan", "heimdall"): Seen(frozenset({"1"}), True)},
         {("homelab-cirdan", "heimdall"): Seen(frozenset({"2"}), True)},
     ]
-    monkeypatch.setattr(node_module, "read_snapshot", lambda remote, project: seen.pop(0))
+    monkeypatch.setattr(stack_module, "read_snapshot", lambda remote, project: seen.pop(0))
     result = invoke("up", "cirdan")
     assert result.exit_code == 0, result.output
     assert "✓ cirdan: recreated heimdall" in result.output
