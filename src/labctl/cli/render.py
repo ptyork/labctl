@@ -46,6 +46,7 @@ from labctl.rollout import Applied
 from labctl.runtime import DEFER, Conflict, Port, Runtime, TakeDown
 from labctl.state import NodeState, Scope, Service, is_volume, key_label
 from labctl.text import human_size
+from labctl.validate import Checked
 
 
 def render_plan(collected: Collected, planned: Planned, verbose: bool) -> None:
@@ -159,6 +160,23 @@ def not_a_stack(node: str, file: str, why: str) -> str:
     """A top-level yml of the node's bundle that is not a stack, and why (markup)."""
     reason = NO_SERVICES if why == NO_SERVICES else "does not resolve"
     return f"{node}: {escape(file)} is not a stack ({reason}); copied as is"
+
+
+def render_checked(checked: Checked) -> None:
+    """One node of the lab config, checked: valid in one line, else why not (a yml that is not a
+    stack is a warning before either)."""
+    node, desired = checked.node, checked.desired
+    if desired is not None:
+        for file, why in sorted(desired.not_stacks.items()):
+            console.print(f"[yellow]![/] {not_a_stack(node, file, why)}")
+    for error in checked.errors:
+        console.print(f"[red]✗[/] {escape(error)}")
+    if desired is not None and checked.valid:
+        stacks, services = len(desired.configs), len(desired.state.services)
+        console.print(
+            f"[green]✓[/] {node}: {stacks} stack{'' if stacks == 1 else 's'}, "
+            f"{services} service{'' if services == 1 else 's'}"
+        )
 
 
 def render_drift(collected: Collected) -> None:

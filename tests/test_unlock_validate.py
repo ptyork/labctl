@@ -12,10 +12,10 @@ from click.testing import CliRunner
 from conftest import MakeRepo
 from test_runtime import Services, desired
 
+from labctl import validate as validate_module
 from labctl.bundle import Desired
 from labctl.cli import cli
 from labctl.cli.commands import unlock as unlock_module
-from labctl.cli.commands import validate as validate_module
 from labctl.compose import ComposeError
 from labctl.envfile import PLACEHOLDER_PREFIX
 from labctl.node import HeldLock

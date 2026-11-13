@@ -30,6 +30,7 @@ from labctl.repo import ConfigRepo, TagInfo
 from labctl.runtime import Container
 from labctl.settings import LAB_CONFIG_ENV, Secrets, Settings
 from labctl.state import Dirs, Stack
+from labctl.validate import Checked
 
 
 def container(
@@ -204,7 +205,7 @@ def lab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_repo: MakeRepo) ->
     monkeypatch.setenv("LABCTL_CONFIG_FILE", str(tmp_path / "labctl.toml"))
     monkeypatch.setattr(add_module, "_check_node", lambda node: None)  # unreachable
     monkeypatch.setattr(add_module, "is_terminal", lambda: False)
-    monkeypatch.setattr(add_module, "check_node", lambda *args: True)  # validate's check
+    monkeypatch.setattr(add_module, "check_new_node", lambda settings, node: Checked(node))
     return root
 
 

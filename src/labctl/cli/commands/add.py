@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -25,14 +24,15 @@ from labctl.adopt import (
     valid_name,
 )
 from labctl.cli import menu
-from labctl.cli.commands.validate import check_node
 from labctl.cli.common import is_terminal, load_settings
+from labctl.cli.render import render_checked
 from labctl.click import DebugOptions
 from labctl.compose import ComposeError
 from labctl.console import console
 from labctl.remote import Remote, RemoteError
 from labctl.repo import Applied, ConfigRepo, RepoError
-from labctl.settings import Secrets, Settings, SettingsError
+from labctl.settings import Settings, SettingsError
+from labctl.validate import check_new_node
 
 
 @click.command(name="add")
@@ -137,9 +137,10 @@ def add_cmd(
 
 def _validate(settings: Settings, name: str) -> None:
     """Check the node as ``labctl validate`` does; exits 1 when it does not pass."""
-    with tempfile.TemporaryDirectory(prefix="labctl-add-") as tmp:
-        if not check_node(settings, name, Secrets.load(settings.secrets_file), Path(tmp)):
-            sys.exit(1)
+    checked = check_new_node(settings, name)
+    render_checked(checked)
+    if not checked.valid:
+        sys.exit(1)
 
 
 def _restore(
