@@ -202,7 +202,7 @@ def lab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_repo: MakeRepo) ->
     make_repo(root, FILES)
     monkeypatch.setenv(LAB_CONFIG_ENV, str(root))
     monkeypatch.setenv("LABCTL_CONFIG_FILE", str(tmp_path / "labctl.toml"))
-    monkeypatch.setattr(add_module, "_check_node", lambda node, remote: None)  # unreachable
+    monkeypatch.setattr(add_module, "_check_node", lambda node: None)  # unreachable
     monkeypatch.setattr(add_module, "is_terminal", lambda: False)
     monkeypatch.setattr(add_module, "check_node", lambda *args: True)  # validate's check
     return root
@@ -238,8 +238,8 @@ def imported(lab: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Impo
             ),
         ),
     )
-    monkeypatch.setattr(add_module, "_check_node", lambda node, remote: host)
-    monkeypatch.setattr(add_module, "read_stacks", lambda *args: found)
+    monkeypatch.setattr(add_module, "_check_node", lambda node: host)
+    monkeypatch.setattr(adopt_module, "read_stacks", lambda *args: found)
     return found
 
 

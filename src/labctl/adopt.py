@@ -1,4 +1,5 @@
-"""Bring a node that already runs compose into the lab config (labctl add).
+"""Bring a node that already runs compose into the lab config (labctl add): reading what it
+runs, what to offer for its dirs, and writing its folder. Nothing here prints or asks.
 
 What the node runs is read once (read-only): every container's compose labels and bind mounts,
 where a labctl apply put DEPLOY_DIR (~/.labctl-home), and whether docker compose is there for the
@@ -13,8 +14,11 @@ restructured.
 from __future__ import annotations
 
 import posixpath
+import re
+import shutil
+import tempfile
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -22,14 +26,28 @@ from typing import Any
 import yaml
 
 from labctl import docker
-from labctl.bundle import NO_SERVICES, Location, find_stacks, include_paths, stack_candidates
+from labctl.bundle import (
+    NO_SERVICES,
+    REQUIRED_VARS,
+    Location,
+    check_dirs,
+    find_stacks,
+    include_paths,
+    stack_candidates,
+)
+from labctl.changes import SECRET_NAME
 from labctl.collect import read_node
-from labctl.envfile import SECRET, parse_env
+from labctl.compose import ComposeError
+from labctl.envfile import SECRET, node_env_file, parse_env, read_sources
 from labctl.layout import HOME_POINTER
-from labctl.remote import MARK, Remote, sections
+from labctl.remote import MARK, Remote, node_remote, sections
+from labctl.repo import Applied, ConfigRepo
 from labctl.runtime import Container, parse_containers
-from labctl.settings import Settings
-from labctl.state import Stack
+from labctl.settings import Secrets, Settings
+from labctl.state import ALL, Stack
+
+DEPLOY, APPDATA = REQUIRED_VARS
+_NODE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 # Bind sources that are the host's, not a service's data: never offered as APPDATA_DIR.
 SYSTEM_PATHS = ("/var/run", "/run", "/etc", "/dev", "/proc", "/sys", "/usr", "/lib", "/var/lib")
@@ -82,19 +100,19 @@ class Host:
         return tuple(found[name] for name in sorted(found))
 
 
-def read_host(remote: Remote) -> Host:
+def read_host(node: str) -> Host:
     """
     Read what the node runs (read-only).
 
     Args:
-        remote (Remote):
-            The node's shell.
+        node (str):
+            The node.
 
     Raises:
         RemoteError:
             The node cannot be reached.
     """
-    return parse_host(remote.run_script(_READ_HOST))
+    return parse_host(node_remote(node).run_script(_READ_HOST))
 
 
 def parse_host(output: str) -> Host:
@@ -405,3 +423,234 @@ def env_lines(
             continue
         lines.append(f"{key}={SECRET}" if key in secret else f"{key}={value}")
     return lines
+
+
+#############################################################################
+# Adding the node to the lab config
+#############################################################################
+
+
+def valid_name(name: str) -> bool:
+    """Whether a node may be called this (an ssh host that is also a folder name; not 'all')."""
+    return name != ALL and _NODE_NAME.fullmatch(name) is not None
+
+
+def last_applied_folder(repo: ConfigRepo, nodes_dir: Path, name: str) -> tuple[Applied, str] | None:
+    """The node's latest apply tag whose commit has its folder, and the folder's repo path (None:
+    the lab config never had it)."""
+    path = f"{nodes_dir.relative_to(repo.root).as_posix()}/{name}"
+    for applied in repo.applied_tags(name):
+        if repo.has_path(applied.commit, path):
+            return applied, path
+    return None
+
+
+def suggest_deploy_dir(nodes_dir: Path, others: Sequence[str], host: Host | None) -> str:
+    """The DEPLOY_DIR to offer: where the node's stacks run from, else what most nodes use."""
+    return (offer_deploy_dir(host) if host else "") or _usual(nodes_dir, others, DEPLOY)
+
+
+def suggest_appdata_dir(
+    nodes_dir: Path, others: Sequence[str], host: Host | None, deploy_dir: str
+) -> str:
+    """The APPDATA_DIR to offer: where the node's containers keep their data, else what most
+    nodes use, else appdata in DEPLOY_DIR."""
+    return (
+        (offer_appdata_dir(host.containers, deploy_dir) if host else "")
+        or _usual(nodes_dir, others, APPDATA)
+        or f"${DEPLOY}/appdata"
+    )
+
+
+def dir_problem(var: str, value: str) -> str | None:
+    """Why ``value`` cannot be the node's DEPLOY_DIR or APPDATA_DIR (``var``), or None."""
+    allow_deploy = var == APPDATA
+    if value.startswith("/") or (allow_deploy and value.startswith(f"${DEPLOY}/")):
+        return None
+    return "must be an absolute path on the node" + (
+        f" (or start with ${DEPLOY}/)" if allow_deploy else ""
+    )
+
+
+@dataclass(frozen=True)
+class Added:
+    """
+    What adding a node came to.
+
+    Attributes:
+        folder (Path):
+            The node's folder in the lab config, written.
+        imported (Imported | None):
+            What was read from the node; None when nothing was (not asked for, or not reachable).
+        plain (tuple[str, ...]):
+            The .env keys that look like secrets and were kept in node.env as they are.
+    """
+
+    folder: Path
+    imported: Imported | None = None
+    plain: tuple[str, ...] = ()
+
+
+def add_node(
+    settings: Settings,
+    name: str,
+    deploy_dir: str,
+    appdata_dir: str,
+    host: Host | None,
+    others: Sequence[str],
+    ask_secrets: Callable[[Sequence[str]], list[str]] | None = None,
+) -> Added:
+    """
+    Write nodes/NAME: node.env with its dirs, and the stacks the node runs (else an empty compose
+    file whose project name follows the other nodes'). Nothing is committed.
+
+    Args:
+        settings (Settings):
+            labctl's settings.
+        name (str):
+            The node.
+        deploy_dir (str):
+            Its DEPLOY_DIR.
+        appdata_dir (str):
+            Its APPDATA_DIR, as it goes into node.env (may start with $DEPLOY_DIR/).
+        host (Host | None):
+            What the node runs, to import its stacks; None to start it empty.
+        others (Sequence[str]):
+            The lab config's other nodes.
+        ask_secrets (Callable[[Sequence[str]], list[str]] | None):
+            Given the imported .env keys that look like secrets, returns those to keep in
+            secrets.toml; None keeps them all in node.env.
+
+    Returns:
+        Added:
+            What was written, and what was left out.
+
+    Raises:
+        ComposeError:
+            The dirs cannot be used, or the node's stacks cannot be resolved.
+        RemoteError:
+            The node could not be read.
+    """
+    for var, value in ((DEPLOY, deploy_dir), (APPDATA, appdata_dir)):
+        problem = dir_problem(var, value)
+        if problem:
+            raise ComposeError(f"{var}: {problem}")
+    prefix = f"${DEPLOY}/"
+    appdata_path = (
+        deploy_dir.rstrip("/") + "/" + appdata_dir[len(prefix) :]
+        if appdata_dir.startswith(prefix)
+        else appdata_dir
+    )
+    check_dirs(name, deploy_dir, appdata_path)
+    nodes_dir = settings.nodes_dir
+
+    with tempfile.TemporaryDirectory(prefix="labctl-add-") as tmp:
+        imported = None
+        if host is not None:
+            imported = read_stacks(
+                settings,
+                node_remote(name),
+                host,
+                deploy_dir,
+                _data_names(deploy_dir, appdata_path),
+                Path(tmp) / "node",
+            )
+        if imported is not None:
+            _leave_to_the_root(settings.lab_config, imported)
+        stacks = imported is not None and bool(imported.stacks)
+        env = dict(imported.env) if imported is not None and stacks else {}
+        looks = [key for key, value in env.items() if value and SECRET_NAME.search(key)]
+        secret = ask_secrets(looks) if ask_secrets else []
+        _write_folder(
+            nodes_dir, others, name, deploy_dir, appdata_dir, imported if stacks else None
+        )
+    shared, _ = read_sources(nodes_dir, name)
+    known = {key: value for values in shared for key, value in values.items()}
+    lines = env_lines(env, known, secret, REQUIRED_VARS)
+    if lines:
+        with node_env_file(nodes_dir, name).open("a", encoding="utf-8") as out:
+            out.write("\n" + "".join(f"{line}\n" for line in lines))
+    if secret:
+        secrets = Secrets.load(settings.secrets_file)
+        secrets.table(name).update({key: env[key] for key in secret})
+        secrets.save(settings.secrets_file)
+    return Added(nodes_dir / name, imported, tuple(key for key in looks if key not in secret))
+
+
+def _leave_to_the_root(lab_config: Path, imported: Imported) -> None:
+    """Imported paths under a top-level name the lab config has itself (a node labctl applied
+    from another config, say) are not copied: the bundle takes the name from the root, and a node
+    folder may not have it too. One the root has otherwise, or not at all, is named."""
+    kept = []
+    for path in imported.files:
+        top = path.split("/", 1)[0]
+        if not (lab_config / top).exists():
+            kept.append(path)
+            continue
+        ours = lab_config / path
+        if not ours.is_file():
+            imported.skipped.append(f"{path}: the lab config's {top} has no such file")
+        elif ours.read_bytes() != (imported.folder / path).read_bytes():
+            imported.skipped.append(f"{path}: the lab config's {top} has it, different")
+    imported.files = tuple(kept)
+
+
+def _write_folder(
+    nodes_dir: Path,
+    others: Sequence[str],
+    name: str,
+    deploy_dir: str,
+    appdata_dir: str,
+    imported: Imported | None,
+) -> None:
+    """nodes/NAME: node.env with the dirs, and the stack files imported (else a compose file
+    whose project name follows the other nodes')."""
+    folder = nodes_dir / name
+    folder.mkdir(parents=True, exist_ok=True)
+    node_env_file(nodes_dir, name).write_text(
+        f"{DEPLOY}={deploy_dir}\n{APPDATA}={appdata_dir}\n", encoding="utf-8"
+    )
+    if imported is not None:
+        for path in imported.files:
+            target = folder / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(imported.folder / path, target)
+        return
+    project = _project_prefix(nodes_dir, others) + name
+    (folder / "docker-compose.yml").write_text(
+        f"name: {project}\n\n# {name}'s services: include files of the lab config, or define "
+        "them here.\n",
+        encoding="utf-8",
+    )
+
+
+def _data_names(deploy_dir: str, appdata_dir: str) -> list[str]:
+    """APPDATA_DIR's top-level name in DEPLOY_DIR, when it is inside it."""
+    home, path = PurePosixPath(deploy_dir), PurePosixPath(appdata_dir)
+    return [path.relative_to(home).parts[0]] if path != home and path.is_relative_to(home) else []
+
+
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+
+def _usual(nodes_dir: Path, nodes: Sequence[str], var: str) -> str:
+    """The value most nodes give ``var`` in their node.env, as written ($DEPLOY_DIR kept)."""
+    raw = (parse_env(_read(node_env_file(nodes_dir, node))) for node in nodes)
+    values = Counter(env[var] for env in raw if env.get(var))
+    return values.most_common(1)[0][0] if values else ""
+
+
+def _project_prefix(nodes_dir: Path, nodes: Sequence[str]) -> str:
+    """What the other nodes put before their name in their project name (homelab-), if they
+    agree on it."""
+    prefixes = set()
+    for node in nodes:
+        try:
+            config = yaml.safe_load(_read(nodes_dir / node / "docker-compose.yml")) or {}
+        except yaml.YAMLError:
+            continue
+        project = str(config.get("name", "")) if isinstance(config, dict) else ""
+        if project.endswith(node):
+            prefixes.add(project.removesuffix(node))
+    return prefixes.pop() if len(prefixes) == 1 else ""
