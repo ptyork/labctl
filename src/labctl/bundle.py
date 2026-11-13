@@ -28,6 +28,7 @@ from typing import Any
 
 import yaml
 
+from labctl import docker
 from labctl.compose import ComposeError, reduce_stacks, relocate
 from labctl.envfile import (
     HOST_IP,
@@ -136,8 +137,8 @@ class Location:
         return execute(args, self.root, self.remote, env)
 
     def compose(self, *args: str) -> str:
-        docker = "docker" if self.remote else self.docker_cli
-        result = self.run(docker, "compose", *args)
+        cli = "docker" if self.remote else self.docker_cli
+        result = self.run(*docker.compose(*args, cli=cli))
         if result.code:
             raise ComposeError(f"docker compose {' '.join(args)} failed:\n{result.stderr.strip()}")
         return result.stdout
@@ -213,10 +214,10 @@ def resolve_desired(
     nodes_dir = source / "nodes"
     staging = workdir / node / "bundle"
     node_files = _build_bundle(source, nodes_dir / node, staging)
-    docker = settings.docker_cli
+    cli = settings.docker_cli
 
     not_stacks: dict[str, str] = {}
-    staged = Location(str(staging), docker_cli=docker)
+    staged = Location(str(staging), docker_cli=cli)
     candidates = stack_candidates(staged, node_files)
     referenced: set[str] = set()
     for name in list(candidates):
@@ -261,7 +262,7 @@ def resolve_desired(
     env_file.write_text(render_env(env.values, node), encoding="utf-8")
     env_file.chmod(0o600)
 
-    location = Location(str(bundle), docker_cli=docker)
+    location = Location(str(bundle), docker_cli=cli)
     stacks, failed = find_stacks(location, candidates)
     not_stacks |= failed
     if env.placeholders and not_stacks and not baseline:  # a baseline has no secrets: expected
@@ -324,15 +325,9 @@ def resolve_stacks(
     """
     resolved = []
     for stack in stacks:
-        output = location.compose(*stack_args(stack), "config", "--format", "json")
+        output = location.compose(*docker.stack_args(stack), "config", "--format", "json")
         resolved.append((stack, relocate(json.loads(output), location.root, deploy_dir)))
     return resolved
-
-
-def stack_args(stack: Stack) -> list[str]:
-    """`-p NAME -f FILE...` for a stack; nothing for compose's own default stack."""
-    project = ["-p", stack.name] if stack.name else []
-    return [*project, *(arg for file in stack.files for arg in ("-f", file))]
 
 
 def stack_candidates(location: Location, names: Iterable[str]) -> list[str]:

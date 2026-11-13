@@ -7,7 +7,7 @@ labctl.toml (or $LABCTL_CONFIG_FILE):
 
 lab_config is the lab config: the folder that describes the lab (nodes/ and what they run), the root
 of its own git repository. $LABCTL_LAB_CONFIG overrides it. With neither, a terminal is asked to
-choose one (cli.commands.settings.load_settings); `labctl init` sets one up.
+choose one (cli.common.load_settings); `labctl init` sets one up.
 
 secrets.toml, next to it: a [global] table and [nodes.<node>] overrides.
 

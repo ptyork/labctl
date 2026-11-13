@@ -321,8 +321,6 @@ def test_scope_is_the_nodes_named() -> None:
     assert Scope.build(nodes, ["cirdan"]).skipped == frozenset({"frodo", "bilbo"})
     assert Scope.build(nodes, ["cirdan", "frodo", "cirdan"]).skipped == frozenset({"bilbo"})
     assert Scope.build(nodes, ["all"]) == Scope()
-    unreachable = Scope.build(nodes, ["all"]).without(["frodo"])
-    assert unreachable.skipped == frozenset({"frodo"})
 
 
 @pytest.mark.parametrize(

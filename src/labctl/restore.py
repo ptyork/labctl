@@ -21,13 +21,11 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
-from labctl.checks import human_size
-from labctl.compose import ARCHIVE_DIR
+from labctl.layout import ARCHIVE_DIR
 from labctl.planner import Add, Plan, Restore
 from labctl.remote import Remote, RemoteError
 from labctl.state import NodeState, is_volume, under
-
-SIDECAR = ".labctl.json"
+from labctl.text import human_size
 
 # $1: APPDATA_DIR. Each sidecar whose entry is still there: entry, size, then the JSON on one line.
 _LIST = f"""\
@@ -200,11 +198,11 @@ Ask = Callable[[str, str, Sequence[Copy]], Copy | None]
 
 @dataclass(frozen=True)
 class Restores:
-    operations: tuple[Restore, ...]
-    chosen: tuple[str, ...]  # SERVICE@STAMP for each restore, and SERVICE for each fresh start
-    fresh: tuple[str, ...]
-    notes: tuple[str, ...]  # said in the plan: what was decided and how to decide otherwise
-    errors: tuple[str, ...]  # a --restore that names no copy
+    operations: tuple[Restore, ...] = ()
+    chosen: tuple[str, ...] = ()  # SERVICE@STAMP for each restore
+    fresh: tuple[str, ...] = ()  # the services that start empty
+    notes: tuple[str, ...] = ()  # said in the plan: what was decided, how to decide otherwise
+    errors: tuple[str, ...] = ()  # a --restore that names no copy
 
 
 def plan_restores(

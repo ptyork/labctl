@@ -21,9 +21,10 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from itertools import combinations
 
+from labctl import docker
 from labctl.bundle import Desired
 from labctl.envfile import PLACEHOLDER_PREFIX
-from labctl.runtime import DOCKER_PROCESSES, Container, Listener, Port, is_any_address, published
+from labctl.runtime import Container, Listener, Port, is_any_address, published
 from labctl.state import NodeState
 
 # What uses a port.
@@ -204,8 +205,8 @@ def port_map(
     seen: set[tuple[Port, str]] = set()
     for listener in listeners:
         port = _plain(listener.port)
-        docker = (port.protocol, port.port) in docker_ports
-        if docker or listener.process in DOCKER_PROCESSES or (port, listener.process) in seen:
+        published = (port.protocol, port.port) in docker_ports
+        if published or listener.process in docker.PROCESSES or (port, listener.process) in seen:
             continue
         seen.add((port, listener.process))
         uses.append(PortUse(node, port, listener.process, PROCESS, LISTENING))

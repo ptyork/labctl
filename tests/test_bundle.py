@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 import pytest
+from conftest import needs_docker
 
 from labctl.bundle import (
     Desired,
@@ -44,9 +44,6 @@ def test_stack_candidates_skip_included_and_disabled_files(tmp_path: Path) -> No
     assert stack_candidates(location, location.names()) == ["broken.yml", "main.yml", "other.yaml"]
 
 
-docker = pytest.mark.skipif(shutil.which("docker") is None, reason="needs the docker CLI")
-
-
 @pytest.fixture
 def repo(tmp_path: Path) -> Settings:
     write(
@@ -65,7 +62,7 @@ def resolve(settings: Settings, tmp_path: Path, files: dict[str, str]) -> Desire
     return resolve_desired(settings, "frodo", Secrets(), tmp_path / "work", None)
 
 
-@docker
+@needs_docker
 def test_stacks_are_found_named_and_resolved_as_on_the_node(repo: Settings, tmp_path: Path) -> None:
     desired = resolve(
         repo,
@@ -98,7 +95,7 @@ def test_stacks_are_found_named_and_resolved_as_on_the_node(repo: Settings, tmp_
     assert "infra-part.yml" in desired.files
 
 
-@docker
+@needs_docker
 def test_service_names_must_be_unique_on_a_node(repo: Settings, tmp_path: Path) -> None:
     with pytest.raises(ComposeError, match="'plex' is in two stacks, 'a' and 'b'"):
         resolve(
@@ -116,7 +113,7 @@ def test_node_files_may_not_shadow_the_lab_config(repo: Settings, tmp_path: Path
         resolve(repo, tmp_path, {"apps/mine.yml": "services: {}\n"})
 
 
-@docker
+@needs_docker
 def test_discovery_works_on_any_folder_of_compose_files(tmp_path: Path) -> None:
     """The same rule finds stacks in a node's DEPLOY_DIR (run through ssh there)."""
     home = tmp_path / "docker"

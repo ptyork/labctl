@@ -2,30 +2,12 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 import click
 
+from labctl.planning import Options
 from labctl.state import ALL
-
-
-@dataclass(frozen=True)
-class Options:
-    """What plan and apply share: the scope, and the choices the plan is made with."""
-
-    nodes: tuple[str, ...]
-    replace_stale: bool
-    no_migrate: tuple[str, ...]
-    verbose: bool
-    fresh: tuple[str, ...] = ()
-    restore: tuple[str, ...] = ()  # SERVICE or SERVICE@STAMP
-    ff: bool = False
-    stop_unmanaged: bool = False
-    defer_blocked: bool = False
-    # Conflicts answered in a terminal, by key (runtime.Conflict).
-    stop: tuple[str, ...] = ()
-    defer: tuple[str, ...] = ()
 
 
 class PlanOptions:

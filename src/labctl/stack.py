@@ -9,16 +9,17 @@ and after edits made on the node.
 from __future__ import annotations
 
 import json
-import shlex
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from labctl.bundle import Location, discover_stacks, stack_args
-from labctl.collect import HOME_POINTER, projects_in
+from labctl import docker
+from labctl.bundle import Location, discover_stacks
+from labctl.collect import projects_in
 from labctl.compose import ComposeError
 from labctl.envfile import preview_env
+from labctl.layout import HOME_POINTER
 from labctl.remote import Remote, execute
 from labctl.settings import Settings, SettingsError
 from labctl.state import Stack
@@ -54,10 +55,16 @@ class Deployed:
         return tuple(matches)
 
 
-def deployed(settings: Settings, node: str, remote: Remote) -> Deployed:
+def deploy_dir_on(settings: Settings, node: str, remote: Remote) -> str:
+    """Where the node's DEPLOY_DIR is: where its ~/.labctl-home says the last apply put it, else
+    node.env's value (before the first apply); "" when neither says."""
     pointer = execute(["sh", "-c", f'cat "$HOME/{HOME_POINTER}"'], "/", remote)
     home = pointer.stdout.strip() if pointer.code == 0 else ""
-    home = home or preview_env(settings.nodes_dir, node).get("DEPLOY_DIR", "")
+    return home or preview_env(settings.nodes_dir, node).get("DEPLOY_DIR", "")
+
+
+def deployed(settings: Settings, node: str, remote: Remote) -> Deployed:
+    home = deploy_dir_on(settings, node, remote)
     if not home:
         raise SettingsError(f"{node}: DEPLOY_DIR is not set (run 'labctl plan {node}' to set it)")
     location = Location(home, remote)
@@ -66,16 +73,6 @@ def deployed(settings: Settings, node: str, remote: Remote) -> Deployed:
         why = "".join(f"\n  {name}: {error.splitlines()[-1]}" for name, error in not_stacks.items())
         raise SettingsError(f"{node}: no stack files in {home}{why}")
     return Deployed(node, location, tuple(stacks), not_stacks)
-
-
-def compose_command(deploy_dir: str, stack: Stack, *args: str, progress: str = "") -> str:
-    """Shell command running docker compose on one stack (for output streamed to the terminal);
-    ``progress`` is compose's --progress (plain: a line per event, for output read by labctl)."""
-    missing = shlex.quote(f"DEPLOY_DIR {deploy_dir} does not exist")
-    flags = ["--progress", progress] if progress else []
-    return f"cd {shlex.quote(deploy_dir)} 2>/dev/null || {{ echo {missing} >&2; exit 3; }}; " + (
-        shlex.join(["docker", "compose", *flags, *stack_args(stack), *args])
-    )
 
 
 @dataclass(frozen=True)
@@ -92,29 +89,24 @@ class ServiceStatus:
 
 def stack_services(location: Location, stack: Stack) -> list[str]:
     """The stack's services, as its files define them."""
-    return location.compose(*stack_args(stack), "config", "--services").split()
+    return location.compose(*docker.stack_args(stack), "config", "--services").split()
 
 
 def read_services(location: Location, stack: Stack) -> list[ServiceStatus]:
     """The stack's services and their containers."""
-    rows = ps_rows(location.compose(*stack_args(stack), "ps", "--all", "--format", "json"))
+    rows = ps_rows(location.compose(*docker.stack_args(stack), "ps", "--all", "--format", "json"))
     names = [str(row["Name"]) for row in rows if row.get("Name")]
-    restarts = parse_restarts(location.run("sh", "-c", _RESTARTS, "sh", *names).stdout)
+    restarts = parse_restarts(location.run("sh", "-c", docker.RESTARTS, "sh", *names).stdout)
     return statuses(stack.name, stack_services(location, stack), rows, restarts)
 
 
-# The node's clock, then per container: its name, RestartCount and when it last started.
-_RESTARTS = (
-    "date -u +%s; [ $# -gt 0 ] && docker inspect --format "
-    "'{{.Name}} {{.RestartCount}} {{.State.StartedAt}}' \"$@\" 2>/dev/null; true"
-)
 # A restart loop: restarting now, or restarted this often and up for less than this long.
 LOOP_RESTARTS = 3
 LOOP_WINDOW = 300  # seconds
 
 
 def parse_restarts(output: str) -> dict[str, tuple[int, int]]:
-    """_RESTARTS's output: container name -> (restarts, seconds up)."""
+    """docker.RESTARTS's output: container name -> (restarts, seconds up)."""
     lines = output.split("\n")
     if not lines or not lines[0].strip().isdigit():
         return {}
@@ -216,13 +208,6 @@ def ps_rows(output: str) -> list[dict[str, Any]]:
 
 ##########################################################################
 
-# `docker ps -a --format`: one JSON object per container, with its compose labels.
-SNAPSHOT_FORMAT = (
-    '{"id":{{json .ID}},"project":{{json (.Label "com.docker.compose.project")}},'
-    '"service":{{json (.Label "com.docker.compose.service")}},"state":{{json .State}}}'
-)
-SNAPSHOT_COMMAND = ("docker", "ps", "--all", "--no-trunc", "--format", SNAPSHOT_FORMAT)
-
 
 @dataclass(frozen=True)
 class Seen:
@@ -236,7 +221,7 @@ Snapshot = dict[tuple[str, str], Seen]  # (project, service) -> its containers
 
 
 def snapshot(output: str) -> Snapshot:
-    """The compose containers in SNAPSHOT_COMMAND's output (others have no service)."""
+    """The compose containers in docker.snapshot's output (others have no service)."""
     found: dict[tuple[str, str], tuple[set[str], bool]] = {}
     for line in output.splitlines():
         if not line.strip():
@@ -253,10 +238,7 @@ def snapshot(output: str) -> Snapshot:
 
 def read_snapshot(remote: Remote, project: str = "") -> Snapshot:
     """The node's compose containers now (one project's, when named)."""
-    args = list(SNAPSHOT_COMMAND)
-    if project:
-        args += ["--filter", f"label=com.docker.compose.project={project}"]
-    result = execute(args, "/", remote)
+    result = execute(docker.snapshot(project), "/", remote)
     if result.code:
         raise ComposeError(f"{remote.host}: docker ps: {result.stderr.strip()}")
     return snapshot(result.stdout)

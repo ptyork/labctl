@@ -22,7 +22,7 @@ updates (or migrates) instead of one data group disappearing and another appeari
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 
@@ -490,3 +490,12 @@ def where_now(path: str, moves: list[Move] | tuple[Move, ...]) -> str:
         if not move.carried:
             path = rebase(path, move.target, move.source)
     return path
+
+
+def move_paths(moves: Sequence[Move]) -> list[tuple[Move, str, str]]:
+    """(move, source now, target now): each move's paths as they are before apply starts."""
+    result: list[tuple[Move, str, str]] = []
+    for i, move in enumerate(moves):
+        before = [m for m in moves[:i] if m.node == move.node]
+        result.append((move, where_now(move.source, before), where_now(move.target, before)))
+    return result

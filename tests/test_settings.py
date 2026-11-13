@@ -7,7 +7,7 @@ import click
 import pytest
 
 from labctl.cli import menu
-from labctl.cli.commands.settings import load_settings
+from labctl.cli.common import load_settings
 from labctl.envfile import preview_env
 from labctl.settings import (
     LAB_CONFIG_ENV,

@@ -19,7 +19,8 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-from labctl.cli.commands.settings import load_settings
+from labctl import docker
+from labctl.cli.common import is_terminal, load_settings, services_option, target_nodes
 from labctl.click import AliasedGroup, DebugOptions
 from labctl.compose import ComposeError
 from labctl.console import console
@@ -28,7 +29,6 @@ from labctl.settings import SettingsError
 from labctl.stack import (
     Deployed,
     ServiceStatus,
-    compose_command,
     container_changes,
     deployed,
     read_services,
@@ -36,17 +36,9 @@ from labctl.stack import (
     stack_services,
     unbacked_projects,
 )
-from labctl.state import ALL, Stack
+from labctl.state import Stack
 
 targets_argument = click.argument("targets", nargs=-1, required=True, metavar="NODE[/STACK]...|all")
-services_option = click.option(
-    "--service",
-    "-s",
-    "services",
-    multiple=True,
-    metavar="SERVICE",
-    help="Only this service (repeatable).",
-)
 
 # The stacks a command runs on, each with the services named in it (none named: all of them).
 Runs = list[tuple[Stack, tuple[str, ...]]]
@@ -64,7 +56,7 @@ class Target:
 
 @click.group(name="node", cls=AliasedGroup)
 def node_cmd() -> None:
-    """Run compose commands on the nodes' deployed stacks; add a node to the lab config.
+    """Run compose commands on the nodes' deployed stacks.
 
     Targets: NODE, NODE/STACK, or 'all' (every node in turn). Help for a command:
     labctl node COMMAND --help
@@ -116,7 +108,7 @@ def prune_cmd(targets: tuple[str, ...], **kwargs: Any) -> None:
     def prune(t: Target, runs: Runs) -> int:
         if not t.whole:
             raise SettingsError("prune is node-wide; give the node without a stack")
-        return t.remote.run("docker image prune --force")
+        return t.remote.run(docker.PRUNE_IMAGES)
 
     _each_node(targets, prune)
 
@@ -134,7 +126,7 @@ def update_cmd(targets: tuple[str, ...], services: tuple[str, ...], **kwargs: An
         failed = failed or _run_stacks(t, runs, "up", "-d", "--remove-orphans", report=True)
         if failed:
             return failed
-        return t.remote.run("docker image prune --force")
+        return t.remote.run(docker.PRUNE_IMAGES)
 
     _each_node(targets, update, services=services)
 
@@ -156,7 +148,7 @@ def logs_cmd(
         (
             t.deployed.label(stack),
             t.remote,
-            compose_command(t.deployed.deploy_dir, stack, *args, *names),
+            docker.compose_command(t.deployed.deploy_dir, stack, *args, *names),
         )
         for t, runs in resolved
         for stack, names in runs
@@ -168,7 +160,7 @@ def logs_cmd(
             for label, remote, command in streams:
                 if len(streams) > 1:
                     console.rule(f"[bold]{escape(label)}[/]")
-                if remote.run(command, _tty()):
+                if remote.run(command, is_terminal()):
                     failed.append(label)
     finally:
         Remote.close_all([*(t.deployed.node for t, _ in resolved), *failed])
@@ -282,8 +274,8 @@ def _run_stacks(
         if len(runs) > 1:
             console.rule(f"[bold]{escape(label)}[/]")
         before = read_snapshot(t.remote, stack.name) if report else {}
-        command = compose_command(t.deployed.deploy_dir, stack, *args, *names)
-        code = t.remote.run(command, _tty())
+        command = docker.compose_command(t.deployed.deploy_dir, stack, *args, *names)
+        code = t.remote.run(command, is_terminal())
         failed |= code
         if report and not code:
             changes = container_changes(before, read_snapshot(t.remote, stack.name), stack.name)
@@ -303,26 +295,6 @@ def _with_services(t: Target, services: tuple[str, ...]) -> Runs:
         for stack in t.stacks
     }
     return [(stack, names) for stack, names in by_stack.items() if names]
-
-
-def target_nodes(targets: Sequence[str], names: Sequence[str]) -> dict[str, tuple[str, ...]]:
-    """Node -> the stacks named on it ("" for all of them), in the order given."""
-    if ALL in names:
-        raise SettingsError(f"a node may not be called '{ALL}'")
-    if ALL in targets:
-        if len(targets) > 1:
-            raise SettingsError(f"'{ALL}' already means every node")
-        return {name: ("",) for name in names}
-    chosen: dict[str, tuple[str, ...]] = {}
-    for target in targets:
-        node, _, selector = target.partition("/")
-        if node == ALL:
-            raise SettingsError("a stack can only be named with its node")
-        if node not in names:
-            raise SettingsError(f"Unknown node '{node}'. Nodes: {', '.join(names)}")
-        if selector not in chosen.get(node, ()):
-            chosen[node] = (*chosen.get(node, ()), selector)
-    return chosen
 
 
 def _resolve(
@@ -427,7 +399,3 @@ def _follow(streams: Sequence[tuple[str, Remote, str]]) -> list[tuple[str, int]]
             proc.wait()
         raise
     return [(label, proc.wait()) for label, proc in procs]
-
-
-def _tty() -> bool:
-    return sys.stdin.isatty() and sys.stdout.isatty()

@@ -23,13 +23,15 @@ from datetime import UTC, datetime
 from enum import Enum
 from pathlib import PurePosixPath
 
+from labctl import docker
 from labctl.bundle import Desired
-from labctl.compose import ARCHIVE_DIR
 from labctl.envfile import PLACEHOLDER_PREFIX
-from labctl.moves import DATA, VOLUME, Move, where_now
+from labctl.layout import archive_path
+from labctl.moves import DATA, VOLUME, Move, move_paths, where_now
 from labctl.planner import Add, Migrate, Operation, Remove, Restore, Update
 from labctl.remote import Remote, RemoteError, node_remote
-from labctl.state import NodeState, is_volume, volume_key, volume_name
+from labctl.state import NodeState, data_spec, is_volume, key_label, volume_key, volume_name
+from labctl.text import human_size
 
 # Arguments are "<mode>:<path>". Mode S: also measure size and newest mtime. Mode -: kind only.
 _PROBE = """\
@@ -65,15 +67,19 @@ done
 # Free space: for each path, the filesystem holding it (or its nearest existing parent): bytes
 # available and mount point. DOCKER stands for Docker's root dir, where volumes live.
 DOCKER = "@docker"
-_FREE = """\
+_FREE = (
+    """\
 for p in "$@"; do
   d=$p
-  if [ "$p" = @docker ]; then d=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null); fi
+  if [ "$p" = @docker ]; then d=$("""
+    + docker.ROOT_DIR
+    + """ 2>/dev/null); fi
   while [ -n "$d" ] && [ ! -e "$d" ] && [ "$d" != / ]; do d=$(dirname "$d"); done
   [ -n "$d" ] || continue
   df -PB1 "$d" 2>/dev/null | awk -v p="$p" 'NR == 2 {printf "%s\\t%s\\t%s\\n", p, $4, $6}'
 done
 """
+)
 
 
 class Level(Enum):
@@ -367,15 +373,6 @@ def space_findings(
     ]
 
 
-def move_paths(moves: Sequence[Move]) -> list[tuple[Move, str, str]]:
-    """(move, source now, target now): each move's paths as they are before apply starts."""
-    result: list[tuple[Move, str, str]] = []
-    for i, move in enumerate(moves):
-        before = [m for m in moves[:i] if m.node == move.node]
-        result.append((move, where_now(move.source, before), where_now(move.target, before)))
-    return result
-
-
 def _move_findings(
     moves: Sequence[Move],
     results: Mapping[str, Mapping[str, PathInfo]],
@@ -462,16 +459,11 @@ def probe(remote: Remote, paths: Sequence[tuple[str, str]]) -> dict[str, PathInf
     return parse_probe(remote.run_script(_PROBE, *(f"{mode}:{path}" for path, mode in paths)))
 
 
-# The volumes that exist, then every volume's size. Read-only: no container is run (mounting a
-# missing volume would create it).
-_VOLUMES = 'docker volume ls -q && echo "--" && docker system df -v --format json'
-
-
 def probe_volumes(remote: Remote, keys: Sequence[str]) -> dict[str, PathInfo]:
     """Volume keys -> missing, empty or dir (has data), with the size."""
     if not keys:
         return {}
-    return parse_volumes(remote.run_script(_VOLUMES), keys)
+    return parse_volumes(remote.run_script(docker.VOLUMES), keys)
 
 
 def parse_volumes(output: str, keys: Sequence[str]) -> dict[str, PathInfo]:
@@ -672,35 +664,6 @@ def describe(p: PathInfo) -> str:
     if p.newest is not None:
         parts.append(f"last modified {p.newest:%Y-%m-%d}")
     return ", ".join(parts)
-
-
-def human_size(size: int) -> str:
-    value = float(size)
-    for unit in ("B", "KB", "MB", "GB"):
-        if value < 1024:
-            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
-        value /= 1024
-    return f"{value:.1f} TB"
-
-
-def archive_path(root: str, key: str) -> str:
-    """Where data is archived: <key> in <root>'s archive, a volume as volume-<name> (the executor
-    appends -<timestamp>)."""
-    return str(PurePosixPath(root) / ARCHIVE_DIR / archive_name(key))
-
-
-def archive_name(key: str) -> str:
-    return f"volume-{volume_name(key)}" if is_volume(key) else key
-
-
-def key_label(key: str) -> str:
-    """A data key as the plan shows it: ``plex/`` or ``volume homelab-frodo_pgdata``."""
-    return f"volume {volume_name(key)}" if is_volume(key) else f"{key}/"
-
-
-def data_spec(root: str, key: str) -> str:
-    """What a probe (and docker -v) takes for a data key: the absolute path, or the volume key."""
-    return key if is_volume(key) else str(PurePosixPath(root) / key)
 
 
 def _archive_prefix(desired: Desired, path: str) -> str:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import shutil
 import sys
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +10,7 @@ from craftable import get_table
 from rich.markup import escape
 from rich.panel import Panel
 
+from labctl import __version__
 from labctl.click import DebugOptions
 from labctl.console import console
 from labctl.envfile import HOST_IP, preview_env
@@ -19,7 +19,6 @@ from labctl.remote import node_remote
 from labctl.repo import ConfigRepo, RepoError
 from labctl.settings import Settings, SettingsError, config_file
 
-_MODULE_NAME = "labctl"
 _NOT_SET = "[yellow]not set[/]"
 # Node variables shown (from _shared/*.env + node.env only).
 _NODE_VARS = ["DEPLOY_DIR", "APPDATA_DIR"]
@@ -38,7 +37,7 @@ def status_cmd(**kwargs: Any) -> None:
         lab_config = f"[red]{escape(str(exc))}[/]"
 
     rows = [
-        ["CLI Version", _package_version()],
+        ["CLI Version", __version__],
         ["Executable", _executable_path()],
         ["Python", sys.executable],
         ["Config File", str(config_file())],
@@ -121,13 +120,6 @@ def _last_applied(repo: ConfigRepo | None, node: str, head: str) -> str:
         return "?"
     moved = f", [yellow]{behind} behind[/]" if behind else ""
     return f"{last.stamp} {last.commit[:7]}{moved}"
-
-
-def _package_version() -> str:
-    try:
-        return version(_MODULE_NAME)
-    except PackageNotFoundError:
-        return "undetermined"
 
 
 def _executable_path() -> str:

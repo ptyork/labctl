@@ -44,33 +44,21 @@ from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any
 
+from labctl import docker
 from labctl.bundle import Desired
 from labctl.changes import network_changes
 from labctl.planner import Migrate, Plan
 from labctl.remote import MARK
 from labctl.state import NodeState
 
-# `docker inspect --format`: one JSON object per container, only what labctl uses (no env: it can
-# hold secrets).
-CONTAINER_FORMAT = (
-    '{"name":{{json .Name}},"state":{{json .State.Status}},"image":{{json .Config.Image}},'
-    '"project":{{json (index .Config.Labels "com.docker.compose.project")}},'
-    '"service":{{json (index .Config.Labels "com.docker.compose.service")}},'
-    '"files":{{json (index .Config.Labels "com.docker.compose.project.config_files")}},'
-    '"dir":{{json (index .Config.Labels "com.docker.compose.project.working_dir")}},'
-    '"ports":{{json .HostConfig.PortBindings}},"restart":{{json .HostConfig.RestartPolicy}},'
-    '"exit":{{json .State.ExitCode}},"restarts":{{json .RestartCount}},'
-    '"mounts":{{json .Mounts}},"networks":{{json .NetworkSettings.Networks}}}'
-)
 # The listener section when the node has no `ss`.
 UNAVAILABLE = "-unavailable"
 # Shell lines printing the node's containers and the ports held on its host, as the sections
-# "containers" (CONTAINER_FORMAT lines) and "listeners" (`ss` lines, or UNAVAILABLE). ss names
-# another user's process only as root: sudo when it needs no password, else as the ssh user.
+# "containers" (docker.CONTAINER_FORMAT lines) and "listeners" (`ss` lines, or UNAVAILABLE). ss
+# names another user's process only as root: sudo when it needs no password, else as the ssh user.
 READ_RUNTIME = f"""\
 echo "{MARK} containers"
-docker ps -aq </dev/null 2>/dev/null |
-  xargs -r docker inspect --format '{CONTAINER_FORMAT}' 2>/dev/null
+{docker.INSPECT_CONTAINERS}
 echo "{MARK} listeners"
 if command -v ss >/dev/null 2>&1; then
   sudo -n ss -Htulnp </dev/null 2>/dev/null || ss -Htulnp </dev/null 2>/dev/null
@@ -78,8 +66,6 @@ else echo "{UNAVAILABLE}"; fi"""
 
 _UP = frozenset({"running", "restarting", "paused"})
 _ANY_ADDRESS = frozenset({"", "0.0.0.0", "::", "*"})
-# What holds a published port for Docker itself.
-DOCKER_PROCESSES = frozenset({"docker-proxy", "rootlesskit", "rootlessport"})
 
 
 def is_any_address(host_ip: str) -> bool:
@@ -144,7 +130,7 @@ class Listener:
 
 
 def parse_containers(lines: Iterable[str], deploy_dir: str) -> tuple[Container, ...]:
-    """The node's containers from CONTAINER_FORMAT lines."""
+    """The node's containers from docker.CONTAINER_FORMAT lines."""
     prefix = deploy_dir.rstrip("/") + "/"
     found = []
     for line in lines:
@@ -529,7 +515,7 @@ def analyse(
         for stack in sorted(want.state.stacks):
             mine = [container for container in here if container.project == stack]
             up = sum(container.up for container in mine)
-            names = [s for s, svc in sorted(want.state.services.items()) if svc.stack == stack]
+            names = want.state.services_in(stack)
             arriving = [
                 f"{prior.name} was up {prior.where}"
                 for s in names
@@ -590,7 +576,7 @@ def analyse(
             services = tuple(
                 sorted({container.service for container in found if container.service})
             )
-            repo = {s for s, svc in want.state.services.items() if svc.stack == project}
+            repo = set(want.state.services_in(project))
             in_repo = tuple(service for service in services if service in repo)
             gone = missing.get(node, ())
             down = TakeDown(
@@ -621,7 +607,7 @@ def analyse(
         held = [
             listener
             for listener in found_listeners or ()
-            if listener.process not in DOCKER_PROCESSES
+            if listener.process not in docker.PROCESSES
             and (listener.port.protocol, listener.port.port) not in docker_ports
         ]
         for name, service in sorted(want.state.services.items()):
@@ -819,7 +805,7 @@ def _previous(
 def _dependents(want: Desired, service: str) -> tuple[str, ...]:
     """Services of the same stack that depend on ``service``, directly or not."""
     stack = want.state.services[service].stack
-    names = [s for s, svc in sorted(want.state.services.items()) if svc.stack == stack]
+    names = want.state.services_in(stack)
     found: list[str] = []
     pending = [service]
     while pending:

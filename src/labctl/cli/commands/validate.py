@@ -11,7 +11,7 @@ import click
 from rich.markup import escape
 
 from labctl.bundle import Desired, resolve_desired
-from labctl.cli.commands.settings import load_settings
+from labctl.cli.common import load_settings
 from labctl.cli.render import not_a_stack
 from labctl.click import DebugOptions
 from labctl.compose import ComposeError

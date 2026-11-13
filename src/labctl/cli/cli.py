@@ -1,7 +1,6 @@
-from importlib.metadata import PackageNotFoundError, version
-
 import click
 
+from labctl import __version__
 from labctl.click import AliasedGroup
 
 from .commands import (
@@ -22,14 +21,8 @@ from .commands import (
     validate_cmd,
 )
 
-MODULE_NAME = "labctl"
-try:
-    VERSION = version(MODULE_NAME)
-except PackageNotFoundError:
-    VERSION = "undetermined"
 
-
-@click.version_option(VERSION)
+@click.version_option(__version__)
 @click.group(cls=AliasedGroup)
 def main() -> None:
     """labctl CLI for homelab Docker management."""

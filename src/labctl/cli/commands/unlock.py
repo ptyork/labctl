@@ -8,12 +8,10 @@ from typing import Any
 import click
 from rich.markup import escape
 
-from labctl.apply import HeldLock, read_lock, unlock
-from labctl.cli import menu
-from labctl.cli.commands.node import target_nodes
-from labctl.cli.commands.settings import load_settings
+from labctl.cli.common import confirm_or_yes, load_settings, target_nodes
 from labctl.click import DebugOptions
 from labctl.console import console
+from labctl.node import HeldLock, read_lock, unlock
 from labctl.remote import Remote, RemoteError, node_remote
 from labctl.settings import SettingsError
 
@@ -55,7 +53,8 @@ def unlock_cmd(targets: tuple[str, ...], yes: bool, **kwargs: Any) -> None:
             for step in found.steps or ("no steps recorded",):
                 console.print(f"    {escape(step)}")
         if held:
-            _confirm(yes, len(held))
+            locks = "the lock" if len(held) == 1 else f"these {len(held)} locks"
+            confirm_or_yes(f"Remove {locks}?", yes, "Not unlocked")
             for node in held:
                 unlock(remotes[node])
                 console.print(f"[green]✓[/] {escape(node)}: unlocked")
@@ -63,13 +62,3 @@ def unlock_cmd(targets: tuple[str, ...], yes: bool, **kwargs: Any) -> None:
         Remote.close_all(chosen)
     if failed:
         sys.exit(1)
-
-
-def _confirm(yes: bool, count: int) -> None:
-    if yes:
-        return
-    if not sys.stdin.isatty():
-        raise click.ClickException("Confirm in a terminal, or pass --yes")
-    console.print()
-    if not menu.confirm(f"Remove {'the lock' if count == 1 else f'these {count} locks'}?"):
-        raise click.ClickException("Not unlocked")

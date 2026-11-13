@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 from click.testing import CliRunner, Result
-from conftest import MakeRepo, git
+from conftest import MakeRepo, git, needs_docker
 
 from labctl import adopt as adopt_module
 from labctl.adopt import (
@@ -30,13 +30,6 @@ from labctl.repo import ConfigRepo, TagInfo
 from labctl.runtime import Container
 from labctl.settings import LAB_CONFIG_ENV, Secrets, Settings
 from labctl.state import Dirs, Stack
-
-docker = pytest.mark.skipif(shutil.which("docker") is None, reason="needs the docker CLI")
-
-
-@pytest.fixture
-def settings(tmp_path: Path) -> Settings:
-    return Settings(lab_config=tmp_path / "repo", config_dir=tmp_path / "config")
 
 
 def container(
@@ -151,7 +144,7 @@ NODE_FILES = {
 }
 
 
-@docker
+@needs_docker
 def test_read_stacks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, settings: Settings) -> None:
     root = tmp_path / "node"
     for path, text in NODE_FILES.items():
@@ -210,7 +203,7 @@ def lab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_repo: MakeRepo) ->
     monkeypatch.setenv(LAB_CONFIG_ENV, str(root))
     monkeypatch.setenv("LABCTL_CONFIG_FILE", str(tmp_path / "labctl.toml"))
     monkeypatch.setattr(add_module, "_check_node", lambda node, remote: None)  # unreachable
-    monkeypatch.setattr(add_module, "_tty", lambda: False)
+    monkeypatch.setattr(add_module, "is_terminal", lambda: False)
     monkeypatch.setattr(add_module, "check_node", lambda *args: True)  # validate's check
     return root
 
@@ -300,7 +293,7 @@ def test_a_terminal_is_offered_what_the_node_runs(
         offered.append(f"{prompt}={value}")
         return value
 
-    monkeypatch.setattr(add_module, "_tty", lambda: True)
+    monkeypatch.setattr(add_module, "is_terminal", lambda: True)
     monkeypatch.setattr(menu, "edit_text", edit_text)
     monkeypatch.setattr(menu, "confirm", lambda *args, **kwargs: True)  # API_KEY is a secret
     add("new")
@@ -328,7 +321,7 @@ def test_unreachable_in_a_terminal_offers_what_most_nodes_use(
         asked.append(prompt)
         return True
 
-    monkeypatch.setattr(add_module, "_tty", lambda: True)
+    monkeypatch.setattr(add_module, "is_terminal", lambda: True)
     monkeypatch.setattr(menu, "edit_text", edit_text)
     monkeypatch.setattr(menu, "confirm", confirm)
     add("aragorn")
@@ -342,7 +335,7 @@ def test_unreachable_in_a_terminal_offers_what_most_nodes_use(
 def test_unreachable_in_a_terminal_is_asked_first(
     lab: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(add_module, "_tty", lambda: True)
+    monkeypatch.setattr(add_module, "is_terminal", lambda: True)
     monkeypatch.setattr(menu, "confirm", lambda *args, **kwargs: False)
     monkeypatch.setattr(menu, "edit_text", lambda *args, **kwargs: 1 / 0)  # never reached
     assert "Not added" in add("bob", ok=False).output
@@ -362,11 +355,6 @@ def test_unreachable_in_a_terminal_is_asked_first(
 )
 def test_refused(lab: Path, args: list[str], message: str) -> None:
     assert message in add(*args, ok=False).output
-
-
-def test_node_add_is_gone(lab: Path) -> None:
-    result = CliRunner().invoke(cli.main, ["node", "add", "x"])
-    assert result.exit_code == 2
 
 
 def test_what_the_lab_config_root_has_is_left_to_it(lab: Path, imported: Imported) -> None:

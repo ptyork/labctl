@@ -12,13 +12,13 @@ from click.testing import CliRunner
 from conftest import MakeRepo, git
 
 from labctl import collect as collect_module
+from labctl import planning
 from labctl.apply import ApplyError
 from labctl.bundle import Desired
-from labctl.cli import cli, git_sync, render
+from labctl.cli import cli, git_sync
 from labctl.cli.commands import plan as plan_module
 from labctl.collect import collect
 from labctl.envfile import CompiledEnv
-from labctl.planner import Plan
 from labctl.repo import ConfigRepo, RepoError
 from labctl.settings import LAB_CONFIG_ENV, Secrets, Settings
 from labctl.state import NodeState, Scope, Service
@@ -104,7 +104,7 @@ def test_apply_stops_when_the_lab_config_changed_since_the_plan(
     options = plan_module.Options((), False, (), False)
 
     def apply(tree: str, base: str) -> None:
-        planned = plan_module.Planned(Plan(), [], [], None, tree=tree, base=base)
+        planned = plan_module.Planned(tree=tree, base=base)
         plan_module._apply(settings, Scope(), Secrets(), options, planned, ["cirdan"], 5, repo)
 
     with pytest.raises(ApplyError, match="HEAD moved from 0000000 to"):
@@ -141,10 +141,10 @@ def test_remote_storage_newly_shared_between_nodes_is_pointed_out() -> None:
     plex, tautulli = Service("plex", remote=nas), Service("tautulli", remote=nas)
     before = {"frodo": NodeState.of("frodo", plex), "bilbo": NodeState.of("bilbo")}
     after = {"frodo": NodeState.of("frodo", plex), "bilbo": NodeState.of("bilbo", tautulli)}
-    (note,) = render.remote_sharing(after, before)
+    (note,) = planning.remote_sharing(after, before)
     assert note.startswith("nfs 10.0.0.5:/export is mounted on 2 nodes: bilbo (tautulli); frodo")
     # Already shared before this plan: nothing new to say.
-    assert render.remote_sharing(after, after) == []
+    assert planning.remote_sharing(after, after) == []
 
 
 @pytest.fixture
@@ -245,7 +245,7 @@ def test_detailed_exitcode(
     def collected(*args: Any, **kwargs: Any) -> Iterator[None]:
         yield None
 
-    planned = plan_module.Planned(Plan(), reasons, [], None, works=works)
+    planned = plan_module.Planned(reasons=tuple(reasons), works=works)
     monkeypatch.setattr(plan_module, "collect", collected)
     monkeypatch.setattr(plan_module, "_plan_and_render", lambda *args, **kwargs: planned)
     code, output = run("plan", *(["--detailed-exitcode"] if flag else []))

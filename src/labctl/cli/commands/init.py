@@ -11,7 +11,7 @@ import click
 from rich.markup import escape
 
 from labctl.cli import menu
-from labctl.cli.commands.settings import save_setting
+from labctl.cli.common import save_setting
 from labctl.click import DebugOptions
 from labctl.console import console
 from labctl.repo import ConfigRepo, RepoError

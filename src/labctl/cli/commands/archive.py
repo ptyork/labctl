@@ -10,7 +10,6 @@ from typing import Any
 import click
 from rich.markup import escape
 
-from labctl.apply import ApplyError, Node
 from labctl.archive import (
     FAILED,
     FILES,
@@ -24,17 +23,16 @@ from labctl.archive import (
     read_archive,
     select,
 )
-from labctl.checks import human_size
-from labctl.cli import menu
-from labctl.cli.commands.node import services_option, target_nodes
-from labctl.cli.commands.settings import load_settings
+from labctl.cli.common import confirm_or_yes, load_settings, services_option, target_nodes
 from labctl.click import AliasedGroup, DebugOptions
 from labctl.compose import ComposeError
 from labctl.console import console
+from labctl.node import Node, NodeError
 from labctl.remote import Remote, RemoteError, node_remote
 from labctl.settings import SettingsError
+from labctl.text import human_size
 
-_FAILURES = (ApplyError, ComposeError, RemoteError, SettingsError)
+_FAILURES = (NodeError, ComposeError, RemoteError, SettingsError)
 
 targets_argument = click.argument("targets", nargs=-1, required=True, metavar="NODE...|all")
 
@@ -124,7 +122,7 @@ def prune_cmd(
                 f"keep {len(all_entries - going)}[/]"
             )
             if not dry_run:
-                _confirm(yes)
+                confirm_or_yes("Delete these entries?", yes, "Not deleted")
                 failed += _delete(nodes, archives, doomed)
     finally:
         Remote.close_all([*nodes, *failed])
@@ -219,16 +217,6 @@ def _row(group: Group, entry: Entry) -> list[str]:
     if group.kind == FILES:
         return [entry.name, entry.stamp, size]
     return [entry.stamp, entry.reason, size]
-
-
-def _confirm(yes: bool) -> None:
-    if yes:
-        return
-    if not sys.stdin.isatty():
-        raise click.ClickException("Confirm in a terminal, or pass --yes")
-    console.print()
-    if not menu.confirm("Delete these entries?"):
-        raise click.ClickException("Not deleted")
 
 
 def _delete(

@@ -62,41 +62,34 @@ from typing import Any
 
 from rich.markup import escape
 
-from labctl.bundle import Desired, stack_args, top_level
-from labctl.checks import archive_name, key_label, move_paths
-from labctl.collect import (
+from labctl import docker
+from labctl.bundle import Desired, top_level
+from labctl.collect import Collected, make_record
+from labctl.layout import (
+    ARCHIVE_DIR,
     FILES_ARCHIVE,
     HOME_POINTER,
-    LOCK,
     MANAGED,
     RECORD,
-    Collected,
-    make_record,
+    SIDECAR,
+    archive_name,
 )
-from labctl.compose import ARCHIVE_DIR
-from labctl.moves import VOLUME, Move
+from labctl.moves import VOLUME, Move, move_paths
+from labctl.node import Node, NodeError
 from labctl.planner import Migrate, Plan, Remove, Restore, archived_keys
 from labctl.progress import Progress, Step
-from labctl.remote import MARK, Remote, RemoteError, execute, node_remote, relay
+from labctl.remote import node_remote, relay
 from labctl.repo import tag_name
-from labctl.restore import SIDECAR
 from labctl.runtime import NodeRuntime
-from labctl.settings import Settings
-from labctl.stack import (
-    SNAPSHOT_COMMAND,
-    Snapshot,
-    compose_command,
-    container_changes,
-    not_up_again,
-    ps_rows,
-    snapshot,
-)
+from labctl.stack import Snapshot, container_changes, not_up_again, ps_rows
 from labctl.state import (
     NodeState,
     Scope,
     Service,
     Stack,
     is_volume,
+    key_label,
+    mount_spec,
     under,
     volume_key,
     volume_name,
@@ -131,37 +124,8 @@ done
 # (label, action) for each change made so far, undone in reverse on failure.
 Undo = list[tuple[str, Callable[[], object]]]
 
-# Runs file work on a node as root (GNU tar and coreutils). Pinned by digest (multi-arch index).
-HELPER = (
-    "debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3"
-)
 
-# In the helper: $1 to $2 when one filesystem holds both (a rename); else it only says
-# "elsewhere". $2's parents are created.
-_MOVE = """\
-set -e
-mkdir -p "$(dirname "$2")"
-if [ "$(stat -c %d "$1")" != "$(stat -c %d "$(dirname "$2")")" ]; then echo elsewhere; exit 0; fi
-mv -T -- "$1" "$2"
-"""
-
-# In the helper, on /x: missing, empty (a directory Docker made for a missing bind source) or data.
-_STATE = """\
-p="/x/$1"
-if [ ! -e "$p" ] && [ ! -L "$p" ]; then echo missing
-elif [ -d "$p" ] && [ -z "$(ls -A "$p")" ]; then echo empty
-else echo data; fi
-"""
-
-# In the helper, on /x: checksums of every file under the given paths, sorted.
-_SUMS = 'cd /x && find "$@" -type f -exec sha256sum {} + | sort -k2'
-# The same for everything in /x, relative to it.
-_RELATIVE_SUMS = "cd /x && find . -type f -exec sha256sum {} + | sort -k2"
-
-_TAR = ["--numeric-owner", "--xattrs", "--acls", "--sparse"]
-
-
-class ApplyError(Exception):
+class ApplyError(NodeError):
     pass
 
 
@@ -233,15 +197,14 @@ def node_work(plan: Plan, collected: Collected, scope: Scope) -> list[NodeWork]:
         ApplyError:
             A migrate and a move on one node (one per apply).
     """
-    drifted = {drift.node for drift in collected.drift}
-    reports = {report.node: report.source for report in collected.reports}
     moved = {move.node for move in plan.moves}
     work = []
-    for node, desired in sorted(collected.desired.items()):
-        recorded = collected.recorded.get(node)
+    for node, view in sorted(collected.nodes.items()):
+        desired, recorded = view.desired, view.recorded
         if not scope.in_scope(node) or recorded is None:
             continue
-        on_node = collected.node_files.get(node, {})
+        on_node = view.on_node.files if view.on_node else {}
+        names = view.on_node.names if view.on_node else {}
         ops = [op for op in plan.operations if node in op.nodes]
         migrates = [op for op in ops if isinstance(op, Migrate)]
         if migrates and node in moved:
@@ -251,23 +214,16 @@ def node_work(plan: Plan, collected: Collected, scope: Scope) -> list[NodeWork]:
             for move, now, new in move_paths(plan.moves)
             if move.node == node and not move.carried
         )
-        present = {
-            name for name, kind in collected.node_names.get(node, {}).items() if kind != "data"
-        } | set(top_level(on_node))
+        present = {name for name, kind in names.items() if kind != "data"} | set(top_level(on_node))
         discard = tuple(sorted(present - set(desired.top_level)))
-        trash = tuple(
-            name for name in collected.gone.get(node, ()) if name not in desired.state.stacks
-        )
+        trash = tuple(name for name in view.gone if name not in desired.state.stacks)
         changed = (
-            dict(on_node) != desired.files
-            or reports.get(node) != "node"
-            or bool(discard)
-            or bool(trash)
+            dict(on_node) != desired.files or view.source != "node" or bool(discard) or bool(trash)
         )
         record_only = not (ops or moves or changed)
-        if record_only and node not in collected.untracked:
+        if record_only and not view.untracked:
             continue
-        old_dirs = collected.recorded_dirs.get(node, desired.dirs)
+        old_dirs = view.recorded_dirs or desired.dirs
         archive = [(key, "removed") for op in ops if isinstance(op, Remove) for key in op.archive]
         archive += [(key, "migrated") for op in migrates if op.source == node for key in op.archive]
         archive += [(move.old, "renamed") for move, _, _ in moves if move.kind == VOLUME]
@@ -278,13 +234,13 @@ def node_work(plan: Plan, collected: Collected, scope: Scope) -> list[NodeWork]:
                 old_home=old_dirs.deploy_dir,
                 old_appdata=old_dirs.appdata_dir,
                 old_stacks=tuple(recorded.stacks.values()),
-                old_projects=collected.projects.get(node, frozenset()),
+                old_projects=frozenset(view.on_node.projects if view.on_node else ()),
                 old_stack_of={name: s.stack for name, s in recorded.services.items()},
                 moves=moves,
                 archive=tuple(archive),
                 replace=tuple(sorted(present | set(desired.top_level))),
                 discard=discard,
-                keep_drift=node in drifted,
+                keep_drift=bool(view.drift),
                 record_only=record_only,
                 old_services=dict(recorded.services),
                 trash=trash,
@@ -293,255 +249,16 @@ def node_work(plan: Plan, collected: Collected, scope: Scope) -> list[NodeWork]:
     return work
 
 
-class Node:
-    """The commands apply runs on one node. Every one raises ApplyError when it fails."""
-
-    def __init__(self, remote: Remote) -> None:
-        self.remote = remote
-        self.name = remote.host
-        # Directories moved to another filesystem: copied, and deleted once the apply succeeded.
-        self.moved_away: list[str] = []
-
-    def run(self, *args: str, cwd: str = "/") -> str:
-        result = execute(args, cwd, self.remote)
-        if result.code:
-            raise ApplyError(f"{self.name}: {' '.join(args)}: {result.stderr.strip()}")
-        return result.stdout
-
-    def snapshot(self) -> Snapshot:
-        """The node's compose containers now."""
-        return snapshot(self.run(*SNAPSHOT_COMMAND))
-
-    def script(self, script: str, *args: str) -> None:
-        self.run("sh", "-c", script, "sh", *args)
-
-    def compose(
-        self, home: str, stack: Stack, *args: str, watch: Callable[[str], None] | None = None
-    ) -> None:
-        """A compose command. Its output is read, line by line (to ``watch``), and shown only when
-        it fails; with debug logging it goes straight to the terminal."""
-        if logging.getLogger().isEnabledFor(logging.DEBUG):
-            if self.remote.run(compose_command(home, stack, *args)):
-                raise ApplyError(
-                    f"{self.name}: docker compose {' '.join(args)} failed ({stack.name})"
-                )
-            return
-        proc = self.remote.stream(compose_command(home, stack, *args, progress="plain"))
-        assert proc.stdout is not None
-        lines = []
-        for raw in proc.stdout:
-            line = raw.strip()
-            if line:
-                lines.append(line)
-                if watch is not None:
-                    watch(line)
-        if proc.wait():
-            shown = "\n".join(f"    {line}" for line in lines[-20:])
-            raise ApplyError(
-                f"{self.name}: docker compose {' '.join(args)} failed ({stack.name}):\n{shown}"
-            )
-
-    def upload(self, local: Path, dest: str) -> None:
-        self.remote.upload(local, dest)
-
-    def exists(self, path: str) -> bool:
-        return execute(["test", "-e", path], "/", self.remote).code == 0
-
-    def helper(self, root: str, script: str, *args: str, read_only: bool = False) -> str:
-        """A script in the helper container (as root), with ``root`` mounted at /x."""
-        mount = f"{root}:/x{':ro' if read_only else ''}"
-        return self.run(
-            "docker", "run", "--rm", "-v", mount, HELPER, "sh", "-c", script, "sh", *args
-        )
-
-    def move(self, now: str, new: str) -> Callable[[], object]:
-        """
-        Move a directory (as root: app data is often root-owned). Parents of ``new`` are created.
-
-        On one filesystem it is a rename. To another, it is copied and checked, and ``now`` stays
-        until the apply has succeeded (``delete_moved_away``), so undoing only drops the copy.
-
-        Args:
-            now (str):
-                The directory.
-            new (str):
-                Where it goes (nothing there yet).
-
-        Returns:
-            Callable[[], object]:
-                What undoes the move.
-
-        Raises:
-            ApplyError:
-                It failed, or the copy differs from the original (the copy is removed).
-        """
-        root = posixpath.commonpath([now, new])
-        inside = [f"/x/{posixpath.relpath(path, root)}" for path in (now, new)]
-        if self.helper(root, _MOVE, *inside).strip() != "elsewhere":
-            return partial(self.move, new, now)
-        logger.debug(
-            "%s: %s and %s are on different filesystems: copy and check", self.name, now, new
-        )
-        if root in (now, new):
-            raise ApplyError(f"{self.name}: cannot move {now} to {new}: one is inside the other")
-        self.copy(now, new)
-        if self.sums(now) != self.sums(new):
-            self.remove(new)
-            raise ApplyError(f"{self.name}: the copy of {now} at {new} differs from the original")
-        self.moved_away.append(now)
-        return partial(self._drop_copy, now, new)
-
-    def _drop_copy(self, now: str, new: str) -> None:
-        self.remove(new)
-        self.moved_away.remove(now)
-
-    def remove(self, path: str) -> None:
-        """Delete a directory (as root)."""
-        folder, name = posixpath.split(path)
-        self.helper(folder, 'rm -rf -- "/x/$1"', name)
-
-    def delete_moved_away(self) -> list[str]:
-        """Delete the originals of the directories copied to another filesystem. Returns the
-        problems (the apply has succeeded: they are only reported)."""
-        problems = []
-        for path in self.moved_away:
-            try:
-                self.remove(path)
-            except ApplyError as exc:
-                problems.append(f"{path} was copied, but is still there: {exc}")
-        self.moved_away = []
-        return problems
-
-    def data_state(self, appdata: str, key: str) -> str:
-        """ "missing", "empty" or "data" for APPDATA_DIR/key."""
-        return self.helper(appdata, _STATE, key).strip()
-
-    def checksums(self, root: str, paths: list[str]) -> str:
-        return self.helper(root, _SUMS, *paths, read_only=True)
-
-    # A data "spec" is what docker -v takes: a host directory, or a volume's name. Mounting a
-    # volume that does not exist creates it, so a source volume is checked first.
-
-    def sums(self, spec: str) -> str:
-        """Checksums of every file in a directory or volume, relative to it."""
-        return self.helper(spec, _RELATIVE_SUMS, read_only=True)
-
-    def copy(self, source: str, target: str) -> None:
-        """Copy the contents of ``source`` into ``target`` (as root, ownership kept)."""
-        tar = " ".join(_TAR)
-        self.run(
-            "docker", "run", "--rm", "-v", f"{source}:/s:ro", "-v", f"{target}:/d", HELPER,
-            "sh", "-c", f"tar -C /s {tar} -cpf - . | tar -C /d {tar} -xpf -",
-        )  # fmt: skip
-
-    def has_data(self, spec: str) -> bool:
-        return self.helper(spec, '[ -n "$(ls -A /x)" ] && echo data || true').strip() == "data"
-
-    def volume_exists(self, name: str) -> bool:
-        return execute(["docker", "volume", "inspect", name], "/", self.remote).code == 0
-
-    def volume_labels(self, name: str) -> dict[str, str]:
-        out = self.run("docker", "volume", "inspect", "--format", "{{json .Labels}}", name)
-        return {str(k): str(v) for k, v in (json.loads(out or "null") or {}).items()}
-
-    def volume_create(self, name: str, labels: Mapping[str, str]) -> None:
-        flags = [arg for k, v in sorted(labels.items()) for arg in ("--label", f"{k}={v}")]
-        self.run("docker", "volume", "create", *flags, name)
-
-    def volume_remove(self, name: str) -> None:
-        self.run("docker", "volume", "rm", name)
-
-    def volume_users(self, name: str) -> list[str]:
-        """Containers (any state) that mount the volume."""
-        out = self.run(
-            "docker", "ps", "--all", "--filter", f"volume={name}", "--format", "{{.Names}}"
-        )
-        return out.split()
-
-    def log(self, step: str) -> None:
-        """Note a step in the lock, so an interrupted run shows how far it got."""
-        self.script(f'echo "$1" >> "$HOME/{LOCK}/steps"', step)
-
-
-def mount_spec(root: str, key: str) -> str:
-    """A data key as docker -v takes it: the volume's name, or the directory under ``root``."""
-    return volume_name(key) if is_volume(key) else f"{root}/{key}"
-
-
 def compose_labels(state: NodeState, key: str) -> dict[str, str]:
     """The labels compose looks for on a volume it is to use as its own (none: external)."""
     volume = state.volumes.get(volume_name(key))
     if volume is None or volume.external:
         return {}
-    return {"com.docker.compose.project": volume.stack, "com.docker.compose.volume": volume.key}
-
-
-def lock(remote: Remote, owner: str) -> None:
-    """
-    Take the node's apply lock (``~/.labctl-lock``), naming its owner.
-
-    Args:
-        remote (Remote):
-            The node's shell.
-        owner (str):
-            Who holds it and since when, shown to the next apply.
-
-    Raises:
-        ApplyError:
-            The lock is held: another apply is running, or one was interrupted.
-    """
-    script = f'mkdir "$HOME/{LOCK}" && printf "%s\\n" "$1" > "$HOME/{LOCK}/owner"'
-    if execute(["sh", "-c", script, "sh", owner], "/", remote).code:
-        raise ApplyError(
-            f"{remote.host}: ~/{LOCK} exists: another apply is running, or one was interrupted "
-            f"(see `labctl plan {remote.host}`; once nothing runs there, `labctl unlock "
-            f"{remote.host}`)"
-        )
-
-
-def unlock(remote: Remote) -> None:
-    execute(["sh", "-c", f'rm -rf "$HOME/{LOCK}"'], "/", remote)
-
-
-@dataclass(frozen=True)
-class HeldLock:
-    """A node's apply lock: who took it and when, and the steps its run recorded."""
-
-    owner: str
-    steps: tuple[str, ...]
-
-
-def read_lock(remote: Remote) -> HeldLock | None:
-    """
-    The node's apply lock, or None when it is not locked.
-
-    Args:
-        remote (Remote):
-            The node's shell.
-
-    Raises:
-        RemoteError:
-            The node cannot be reached, or the lock cannot be read.
-    """
-    script = (
-        f'[ -d "$HOME/{LOCK}" ] || exit 3; '
-        f'cat "$HOME/{LOCK}/owner" 2>/dev/null; echo {MARK}; cat "$HOME/{LOCK}/steps" 2>/dev/null; '
-        "exit 0"
-    )
-    result = execute(["sh", "-c", script], "/", remote)
-    if result.code == 3:
-        return None
-    if result.code:
-        raise RemoteError(f"{remote.host}: cannot read ~/{LOCK}: {result.stderr.strip()}")
-    owner, _, steps = result.stdout.partition(f"{MARK}\n")
-    return HeldLock(
-        owner.strip() or "unknown", tuple(line for line in steps.splitlines() if line.strip())
-    )
+    return docker.compose_volume_labels(volume.stack, volume.key)
 
 
 @dataclass
 class Executor:
-    settings: Settings
     say: Callable[[str], None]
     wait: int = 120  # seconds for services to come up
     replace_stale: bool = False  # archive data already at a migrate's target
@@ -699,22 +416,22 @@ class Executor:
             node.log(f"stop {name}")
             self.steps.note(f"{work.node}: stop {name}")
             if restart != "no":
-                node.run("docker", "update", "--restart=no", name)
+                node.run(*docker.set_restart(name, "no"))
                 undo.append(
                     (
                         f"restart policy of {name} back to {restart}",
-                        partial(node.run, "docker", "update", f"--restart={restart}", name),
+                        partial(node.run, *docker.set_restart(name, restart)),
                     )
                 )
             if stop.container.up:
-                node.run("docker", "stop", name)
-                undo.append((f"start {name}", partial(node.run, "docker", "start", name)))
+                node.run(*docker.stop(name))
+                undo.append((f"start {name}", partial(node.run, *docker.start(name))))
             if stop.rename:
                 aside = f"{name}-labctl-{self.stamp}"
                 self.steps.note(f"{work.node}: rename {name} → {aside}")
-                node.run("docker", "rename", name, aside)
+                node.run(*docker.rename(name, aside))
                 undo.append(
-                    (f"rename {aside} back", partial(node.run, "docker", "rename", aside, name))
+                    (f"rename {aside} back", partial(node.run, *docker.rename(aside, name)))
                 )
 
     def _report_not_started(self, work: NodeWork) -> None:
@@ -790,37 +507,9 @@ class Executor:
         if keys:
             relay(
                 source.remote,
-                [
-                    "docker",
-                    "run",
-                    "--rm",
-                    "-v",
-                    f"{src_root}:/src:ro",
-                    HELPER,
-                    "tar",
-                    "-C",
-                    "/src",
-                    *_TAR,
-                    "-cpf",
-                    "-",
-                    "--",
-                    *keys,
-                ],
+                docker.tar_out(src_root, *keys),
                 target.remote,
-                [
-                    "docker",
-                    "run",
-                    "--rm",
-                    "-i",
-                    "-v",
-                    f"{dst_root}:/dst",
-                    HELPER,
-                    "sh",
-                    "-c",
-                    'mkdir -p "/dst/$1" && tar -C "/dst/$1" ' + " ".join(_TAR) + " -xpf -",
-                    "sh",
-                    staging,
-                ],
+                docker.tar_in(dst_root, staging),
             )
             sent = source.checksums(src_root, keys)
             received = target.checksums(f"{dst_root}/{staging}", keys)
@@ -845,22 +534,13 @@ class Executor:
                     target, dst_root, new_key, compose_labels(dst.desired.state, new_key), undo, dst
                 )
                 dest = volume_name(new_key)
-                write = ["tar", "-C", "/dst", *_TAR, "-xpf", "-"]
-                mount = f"{dest}:/dst"
+                write = docker.tar_in(dest)
             else:
                 name = archive_name(key)
                 dest = f"{dst_root}/{staging}/{name}"
-                extract = 'mkdir -p "/dst/$1" && tar -C "/dst/$1" ' + " ".join(_TAR) + " -xpf -"
-                write = ["sh", "-c", extract, "sh", f"{staging}/{name}"]
-                mount = f"{dst_root}:/dst"
+                write = docker.tar_in(dst_root, f"{staging}/{name}")
                 staged.append((name, new_key))
-            relay(
-                source.remote,
-                ["docker", "run", "--rm", "-v", f"{spec}:/src:ro", HELPER, "tar", "-C", "/src",
-                 *_TAR, "-cpf", "-", "."],
-                target.remote,
-                ["docker", "run", "--rm", "-i", "-v", mount, HELPER, *write],
-            )  # fmt: skip
+            relay(source.remote, docker.tar_out(spec), target.remote, write)
             sent = source.sums(spec)
             if sent != target.sums(dest):
                 raise ApplyError(
@@ -1010,14 +690,7 @@ class Executor:
             if op.source == op.node:
                 target.copy(archived, spec)
             else:
-                relay(
-                    source.remote,
-                    ["docker", "run", "--rm", "-v", f"{archived}:/src:ro", HELPER, "tar", "-C",
-                     "/src", *_TAR, "-cpf", "-", "."],
-                    target.remote,
-                    ["docker", "run", "--rm", "-i", "-v", f"{spec}:/dst", HELPER, "tar", "-C",
-                     "/dst", *_TAR, "-xpf", "-"],
-                )  # fmt: skip
+                relay(source.remote, docker.tar_out(archived), target.remote, docker.tar_in(spec))
             sent = source.sums(archived)
             if sent != target.sums(spec):
                 raise ApplyError(f"restore {label}: the copy of {entry} differs from the archive")
@@ -1168,7 +841,7 @@ class Executor:
             node.log(f"up {stack.name}")
             if stack.name not in had_containers:  # a new stack goes again; others are restored
                 undo.append((f"down {stack.name}", partial(node.compose, home, stack, "down")))
-            services = [s for s, svc in desired.state.services.items() if svc.stack == stack.name]
+            services = desired.state.services_in(stack.name)
             held = [service for service in services if service in deferred]
             with self.steps.step(work.node, f"up {stack.name}") as step:
                 if not held:
@@ -1225,7 +898,8 @@ class Executor:
         while True:
             pending, failed = [], []
             ps = node.run(
-                "docker", "compose", *stack_args(stack), "ps", "--all", "--format", "json", cwd=home
+                *docker.compose(*docker.stack_args(stack), "ps", "--all", "--format", "json"),
+                cwd=home,
             )
             rows: dict[str, dict[str, Any]] = {row["Service"]: row for row in ps_rows(ps)}
             for service in expected:

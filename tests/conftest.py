@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -9,6 +10,10 @@ import pytest
 
 from labctl.remote import Unreachable
 from labctl.repo import ConfigRepo
+from labctl.settings import Settings
+
+# For tests that resolve real compose files.
+needs_docker = pytest.mark.skipif(shutil.which("docker") is None, reason="needs the docker CLI")
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -40,6 +45,11 @@ def make_repo() -> MakeRepo:
         return ConfigRepo.open(root)
 
     return make
+
+
+@pytest.fixture
+def settings(tmp_path: Path) -> Settings:
+    return Settings(lab_config=tmp_path / "repo", config_dir=tmp_path / "config")
 
 
 @pytest.fixture(autouse=True)

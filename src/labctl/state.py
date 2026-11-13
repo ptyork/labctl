@@ -135,9 +135,9 @@ class NodeState:
             networks={network.name: network for network in networks},
         )
 
-    @property
-    def multi_stack(self) -> bool:
-        return len(self.stacks) > 1
+    def services_in(self, stack: str) -> list[str]:
+        """The names of the stack's services, in name order."""
+        return sorted(name for name, service in self.services.items() if service.stack == stack)
 
 
 @dataclass(frozen=True)
@@ -170,10 +170,6 @@ class Scope:
             )
         return cls(skipped=frozenset(nodes - named), named=frozenset(named))
 
-    def without(self, nodes: Iterable[str]) -> Scope:
-        """This scope with ``nodes`` skipped too."""
-        return Scope(self.skipped | frozenset(nodes), self.named)
-
     def in_scope(self, node: str) -> bool:
         return node not in self.skipped
 
@@ -188,19 +184,19 @@ class Scope:
 # A data key is a path relative to APPDATA_DIR ("plexms/config") or a named volume by its real
 # name ("volume:homelab-frodo_pgdata"). The path helpers also work on absolute paths.
 
-VOLUME = "volume:"
+_VOLUME_PREFIX = "volume:"
 
 
 def is_volume(key: str) -> bool:
-    return key.startswith(VOLUME)
+    return key.startswith(_VOLUME_PREFIX)
 
 
 def volume_key(name: str) -> str:
-    return VOLUME + name
+    return _VOLUME_PREFIX + name
 
 
 def volume_name(key: str) -> str:
-    return key.removeprefix(VOLUME)
+    return key.removeprefix(_VOLUME_PREFIX)
 
 
 def under(path: str, parent: str) -> bool:
@@ -213,3 +209,18 @@ def overlaps(a: str, b: str) -> bool:
     if is_volume(a) or is_volume(b):
         return a == b
     return a == b or under(a, b) or under(b, a)
+
+
+def key_label(key: str) -> str:
+    """A data key as the plan shows it: ``plex/`` or ``volume homelab-frodo_pgdata``."""
+    return f"volume {volume_name(key)}" if is_volume(key) else f"{key}/"
+
+
+def data_spec(root: str, key: str) -> str:
+    """What a probe takes for a data key: the absolute path under ``root``, or the volume key."""
+    return key if is_volume(key) else str(PurePosixPath(root) / key)
+
+
+def mount_spec(root: str, key: str) -> str:
+    """A data key as docker -v takes it: the directory under ``root``, or the volume's name."""
+    return volume_name(key) if is_volume(key) else f"{root}/{key}"

@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import sys
 from datetime import datetime
 from typing import Any
 
 import click
 from rich.markup import escape
 
-from labctl.cli import menu
-from labctl.cli.commands.settings import load_settings
+from labctl.cli.common import confirm_or_yes, load_settings
 from labctl.click import DebugOptions
 from labctl.console import console
 from labctl.repo import ConfigRepo, RepoError
@@ -47,12 +45,7 @@ def discard_cmd(dry_run: bool, yes: bool, **kwargs: Any) -> None:
         console.print(f"  {what:<8} {escape(change.path)}", highlight=False)
     if dry_run:
         return
-    if not yes:
-        if not sys.stdin.isatty():
-            raise click.ClickException("Confirm in a terminal, or pass --yes")
-        console.print()
-        if not menu.confirm("Discard these changes?"):
-            raise click.ClickException("Not discarded")
+    confirm_or_yes("Discard these changes?", yes, "Not discarded")
     name = f"labctl discard {datetime.now().strftime('%Y%m%d-%H%M%S')}"
     try:
         repo.stash(name)

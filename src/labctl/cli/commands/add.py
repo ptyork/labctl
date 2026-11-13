@@ -27,8 +27,8 @@ from labctl.adopt import (
 from labctl.bundle import REQUIRED_VARS, check_dirs
 from labctl.changes import SECRET_NAME
 from labctl.cli import menu
-from labctl.cli.commands.settings import load_settings
 from labctl.cli.commands.validate import check_node
+from labctl.cli.common import is_terminal, load_settings
 from labctl.click import DebugOptions
 from labctl.compose import ComposeError
 from labctl.console import console
@@ -92,7 +92,7 @@ def add_cmd(
             if not check_node(settings, name, Secrets.load(settings.secrets_file), Path(tmp)):
                 sys.exit(1)
         return
-    if not _tty() and not (deploy_dir and appdata_dir):
+    if not is_terminal() and not (deploy_dir and appdata_dir):
         raise click.ClickException(
             "No terminal to ask in: pass --deploy-dir and --appdata-dir (labctl does not guess "
             "where the stacks or the data go)"
@@ -103,7 +103,7 @@ def add_cmd(
     try:
         host = _check_node(name, remote)
         usable = host is not None and host.docker and bool(host.compose)
-        if not usable and _tty():
+        if not usable and is_terminal():
             # Nothing to offer or import: usually a typo, or a node not set up yet.
             answer = menu.confirm(f"Add {name} anyway?", default=False)
             if not answer:
@@ -159,7 +159,7 @@ def add_cmd(
                 _leave_to_the_root(settings.lab_config, imported)
             env = dict(imported.env) if imported is not None and stacks else {}
             looks = [key for key, value in env.items() if value and SECRET_NAME.search(key)]
-            secret = _ask_secrets(looks) if _tty() else []
+            secret = _ask_secrets(looks) if is_terminal() else []
             _write(settings.nodes_dir, others, name, deploy, appdata, imported if stacks else None)
             lines = env_lines(env, _shared(settings.nodes_dir, name), secret, REQUIRED_VARS)
             if lines:
@@ -198,7 +198,7 @@ def _restore(
 ) -> bool:
     """Bring the node's folder back from ``past`` (asked in a terminal); False: add it anew."""
     applied, path = past
-    if _tty():
+    if is_terminal():
         answer = menu.confirm(
             f"{folder.name} was in the lab config at {applied.tag}. Restore it from there?",
             default=True,
@@ -376,7 +376,3 @@ def _check_node(node: str, remote: Remote) -> Host | None:
     elif not host.compose:
         console.print(f"[yellow]![/] {escape(node)}: no docker compose there")
     return host
-
-
-def _tty() -> bool:
-    return sys.stdin.isatty() and sys.stdout.isatty()

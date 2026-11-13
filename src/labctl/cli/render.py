@@ -2,24 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 from craftable import get_table
 from rich.markup import escape
 
 from labctl.bundle import NO_SERVICES
 from labctl.changes import definition_changes, network_changes
-from labctl.checks import (
-    Finding,
-    Level,
-    PathInfo,
-    archive_path,
-    human_size,
-    key_label,
-    move_paths,
-)
-from labctl.collect import FILES_ARCHIVE, Collected
+from labctl.checks import Finding, Level, PathInfo
+from labctl.collect import Collected
 from labctl.console import console
+from labctl.layout import FILES_ARCHIVE, archive_path
 from labctl.moves import (
     DATA,
     VOLUME,
@@ -29,6 +22,7 @@ from labctl.moves import (
     MoveNotice,
     NotRenamed,
     UnevenRename,
+    move_paths,
     where_now,
 )
 from labctl.planner import (
@@ -45,12 +39,58 @@ from labctl.planner import (
     UnknownNode,
     Update,
 )
+from labctl.planning import Planned, gone
 from labctl.ports import PortMove
 from labctl.runtime import DEFER, Conflict, Port, Runtime, TakeDown
-from labctl.state import NodeState, Scope, Service, is_volume
+from labctl.state import NodeState, Scope, Service, is_volume, key_label
+from labctl.text import human_size
 
 
-def render_repo_notices(notices: list[str]) -> None:
+def render_plan(collected: Collected, planned: Planned, verbose: bool) -> None:
+    """Everything below the list of nodes: each section only when it has something, then the
+    summary line."""
+    if collected.errors:
+        console.print("\n[bold red]Cannot plan:[/]")
+        for error in collected.errors:
+            console.print(f"  [red]✗[/] {escape(error)}")
+        return
+    scope, plan, runtime, restores = (
+        collected.scope,
+        planned.plan,
+        planned.runtime,
+        planned.restores,
+    )
+    render_problems(plan.problems, planned.placeholders, planned.lab_problems)
+    render_drift(collected)
+    files_changed = render_files(collected, scope, verbose)
+    render_stacks(plan, collected, runtime, planned.work_nodes, planned.probes, verbose)
+    render_moves(plan, planned.probes, verbose)
+    render_gone(collected)
+    for note in restores.notes:
+        console.print(f"  [cyan]i[/] {escape(note)}")
+    for error in restores.errors:
+        console.print(f"  [red]✗[/] {escape(error)}")
+    render_notices(plan.notices)
+    if planned.shared:
+        console.print("\n[bold]Remote storage[/]")
+        for note in planned.shared:
+            console.print(f"  [yellow]![/] {escape(note)}")
+    render_repo_notices(planned.repo_notices)
+    render_findings(planned.findings)
+    render_runtime(runtime)
+    render_port_moves(planned.port_moves, "Published ports that change")
+    if planned.works is None:
+        console.print(f"\n[red]✗[/] {escape(planned.work_error)}")
+    render_summary(plan, files_changed, planned.reasons, runtime.conflicts)
+    at = "the commit applied" if collected.tree else "HEAD"
+    for work in planned.works or ():
+        if work.record_only:
+            console.print(
+                f"  {work.node}: nothing to change; apply records {at} there, and tags it"
+            )
+
+
+def render_repo_notices(notices: Sequence[str]) -> None:
     if not notices:
         return
     console.print("\n[bold]Repo[/] (apply asks first)")
@@ -66,23 +106,25 @@ def render_nodes(collected: Collected) -> None:
     console.print(f"Nodes included:  {', '.join(included) or 'none'}")
     if skipped:
         console.print(f"Nodes skipped:   {', '.join(skipped)}")
-    for node in sorted(collected.retiring):
+    for node in sorted(node for node, view in collected.nodes.items() if view.retiring):
         console.print(
             f"[yellow]![/] {node} is being retired (nodes/{node} is gone): labctl removes "
             "everything it put there",
             highlight=False,
         )
-    for node, why in sorted(collected.unread.items()):
+    for node, view in sorted(collected.nodes.items()):
+        if not view.unread:
+            continue
         console.print(
-            f"[yellow]![/] {node} not read ({escape(why)}): planned as of its last apply",
+            f"[yellow]![/] {node} not read ({escape(view.unread)}): planned as of its last apply",
             highlight=False,
         )
 
 
 def render_problems(
     problems: tuple[Problem, ...],
-    placeholders: dict[str, tuple[str, ...]],
-    lab_problems: list[str] | None = None,
+    placeholders: Mapping[str, tuple[str, ...]],
+    lab_problems: Sequence[str] = (),
 ) -> None:
     if not (problems or placeholders or lab_problems):
         return
@@ -118,15 +160,16 @@ def not_a_stack(node: str, file: str, why: str) -> str:
 
 
 def render_drift(collected: Collected) -> None:
-    if not collected.drift:
+    edited = {node: view.drift for node, view in sorted(collected.nodes.items()) if view.drift}
+    if not edited:
         return
     console.print(
         "\n[bold]Edited directly on the node[/] (apply replaces them with the repo's; the "
         f"node's copies are archived to {FILES_ARCHIVE}/node-edits-<timestamp>)"
     )
-    for drift in collected.drift:
-        for change in drift.changes:
-            console.print(f"  [yellow]![/] {drift.node}: {escape(change)}")
+    for node, changes in edited.items():
+        for change in changes:
+            console.print(f"  [yellow]![/] {node}: {escape(change)}")
 
 
 def file_changes(
@@ -155,12 +198,12 @@ def render_files(collected: Collected, scope: Scope, verbose: bool) -> int:
     """Per node, how apply makes DEPLOY_DIR match the bundle: what it adds, updates and archives.
     Returns how many nodes have changes."""
     changed = 0
-    for node in sorted(collected.desired):
-        if not scope.in_scope(node) or collected.recorded.get(node) is None:
+    for node, view in sorted(collected.nodes.items()):
+        if not scope.in_scope(node) or view.recorded is None:
             continue
-        desired = collected.desired[node]
-        names = collected.node_names.get(node, {})
-        changes = file_changes(desired.files, collected.node_files.get(node, {}))
+        desired = view.desired
+        names = view.on_node.names if view.on_node else {}
+        changes = file_changes(desired.files, view.on_node.files if view.on_node else {})
         # Names the bundle does not have and that hold no files (an empty folder, a symlink).
         for name, kind in names.items():
             label = name + ("/" if kind == "dir" else "")
@@ -192,7 +235,7 @@ def render_stacks(
     collected: Collected,
     runtime: Runtime,
     work: set[str],
-    probes: dict[str, dict[str, PathInfo]],
+    probes: Mapping[str, dict[str, PathInfo]],
     verbose: bool,
 ) -> None:
     """The stacks of the nodes included that are new, go away or change, each with what happens
@@ -452,29 +495,23 @@ def render_port_moves(moves: Sequence[PortMove], heading: str) -> None:
     )
 
 
-def render_gone(collected: Collected, scope: Scope) -> list[str]:
-    """Projects running from DEPLOY_DIR whose files are gone, on the named nodes. Returns the ones
-    apply takes down for good (no stack of the lab config has their name), for its question."""
-    lines, trash = [], []
-    for node, names in sorted(collected.gone.items()):
-        if not scope.in_scope(node) or node not in collected.desired:
-            continue
-        stacks = collected.desired[node].state.stacks
-        for name in names:
-            if name in stacks:
-                then = f"the lab config's {name} takes its containers over"
-            else:
-                then = "taken down (nothing could bring it back)"
-                trash.append(f"{node}/{name}")
-            lines.append(f"  [yellow]![/] {node}: project {escape(name)}'s files are gone → {then}")
-    if lines:
-        console.print("\n[bold]Projects whose files are gone[/]")
-        for line in lines:
-            console.print(line)
-    return trash
+def render_gone(collected: Collected) -> None:
+    """Projects running from DEPLOY_DIR whose files are gone, on the named nodes."""
+    found = gone(collected)
+    if not found:
+        return
+    console.print("\n[bold]Projects whose files are gone[/]")
+    for node, name, taken_over in found:
+        if taken_over:
+            then = f"the lab config's {name} takes its containers over"
+        else:
+            then = "taken down (nothing could bring it back)"
+        console.print(f"  [yellow]![/] {node}: project {escape(name)}'s files are gone → {then}")
 
 
-def render_moves(plan: Plan, probes: dict[str, dict[str, PathInfo]], verbose: bool = False) -> None:
+def render_moves(
+    plan: Plan, probes: Mapping[str, dict[str, PathInfo]], verbose: bool = False
+) -> None:
     if not plan.moves:
         return
     console.print("\n[bold]Moves[/] (run first, in this order; affected services restart)")
@@ -484,7 +521,7 @@ def render_moves(plan: Plan, probes: dict[str, dict[str, PathInfo]], verbose: bo
 
 def _describe_move(
     move: Move,
-    probes: dict[str, dict[str, PathInfo]],
+    probes: Mapping[str, dict[str, PathInfo]],
     source: str = "",
     target: str = "",
     verbose: bool = False,
@@ -526,7 +563,7 @@ def _describe_move(
 def _migrate_details(
     op: Migrate,
     collected: Collected,
-    probes: dict[str, dict[str, PathInfo]],
+    probes: Mapping[str, dict[str, PathInfo]],
     moves: tuple[Move, ...],
 ) -> str:
     """What a migrate copies: its data, the size, and what it leaves behind."""
@@ -584,38 +621,10 @@ def _remote_note(service: Service | None, what: str) -> str:
     return f" ({volumes}: {what})"
 
 
-def remote_sharing(
-    desired: Mapping[str, NodeState], recorded: Mapping[str, NodeState | None]
-) -> list[str]:
-    """Remote storage this plan has mounted on more nodes than before (the services on each
-    must be able to share it: a database on NFS used from two nodes is how it gets corrupted)."""
-
-    def users(states: Iterable[NodeState | None]) -> dict[str, dict[str, list[str]]]:
-        found: dict[str, dict[str, list[str]]] = {}
-        for state in states:
-            if state is None:
-                continue
-            for service in state.services.values():
-                for _, where in service.remote:
-                    found.setdefault(where, {}).setdefault(state.node, []).append(service.name)
-        return found
-
-    want, have = users(desired.values()), users(recorded.values())
-    notes = []
-    for where, nodes in sorted(want.items()):
-        if len(nodes) > 1 and not set(nodes) <= set(have.get(where, {})):
-            on = "; ".join(f"{node} ({', '.join(sorted(s))})" for node, s in sorted(nodes.items()))
-            notes.append(
-                f"{where} is mounted on {len(nodes)} nodes: {on}. Make sure what uses it can "
-                "share it (one database on NFS written from two nodes is how it gets corrupted)"
-            )
-    return notes
-
-
 def _migrate_size(
     op: Migrate,
     collected: Collected,
-    probes: dict[str, dict[str, PathInfo]],
+    probes: Mapping[str, dict[str, PathInfo]],
     moves: tuple[Move, ...],
 ) -> str:
     root = collected.desired[op.source].dirs.appdata_dir
@@ -705,7 +714,7 @@ def render_notices(notices: tuple[NotMigrated | MoveNotice | Assumed, ...]) -> N
                 )
 
 
-def render_findings(findings: list[Finding]) -> None:
+def render_findings(findings: Sequence[Finding]) -> None:
     if not findings:
         return
     console.print("\n[bold]Checks[/]")
@@ -721,7 +730,7 @@ def render_findings(findings: list[Finding]) -> None:
         )
 
 
-def render_summary(plan: Plan, files_changed: int, reasons: list[str], conflicts: int) -> None:
+def render_summary(plan: Plan, files_changed: int, reasons: Sequence[str], conflicts: int) -> None:
     counts = {
         kind: sum(isinstance(op, cls) for op in plan.operations)
         for kind, cls in (

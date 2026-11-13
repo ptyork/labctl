@@ -15,12 +15,12 @@ from rich.markup import escape
 from rich.panel import Panel
 
 from labctl.bundle import resolve_desired
-from labctl.cli.commands.settings import load_settings
+from labctl.cli.common import load_settings
 from labctl.click import DebugOptions
-from labctl.collect import HOME_POINTER
 from labctl.compose import ComposeError
 from labctl.console import console
 from labctl.envfile import EnvError, preview_env
+from labctl.layout import HOME_POINTER
 from labctl.ports import NOT_IN_CONFIG, SERVICE, Declared, PortUse, declared_ports, port_map
 from labctl.remote import MARK, Remote, RemoteError, node_remote, sections
 from labctl.repo import ConfigRepo, RepoError

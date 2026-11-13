@@ -47,6 +47,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from labctl import docker
 from labctl.bundle import (
     Desired,
     Location,
@@ -60,6 +61,7 @@ from labctl.bundle import (
 )
 from labctl.compose import ComposeError, reduce_stacks
 from labctl.envfile import EnvError, Prompt, preview_env
+from labctl.layout import HOME_POINTER, LOCK, MANAGED, RECORD
 from labctl.remote import (
     CONNECT_TIMEOUT,
     MARK,
@@ -80,15 +82,7 @@ from labctl.runtime import (
 from labctl.settings import Secrets, Settings, node_names
 from labctl.state import Dirs, NodeState, Scope, Stack
 
-RECORD_VERSION = 2  # 2: commit and tag
-RECORD = ".labctl/applied.json"
-MANAGED = ".labctl/managed"
-# Where apply puts what it removes from DEPLOY_DIR: <name>-<timestamp>.
-FILES_ARCHIVE = ".labctl/archive"
-# In the ssh user's home on the node (they do not move with DEPLOY_DIR): the lock held by a
-# running apply, and where the last apply put DEPLOY_DIR.
-LOCK = ".labctl-lock"
-HOME_POINTER = ".labctl-home"
+RECORD_VERSION = 2
 # A file listed but not read (not one apply writes): its digest in OnNode.files.
 UNREAD = "-"
 # Where the source tree is exported in the work folder (node names never start with a dot).
@@ -98,7 +92,6 @@ _RETIRED = ".retired"
 # Seconds ssh waits for a node not named: it is only looked at.
 NOT_NAMED_TIMEOUT = 2
 
-_MOUNTS = '{{range .Mounts}}{{if eq .Type "bind"}}{{println .Source}}{{end}}{{end}}'
 
 # $1: DEPLOY_DIR. Then the names whose files are hashed (with those in .labctl/managed), "--",
 # and the names that are data by the repo. Every other top-level name is listed with its kind
@@ -112,8 +105,7 @@ fi
 echo "{MARK} pointer"; cat "$HOME/{HOME_POINTER}" 2>/dev/null
 {READ_RUNTIME}
 echo "{MARK} missing"
-docker ps -a --format '{{{{.Label "com.docker.compose.project.config_files"}}}}' \\
-  </dev/null 2>/dev/null | tr ',' '\\n' | sort -u | while IFS= read -r file; do
+{docker.PROJECT_FILES} | tr ',' '\\n' | sort -u | while IFS= read -r file; do
     if [ -n "$file" ] && [ ! -e "$file" ]; then printf '%s\\n' "$file"; fi
   done
 cd "$home" 2>/dev/null || {{ echo "{MARK} nohome"; exit 0; }}
@@ -124,7 +116,7 @@ while [ $# -gt 0 ] && [ "$1" != -- ]; do hashed="$hashed$1/"; shift; done
 if [ -f {MANAGED} ]; then
   while IFS= read -r name; do hashed="$hashed$name/"; done < {MANAGED}
 fi
-mounts=$(docker ps -aq </dev/null | xargs -r docker inspect --format '{_MOUNTS}' 2>/dev/null)
+mounts=$({docker.BIND_SOURCES})
 listed=$(ls -A | while IFS= read -r name; do
   [ "$name" = .labctl ] && continue
   for data in "$@"; do [ "$data" = "$name" ] && continue 2; done
@@ -147,7 +139,7 @@ echo "{MARK} files"
   esac
 done
 echo "{MARK} projects"
-docker compose ls --all --format json 2>/dev/null </dev/null
+{docker.COMPOSE_LS} 2>/dev/null </dev/null
 """
 
 
@@ -159,15 +151,9 @@ class Record:
     dirs: Dirs
     stacks: tuple[Stack, ...]
     manifest: Mapping[str, str]  # DEPLOY_DIR-relative path -> sha256
-    commit: str = ""  # the config repo's commit applied ("": applied before git tracking)
+    commit: str = ""  # the config repo's commit applied
     tag: str = ""  # its apply tag
-    node: str = ""  # the node it was applied to ("": not said)
-
-    @property
-    def owner(self) -> str:
-        """The node this record is for: its own word, else its tag's; "" when neither says."""
-        parts = self.tag.split("/")
-        return self.node or (parts[1] if len(parts) == 3 else "")
+    node: str = ""  # the node it was applied to
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -184,17 +170,16 @@ class Record:
 
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> Record:
-        if data.get("version") not in (1, RECORD_VERSION):
+        if data.get("version") != RECORD_VERSION:
             raise ComposeError(f"unsupported {RECORD} version {data.get('version')}")
         return cls(
             data["applied_at"],
-            # docker_home: records written before DOCKER_HOME was renamed DEPLOY_DIR
-            Dirs(data.get("deploy_dir") or data["docker_home"], data["appdata_dir"]),
+            Dirs(data["deploy_dir"], data["appdata_dir"]),
             tuple(Stack(name, tuple(files)) for name, files in data["stacks"].items()),
             data["manifest"],
-            data.get("commit", ""),
-            data.get("tag", ""),
-            data.get("node", ""),
+            data["commit"],
+            data["tag"],
+            data["node"],
         )
 
 
@@ -221,57 +206,88 @@ class OnNode:
     missing: frozenset[str] = frozenset()
 
 
-@dataclass(frozen=True)
-class Drift:
-    node: str
-    changes: tuple[str, ...]
+@dataclass
+class NodeView:
+    """One node, as collected: what the lab config wants on it, and what was found there."""
 
-
-@dataclass(frozen=True)
-class NodeReport:
-    """How each node's recorded state was obtained, for the plan header."""
-
-    node: str
-    # "node" (applied by labctl), "first" (never applied: what is there now), "tag" (not read: as of
-    # its apply tag), "none" (not read, and no apply tag)
-    source: str
+    desired: Desired
+    # What runs there now: read on the node, or (not named and not read) as of its latest apply
+    # tag. None: unknown (not read and no apply tag, or it could not be collected).
+    recorded: NodeState | None = None
+    # DEPLOY_DIR and APPDATA_DIR as last applied (or found); compared with desired for moves.
+    recorded_dirs: Dirs | None = None
+    # How the recorded state was obtained: "node" (applied by labctl), "first" (never applied: what
+    # is there now), "tag" (not read: as of its apply tag), "none" (not read, and no apply tag).
+    source: str = ""
     detail: str = ""
+    # What was read on the node: its files, top-level names, projects, containers, listeners and
+    # applied.json. None: it was not read.
+    on_node: OnNode | None = None
+    # Projects with containers there whose files are gone (from DEPLOY_DIR, or into a data
+    # folder): trash.
+    gone: tuple[str, ...] = ()
+    # Edits made on the node since its last apply (named nodes only).
+    drift: tuple[str, ...] = ()
+    # Its record names a commit this clone does not have: recorded again, even with nothing to
+    # change.
+    untracked: bool = False
+    # Not named, and it could not be read (planned as of its apply tag): why.
+    unread: str = ""
+    # Applied before, its folder gone from nodes/: wanted empty.
+    retiring: bool = False
 
 
 @dataclass
 class Collected:
-    desired: dict[str, Desired]
-    recorded: dict[str, NodeState | None]
+    """Everything the planner needs: each node, and what is true of the run as a whole."""
+
+    nodes: dict[str, NodeView] = field(default_factory=dict)
     # The nodes this run may change: those named.
     scope: Scope = field(default_factory=Scope)
-    # DEPLOY_DIR and APPDATA_DIR as last applied (or found); compared with desired for moves.
-    recorded_dirs: dict[str, Dirs] = field(default_factory=dict)
-    reports: list[NodeReport] = field(default_factory=list)
-    drift: list[Drift] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)  # fatal: unreachable, unreadable
-    # The nodes not named that could not be read (planned as of their apply tag), and why.
-    unread: dict[str, str] = field(default_factory=dict)
-    # For each reachable node: its files, its top-level names, and the projects with containers.
-    node_files: dict[str, Mapping[str, str]] = field(default_factory=dict)
-    node_names: dict[str, Mapping[str, str]] = field(default_factory=dict)
-    projects: dict[str, frozenset[str]] = field(default_factory=dict)
-    # Of those, the ones whose files are gone (from DEPLOY_DIR, or into a data folder): trash.
-    gone: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    # For each node read: what runs there (see runtime.py).
-    containers: dict[str, tuple[Container, ...]] = field(default_factory=dict)
-    listeners: dict[str, tuple[Listener, ...] | None] = field(default_factory=dict)
-    missing: dict[str, frozenset[str]] = field(default_factory=dict)
     # The tree the bundles were built from (apply's snapshot; None: plan, the working tree), and
     # the commit the nodes' commits are compared with (HEAD: apply commits the tree on it).
     tree: str | None = None
     base: str = ""
-    # Each reachable node's applied.json; the named nodes whose record has no commit yet.
-    applied: dict[str, Record] = field(default_factory=dict)
-    untracked: set[str] = field(default_factory=set)
     # About the repo and the nodes' commits: apply asks about them first.
     repo_notices: list[str] = field(default_factory=list)
-    # The nodes being retired: applied, their folder gone from nodes/ (wanted empty).
-    retiring: frozenset[str] = frozenset()
+
+    @classmethod
+    def of(cls, desired: Mapping[str, Desired]) -> Collected:
+        """Every node the lab config wants, nothing found on them yet."""
+        return cls(nodes={node: NodeView(wanted) for node, wanted in desired.items()})
+
+    # The same things by node, as the planner's functions take them.
+
+    @property
+    def desired(self) -> dict[str, Desired]:
+        return {node: view.desired for node, view in self.nodes.items()}
+
+    @property
+    def desired_states(self) -> dict[str, NodeState]:
+        """Every node as the lab config wants it."""
+        return {node: view.desired.state for node, view in self.nodes.items()}
+
+    @property
+    def recorded(self) -> dict[str, NodeState | None]:
+        return {node: view.recorded for node, view in self.nodes.items()}
+
+    @property
+    def recorded_dirs(self) -> dict[str, Dirs]:
+        """Of the nodes whose dirs are known."""
+        return {
+            node: view.recorded_dirs
+            for node, view in self.nodes.items()
+            if view.recorded_dirs is not None
+        }
+
+    def read(self, scope: Scope | None = None) -> dict[str, OnNode]:
+        """What was read on each node that was read (only the nodes ``scope`` names)."""
+        return {
+            node: view.on_node
+            for node, view in self.nodes.items()
+            if view.on_node is not None and (scope is None or scope.in_scope(node))
+        }
 
 
 @contextmanager
@@ -338,24 +354,20 @@ def collect(
         nodes = sorted(desired)
         if tree is not None and any(wanted.env.new_node_vars for wanted in desired.values()):
             tree = repo.snapshot()  # with the answers just written to node.env
-        result = Collected(
-            desired=desired,
-            recorded={},
-            tree=tree,
-            base=repo.head(),
-            retiring=frozenset(retiring),
-        )
+        result = Collected.of(desired)
+        result.tree, result.base = tree, repo.head()
+        for node in retiring:
+            result.nodes[node].retiring = True
         reads = _read_all(settings, nodes, desired, work, scope)
         # A node being retired is planned only when it can be read and labctl has something there
         # to remove. Otherwise it is left out; named, that is an error saying how to forget it.
-        for node in sorted(result.retiring):
+        for node in sorted(retiring):
             read = reads[node]
             gone = bool(read.unreachable or read.error)
             if not (gone or _nothing_there(read)):
                 continue
             nodes.remove(node)
-            del desired[node]
-            result.retiring -= {node}
+            del desired[node], result.nodes[node]
             if node in scope.named:
                 why = "cannot be read" if gone else "has nothing of labctl's left"
                 result.errors.append(
@@ -381,7 +393,9 @@ def collect(
             elif why:
                 # ssh's last words say it ("Connection timed out", "No route to host").
                 down = reads[node].unreachable
-                result.unread[node] = f"unreachable: {down.rsplit(': ', 1)[-1]}" if down else why
+                result.nodes[node].unread = (
+                    f"unreachable: {down.rsplit(': ', 1)[-1]}" if down else why
+                )
                 _collect_baseline(
                     result, settings, node, repo, work, "not named, not read", secrets
                 )
@@ -463,7 +477,7 @@ def read_remote(
         moved_from = ""
         if on_node.pointer and on_node.pointer != home and on_node.applied is None:
             at_old = read_node(remote, on_node.pointer, desired.top_level, data)
-            if at_old.applied is not None and at_old.applied.owner in ("", node):
+            if at_old.applied is not None and at_old.applied.node == node:
                 on_node, home, moved_from = at_old, on_node.pointer, on_node.pointer
     except Unreachable as exc:
         return NodeRead(node, unreachable=str(exc).removeprefix(f"{node}: "))
@@ -527,57 +541,43 @@ def _collect_remote(
     if found.error or on_node is None:
         result.errors.append(f"{node}: {found.error}")
         return ""
-    result.containers[node] = on_node.containers
-    result.listeners[node] = on_node.listeners
-    result.missing[node] = on_node.missing
+    view = result.nodes[node]
+    view.on_node = on_node
     if not on_node.exists:  # a new node: nothing runs there yet
-        result.recorded[node] = NodeState.of(node)
-        result.recorded_dirs[node] = desired.dirs
-        result.reports.append(
-            NodeReport(node, "first", f"never applied; {home} does not exist yet")
-        )
+        view.recorded = NodeState.of(node)
+        view.recorded_dirs = desired.dirs
+        view.source, view.detail = "first", f"never applied; {home} does not exist yet"
         return ""
     applied = on_node.applied
     state = found.state or NodeState.of(node)
-    result.recorded[node] = state
-    result.recorded_dirs[node] = applied.dirs if applied else desired.dirs
-    result.node_files[node] = on_node.files
-    result.node_names[node] = on_node.names
-    result.projects[node] = frozenset(on_node.projects)
-    result.gone[node] = tuple(sorted(set(on_node.projects) - set(state.stacks)))
+    view.recorded = state
+    view.recorded_dirs = applied.dirs if applied else desired.dirs
+    view.gone = tuple(sorted(set(on_node.projects) - set(state.stacks)))
 
     if applied is None:
         count, stacks = len(state.services), len(state.stacks)
-        result.reports.append(
-            NodeReport(
-                node,
-                "first",
-                f"never applied; what is there now: {count} services in {home} ({stacks} "
-                f"stack{'' if stacks == 1 else 's'})",
-            )
+        view.source = "first"
+        view.detail = (
+            f"never applied; what is there now: {count} services in {home} ({stacks} "
+            f"stack{'' if stacks == 1 else 's'})"
         )
         return ""
     where = f" at the old DEPLOY_DIR {found.moved_from}" if found.moved_from else ""
-    result.applied[node] = applied
+    view.source = "node"
     detail = f"applied {applied.applied_at}{where}"
     if not named:
         if applied.commit and repo is not None:
             detail += f" from {applied.commit[:7]}{_behind(repo, applied.commit, base)}"
-        result.reports.append(NodeReport(node, "node", f"not named; {detail}"))
+        view.detail = f"not named; {detail}"
         return ""
-    if not applied.commit:
-        detail += " (before git tracking)"
-        result.untracked.add(node)
-    elif repo is not None:
+    if repo is not None:
         detail += f" from {applied.commit[:7]}{_behind(repo, applied.commit, base)}"
         try:
             _check_commit(result, repo, node, applied, base, on_node)
         except RepoError as exc:
             result.repo_notices.append(f"{node}: {exc}")
-    result.reports.append(NodeReport(node, "node", detail))
-    changes = drift_changes(applied, on_node)
-    if changes:
-        result.drift.append(Drift(node, changes))
+    view.detail = detail
+    view.drift = drift_changes(applied, on_node)
     return ""
 
 
@@ -599,7 +599,7 @@ def _check_commit(
             f"{node} was applied from {short}, which this clone does not have (git fetch, or "
             "pull); planned against the node as it is, and apply records the commit planned"
         )
-        result.untracked.add(node)  # like a record from before git tracking: recorded again
+        result.nodes[node].untracked = True  # recorded again, with the commit planned
         return
     if not repo.is_ancestor(applied.commit, base):
         lost = repo.subjects(f"{base}..{applied.commit}")
@@ -647,9 +647,10 @@ def _collect_baseline(
     except RepoError as exc:
         result.errors.append(f"{node}: {exc}")
         return
+    view = result.nodes[node]
     if applied is None:
-        result.recorded[node] = None
-        result.reports.append(NodeReport(node, "none", f"{why}; no apply tag"))
+        view.recorded = None
+        view.source, view.detail = "none", f"{why}; no apply tag"
         return
     if applied.info is None:
         result.errors.append(f"{node}: {applied.tag} is not a labctl apply tag (no trailers)")
@@ -669,21 +670,16 @@ def _collect_baseline(
             address=applied.info.host_ip,
         )
         resolved = [(then.state.stacks[name], config) for name, config in then.configs.items()]
-        result.recorded[node] = reduce_stacks(
+        view.recorded = reduce_stacks(
             node, resolved, applied.info.dirs.appdata_dir, running=applied.info.stacks_up
         )
     except (RepoError, ComposeError, EnvError, OSError) as exc:
         result.errors.append(f"{node}: cannot rebuild {applied.tag}: {exc}")
         return
-    result.recorded_dirs[node] = applied.info.dirs
+    view.recorded_dirs = applied.info.dirs
     behind = _behind(repo, applied.commit, result.base)
-    result.reports.append(
-        NodeReport(
-            node,
-            "tag",
-            f"{why}; as of {applied.tag} ({applied.commit[:7]}{behind}); drift not checked",
-        )
-    )
+    view.source = "tag"
+    view.detail = f"{why}; as of {applied.tag} ({applied.commit[:7]}{behind}); drift not checked"
 
 
 #############################################################################
@@ -855,7 +851,7 @@ def current_state(
         NodeState:
             Each top-level stack file (found by the rule the bundle uses), and each project with
             containers that runs from other files. A project whose files are gone is left out:
-            it is trash (``Collected.gone``).
+            it is trash (``NodeView.gone``).
     """
     location = Location(str(folder), docker_cli=settings.docker_cli)
     files = [path.name for path in folder.iterdir() if path.is_file()]

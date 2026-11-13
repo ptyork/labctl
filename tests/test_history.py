@@ -41,7 +41,7 @@ def lab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_repo: MakeRepo) ->
     repo.tag_applied("bilbo", "20261103-090000", second, info("2026-11-03T09:00:00"))
     monkeypatch.setenv(LAB_CONFIG_ENV, str(root))
     monkeypatch.setenv("LABCTL_CONFIG_FILE", str(tmp_path / "labctl.toml"))
-    monkeypatch.setattr(history_module, "_tty", lambda: False)
+    monkeypatch.setattr(history_module, "is_terminal", lambda: False)
     return repo
 
 
@@ -91,7 +91,7 @@ def test_show_picks_in_a_terminal(lab: ConfigRepo, monkeypatch: pytest.MonkeyPat
         offered.extend(options)
         return 2
 
-    monkeypatch.setattr(history_module, "_tty", lambda: True)
+    monkeypatch.setattr(history_module, "is_terminal", lambda: True)
     monkeypatch.setattr(menu, "choose", choose)
     assert "Apply 20261101-090000" in run("show").output
     assert len(offered) == 3 and offered[0].startswith("2026-11-03")

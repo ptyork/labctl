@@ -13,12 +13,8 @@ from collections.abc import Collection, Mapping, Sequence
 from pathlib import PurePosixPath
 from typing import Any
 
+from labctl.layout import LABCTL_DIR
 from labctl.state import Network, NodeState, Service, Stack, Volume, volume_key
-
-# Under APPDATA_DIR, reserved for labctl: copies on their way in, and the archive (data of removed
-# services and migrate sources). Everything in the archive is labctl's.
-LABCTL_DIR = ".labctl"
-ARCHIVE_DIR = f"{LABCTL_DIR}/archive"
 
 
 class ComposeError(Exception):

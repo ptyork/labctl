@@ -18,7 +18,7 @@ import click
 from rich.markup import escape
 
 from labctl.cli import menu
-from labctl.cli.commands.settings import load_settings
+from labctl.cli.common import is_terminal, load_settings
 from labctl.click import AliasedGroup, DebugOptions
 from labctl.console import console
 from labctl.repo import Apply, ConfigRepo, RepoError
@@ -184,7 +184,7 @@ def _pick(repo: ConfigRepo, applies: Sequence[Apply], ref: str | None) -> tuple[
             return repo.resolve(ref, applies)
         except RepoError as exc:
             raise click.ClickException(str(exc)) from exc
-    if not _tty():
+    if not is_terminal():
         raise click.ClickException(f"Name the apply: {REFS}")
     if not applies:
         raise click.ClickException("No applies yet")
@@ -226,7 +226,3 @@ def _files(repo: ConfigRepo, old: str, new: str, title: str = "Files its commit 
     console.print(f"[bold]{title}[/]")
     for path in paths:
         console.print(f"  {escape(path)}", highlight=False)
-
-
-def _tty() -> bool:
-    return sys.stdin.isatty() and sys.stdout.isatty()

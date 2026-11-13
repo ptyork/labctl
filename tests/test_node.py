@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner, Result
 
+from labctl import docker
 from labctl import remote as remote_module
 from labctl import stack as stack_module
 from labctl.bundle import Location
@@ -15,14 +16,7 @@ from labctl.cli import cli
 from labctl.cli.commands import node as node_module
 from labctl.remote import Remote
 from labctl.settings import write_config
-from labctl.stack import (
-    Seen,
-    ServiceStatus,
-    compose_command,
-    parse_restarts,
-    ps_rows,
-    statuses,
-)
+from labctl.stack import Seen, ServiceStatus, parse_restarts, ps_rows, statuses
 from labctl.state import Stack
 
 POINTERS: dict[str, str] = {}  # node -> what its ~/.labctl-home says
@@ -104,7 +98,7 @@ def test_single_stack_with_services(
     assert invoke("up", "cirdan", "-s", "plex", "--service", "sonarr").exit_code == 0
     up = ("up", "-d", "--remove-orphans")
     assert commands(ran) == [
-        ("cirdan", compose_command("/srv/cirdan", CIRDAN, *up, "plex", "sonarr"))
+        ("cirdan", docker.compose_command("/srv/cirdan", CIRDAN, *up, "plex", "sonarr"))
     ]
 
 
@@ -113,10 +107,10 @@ def test_every_stack_in_order_and_down_in_reverse(ran: list[tuple[str, str]]) ->
     assert invoke("down", "frodo").exit_code == 0
     up = ("up", "-d", "--remove-orphans")
     assert commands(ran) == [
-        ("frodo", compose_command("/srv/frodo", INFRA, *up)),
-        ("frodo", compose_command("/srv/frodo", MEDIA, *up)),
-        ("frodo", compose_command("/srv/frodo", MEDIA, "down")),
-        ("frodo", compose_command("/srv/frodo", INFRA, "down")),
+        ("frodo", docker.compose_command("/srv/frodo", INFRA, *up)),
+        ("frodo", docker.compose_command("/srv/frodo", MEDIA, *up)),
+        ("frodo", docker.compose_command("/srv/frodo", MEDIA, "down")),
+        ("frodo", docker.compose_command("/srv/frodo", INFRA, "down")),
     ]
 
 
@@ -124,8 +118,8 @@ def test_one_stack_by_name_or_suffix(ran: list[tuple[str, str]]) -> None:
     assert invoke("restart", "frodo/media").exit_code == 0
     assert invoke("restart", "frodo/homelab-frodo-infra").exit_code == 0
     assert commands(ran) == [
-        ("frodo", compose_command("/srv/frodo", MEDIA, "restart")),
-        ("frodo", compose_command("/srv/frodo", INFRA, "restart")),
+        ("frodo", docker.compose_command("/srv/frodo", MEDIA, "restart")),
+        ("frodo", docker.compose_command("/srv/frodo", INFRA, "restart")),
     ]
     output = invoke("up", "frodo/books").output
     assert "frodo/books is not a stack; stacks: homelab-frodo-infra, homelab-frodo-media" in output
@@ -135,8 +129,8 @@ def test_services_run_in_their_own_stacks(ran: list[tuple[str, str]]) -> None:
     assert invoke("pull", "frodo", "-s", "tdarr", "-s", "npm").exit_code == 0
     pull = ("pull", "--ignore-pull-failures")
     assert commands(ran) == [
-        ("frodo", compose_command("/srv/frodo", INFRA, *pull, "npm")),
-        ("frodo", compose_command("/srv/frodo", MEDIA, *pull, "tdarr")),
+        ("frodo", docker.compose_command("/srv/frodo", INFRA, *pull, "npm")),
+        ("frodo", docker.compose_command("/srv/frodo", MEDIA, *pull, "tdarr")),
     ]
     assert "frodo: no stack has sonarr" in invoke("up", "frodo", "-s", "sonarr").output
 
@@ -144,8 +138,14 @@ def test_services_run_in_their_own_stacks(ran: list[tuple[str, str]]) -> None:
 def test_update_pulls_ups_and_prunes(ran: list[tuple[str, str]]) -> None:
     assert invoke("update", "frodo/media", "-s", "plex").exit_code == 0
     assert commands(ran) == [
-        ("frodo", compose_command("/srv/frodo", MEDIA, "pull", "--ignore-pull-failures", "plex")),
-        ("frodo", compose_command("/srv/frodo", MEDIA, "up", "-d", "--remove-orphans", "plex")),
+        (
+            "frodo",
+            docker.compose_command("/srv/frodo", MEDIA, "pull", "--ignore-pull-failures", "plex"),
+        ),
+        (
+            "frodo",
+            docker.compose_command("/srv/frodo", MEDIA, "up", "-d", "--remove-orphans", "plex"),
+        ),
         ("frodo", "docker image prune --force"),  # node-wide, also for one stack
     ]
 
@@ -164,9 +164,9 @@ def test_several_targets(ran: list[tuple[str, str]]) -> None:
     """Targets run in the order given; a node and one of its stacks is the whole node."""
     assert invoke("restart", "frodo/media", "cirdan", "frodo/infra").exit_code == 0
     assert commands(ran) == [
-        ("frodo", compose_command("/srv/frodo", INFRA, "restart")),
-        ("frodo", compose_command("/srv/frodo", MEDIA, "restart")),
-        ("cirdan", compose_command("/srv/cirdan", CIRDAN, "restart")),
+        ("frodo", docker.compose_command("/srv/frodo", INFRA, "restart")),
+        ("frodo", docker.compose_command("/srv/frodo", MEDIA, "restart")),
+        ("cirdan", docker.compose_command("/srv/cirdan", CIRDAN, "restart")),
     ]
     ran.clear()
     assert invoke("restart", "frodo/media", "frodo").exit_code == 0
@@ -177,7 +177,7 @@ def test_services_run_only_where_they_are(ran: list[tuple[str, str]]) -> None:
     result = invoke("up", "all", "-s", "plex")
     assert result.exit_code == 0, result.output
     up = ("up", "-d", "--remove-orphans")
-    assert commands(ran) == [("frodo", compose_command("/srv/frodo", MEDIA, *up, "plex"))]
+    assert commands(ran) == [("frodo", docker.compose_command("/srv/frodo", MEDIA, *up, "plex"))]
     ran.clear()
     output = invoke("up", "all", "-s", "plex", "-s", "sonarr").output
     assert "the targets: no stack has sonarr" in output
@@ -195,9 +195,9 @@ def test_logs_one_after_another(ran: list[tuple[str, str]]) -> None:
     assert invoke("logs", "cirdan", "frodo", "-s", "plex", "-n", "5").exit_code == 0
     logs = ("logs", "--tail", "100")
     assert commands(ran) == [
-        ("frodo", compose_command("/srv/frodo", INFRA, *logs)),
-        ("frodo", compose_command("/srv/frodo", MEDIA, *logs)),
-        ("frodo", compose_command("/srv/frodo", MEDIA, "logs", "--tail", "5", "plex")),
+        ("frodo", docker.compose_command("/srv/frodo", INFRA, *logs)),
+        ("frodo", docker.compose_command("/srv/frodo", MEDIA, *logs)),
+        ("frodo", docker.compose_command("/srv/frodo", MEDIA, "logs", "--tail", "5", "plex")),
     ]
 
 
@@ -281,13 +281,13 @@ def test_the_node_says_where_deploy_dir_is(ran: list[tuple[str, str]]) -> None:
     assert invoke("down", "frodo").exit_code == 0
     assert commands(ran) == [
         ("frodo", "docker image prune --force"),
-        ("frodo", compose_command("/old/home", MEDIA, "down")),
-        ("frodo", compose_command("/old/home", INFRA, "down")),
+        ("frodo", docker.compose_command("/old/home", MEDIA, "down")),
+        ("frodo", docker.compose_command("/old/home", INFRA, "down")),
     ]
 
 
 def test_compose_command_quotes_and_checks_the_home() -> None:
-    command = compose_command("/srv/my home", MEDIA, "up")
+    command = docker.compose_command("/srv/my home", MEDIA, "up")
     assert command.startswith("cd '/srv/my home' 2>/dev/null || {")
     assert command.endswith(
         "; docker compose -p homelab-frodo-media -f media-extra.yml -f media.yml up"

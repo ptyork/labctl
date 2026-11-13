@@ -85,8 +85,6 @@ def test_tag_message_round_trip_and_nothing_secret() -> None:
     # git strips the trailing space of "Stacks-Up: " when it stores the message
     assert parse_tag_message(tag_message("x", no_stacks).replace(": \n", ":\n")) == no_stacks
     assert parse_tag_message("some tag someone made by hand") is None
-    # Made before DOCKER_HOME was renamed DEPLOY_DIR.
-    assert parse_tag_message(message.replace("Deploy-Dir:", "Docker-Home:")) == INFO
     # The node's address, when `_HOST_IP_` used it (a tag from before has none).
     addressed = replace(INFO, host_ip="10.11.12.31")
     assert "Host-IP: 10.11.12.31" in tag_message("frodo", addressed)

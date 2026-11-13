@@ -5,16 +5,14 @@ from __future__ import annotations
 import getpass
 import shutil
 import socket
-import sys
 from datetime import datetime
-from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
 import click
 from rich.markup import escape
 
-from labctl.cli import menu
-from labctl.cli.commands.settings import load_settings
+from labctl import __version__
+from labctl.cli.common import confirm_or_yes, load_settings
 from labctl.click import DebugOptions
 from labctl.console import console
 from labctl.repo import ConfigRepo, RepoError, TagInfo
@@ -74,20 +72,16 @@ def _forget(repo: ConfigRepo, name: str, yes: bool) -> None:
     last = repo.last_applied(name)
     if last is None or last.info is None:
         return  # never applied: there is nothing to forget, only the folder
-    if not yes:
-        if not sys.stdin.isatty():
-            raise click.ClickException("Confirm in a terminal, or pass --yes")
-        console.print(
-            f"labctl stops tracking {escape(name)}. Nothing on it changes: what labctl put there "
-            "stays, unmanaged."
-        )
-        if not menu.confirm(f"Forget {name}?"):
-            raise click.ClickException("Not forgotten")
+    about = (
+        f"labctl stops tracking {escape(name)}. Nothing on it changes: what labctl put there "
+        "stays, unmanaged."
+    )
+    confirm_or_yes(f"Forget {name}?", yes, "Not forgotten", about)
     now = datetime.now()
     info = TagInfo(
         now.isoformat(timespec="seconds"),
         f"{getpass.getuser()}@{socket.gethostname()}",
-        _version(),
+        __version__,
         (),
         last.info.dirs,
         retired=True,
@@ -99,10 +93,3 @@ def _forget(repo: ConfigRepo, name: str, yes: bool) -> None:
     failed = repo.publish()
     pushed = "" if failed == "no remote" else (" (not pushed)" if failed else ", pushed")
     console.print(f"[green]✓[/] forgot {escape(name)}: tagged {escape(tag)}{pushed}")
-
-
-def _version() -> str:
-    try:
-        return version("labctl")
-    except PackageNotFoundError:
-        return "undetermined"

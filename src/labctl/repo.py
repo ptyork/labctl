@@ -123,8 +123,7 @@ def parse_tag_message(text: str) -> TagInfo | None:
             fields.get("Applied-By", ""),
             fields.get("Labctl", ""),
             tuple(fields.get("Stacks-Up", "").split()),
-            # Docker-Home: tags made before DOCKER_HOME was renamed DEPLOY_DIR
-            Dirs(fields.get("Deploy-Dir") or fields["Docker-Home"], fields["Appdata-Dir"]),
+            Dirs(fields["Deploy-Dir"], fields["Appdata-Dir"]),
             fields.get("Host-IP", ""),
             fields.get("Retired") == "yes",
         )

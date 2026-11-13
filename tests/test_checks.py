@@ -16,10 +16,7 @@ from labctl.checks import (
     Finding,
     Level,
     PathInfo,
-    archive_path,
     check_paths,
-    human_size,
-    key_label,
     parse_free,
     parse_probe,
     parse_size,
@@ -29,10 +26,12 @@ from labctl.checks import (
 )
 from labctl.compose import reduce_config
 from labctl.envfile import CompiledEnv
+from labctl.layout import archive_path
 from labctl.moves import APPDATA, DATA, Move
 from labctl.planner import Add, Migrate, Restore, Update
 from labctl.remote import Remote
-from labctl.state import NodeState, Service
+from labctl.state import NodeState, Service, key_label
+from labctl.text import human_size
 
 ROOT_A = "/home/paul/docker/app_data"
 ROOT_B = "/srv/appdata"

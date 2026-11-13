@@ -17,13 +17,12 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from labctl.apply import Node, lock, unlock
-from labctl.collect import FILES_ARCHIVE, HOME_POINTER, RECORD
-from labctl.compose import ARCHIVE_DIR
 from labctl.envfile import preview_env
+from labctl.layout import ARCHIVE_DIR, FILES_ARCHIVE, RECORD, SIDECAR
+from labctl.node import Node, lock, unlock
 from labctl.remote import Remote, execute
-from labctl.restore import SIDECAR
 from labctl.settings import Settings, SettingsError
+from labctl.stack import deploy_dir_on
 
 STAMP_FORMAT = "%Y%m%d-%H%M%S"
 _STAMP_LENGTH = len("YYYYMMDD-HHMMSS")
@@ -278,9 +277,7 @@ def archive_dirs(settings: Settings, node: str, remote: Remote) -> tuple[str, st
         SettingsError:
             Neither the node nor the repo says.
     """
-    env = preview_env(settings.nodes_dir, node)
-    pointer = execute(["sh", "-c", f'cat "$HOME/{HOME_POINTER}"'], "/", remote)
-    deploy = (pointer.stdout.strip() if pointer.code == 0 else "") or env.get("DEPLOY_DIR", "")
+    deploy = deploy_dir_on(settings, node, remote)
     if not deploy:
         raise SettingsError(f"{node}: DEPLOY_DIR is not set")
     record = execute(["cat", f"{deploy}/{RECORD}"], "/", remote)
@@ -290,7 +287,7 @@ def archive_dirs(settings: Settings, node: str, remote: Remote) -> tuple[str, st
             appdata = str(json.loads(record.stdout).get("appdata_dir", ""))
         except ValueError:
             pass
-    appdata = appdata or env.get("APPDATA_DIR", "")
+    appdata = appdata or preview_env(settings.nodes_dir, node).get("APPDATA_DIR", "")
     if not appdata:
         raise SettingsError(f"{node}: APPDATA_DIR is not set")
     return f"{appdata}/{ARCHIVE_DIR}", f"{deploy}/{FILES_ARCHIVE}"
@@ -366,7 +363,7 @@ def delete_entries(node: Node, archive: NodeArchive, doomed: Iterable[Entry], ow
             Who holds the lock, shown to an apply that finds it.
 
     Raises:
-        ApplyError:
+        NodeError:
             The lock is held, or a deletion failed.
     """
     paths: dict[str, list[str]] = {}

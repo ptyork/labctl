@@ -11,8 +11,8 @@ from git_wrap import StatusEntry
 from rich.markup import escape
 
 from labctl.cli import menu
-from labctl.click import Options
 from labctl.console import console
+from labctl.planning import Options
 from labctl.repo import ConfigRepo, RepoError, TagInfo
 
 

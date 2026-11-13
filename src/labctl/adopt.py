@@ -21,11 +21,13 @@ from typing import Any
 
 import yaml
 
+from labctl import docker
 from labctl.bundle import NO_SERVICES, Location, find_stacks, include_paths, stack_candidates
-from labctl.collect import HOME_POINTER, read_node
+from labctl.collect import read_node
 from labctl.envfile import SECRET, parse_env
+from labctl.layout import HOME_POINTER
 from labctl.remote import MARK, Remote, sections
-from labctl.runtime import CONTAINER_FORMAT, Container, parse_containers
+from labctl.runtime import Container, parse_containers
 from labctl.settings import Settings
 from labctl.state import Stack
 
@@ -34,11 +36,10 @@ SYSTEM_PATHS = ("/var/run", "/run", "/etc", "/dev", "/proc", "/sys", "/usr", "/l
 
 _READ_HOST = f"""\
 echo "{MARK} pointer"; cat "$HOME/{HOME_POINTER}" 2>/dev/null
-echo "{MARK} compose"; docker compose version --short </dev/null 2>/dev/null
+echo "{MARK} compose"; {docker.COMPOSE_VERSION} </dev/null 2>/dev/null
 echo "{MARK} user"; id -u; id -nG
 echo "{MARK} containers"
-docker ps -aq </dev/null 2>/dev/null |
-  xargs -r docker inspect --format '{CONTAINER_FORMAT}' 2>/dev/null
+{docker.INSPECT_CONTAINERS}
 """
 
 
@@ -104,7 +105,7 @@ def parse_host(output: str) -> Host:
     return Host(
         pointer="".join(parts.get("pointer", [])).strip(),
         compose="".join(parts.get("compose", [])).strip(),
-        docker=root or "docker" in groups,
+        docker=root or docker.GROUP in groups,
         containers=parse_containers(parts.get("containers", []), ""),
     )
 

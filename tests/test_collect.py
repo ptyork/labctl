@@ -3,14 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import MakeRepo, git
+from conftest import MakeRepo, git, needs_docker
 
 from labctl import collect as collect_module
 from labctl.bundle import Desired
@@ -21,6 +20,7 @@ from labctl.collect import (
     UNREAD,
     Collected,
     NodeRead,
+    NodeView,
     OnNode,
     Record,
     _collect_baseline,
@@ -47,7 +47,14 @@ RECORD_DOC = Record(
     Dirs(HOME, APPDATA),
     (Stack("homelab-cirdan", ("docker-compose.yml",)),),
     {"docker-compose.yml": "aaa111", "apps/plex.yml": "bbb222", ".env": "eee555"},
+    node="cirdan",
 )
+
+
+def only(result: Collected) -> NodeView:
+    """The record of the one node collected."""
+    (view,) = result.nodes.values()
+    return view
 
 
 def node_output(applied: Record | None = None, projects: list[dict[str, str]] | None = None) -> str:
@@ -165,12 +172,8 @@ def test_record_round_trip() -> None:
     assert Record.from_json(json.loads(json.dumps(RECORD_DOC.to_json()))) == RECORD_DOC
     tracked = replace(RECORD_DOC, commit="abc1234", tag="applied/cirdan/20261030-120000")
     assert Record.from_json(json.loads(json.dumps(tracked.to_json()))) == tracked
-    version_1 = {k: v for k, v in RECORD_DOC.to_json().items() if k not in ("commit", "tag")}
-    assert Record.from_json({**version_1, "version": 1}) == RECORD_DOC
-    # Written before DOCKER_HOME was renamed DEPLOY_DIR.
-    old = {k: v for k, v in RECORD_DOC.to_json().items() if k != "deploy_dir"}
-    old["docker_home"] = RECORD_DOC.dirs.deploy_dir
-    assert Record.from_json(old) == RECORD_DOC
+    with pytest.raises(ComposeError, match="unsupported .* version 1"):
+        Record.from_json({**RECORD_DOC.to_json(), "version": 1})
 
 
 def test_drift_is_edits_to_the_files_apply_wrote() -> None:
@@ -195,11 +198,6 @@ def test_drift_is_edits_to_the_files_apply_wrote() -> None:
     assert drift_changes(RECORD_DOC, clean) == ()
 
 
-@pytest.fixture
-def settings(tmp_path: Path) -> Settings:
-    return Settings(lab_config=tmp_path / "repo", config_dir=tmp_path / "config")
-
-
 def desired_for(bundle: Path, home: str = HOME, files: dict[str, str] | None = None) -> Desired:
     env = CompiledEnv(values={"DEPLOY_DIR": home, "APPDATA_DIR": APPDATA})
     state = NodeState.of("cirdan", stacks=[Stack("homelab-cirdan", ("docker-compose.yml",))])
@@ -222,17 +220,16 @@ def test_the_node_is_the_record(
     monkeypatch.setattr(collect_module, "read_node", lambda r, h, n, d: on_node)
     desired = desired_for(Path("/unused"))
 
-    result = Collected(desired={"cirdan": desired}, recorded={})
+    result = Collected.of({"cirdan": desired})
     _collect_remote(result, settings, "cirdan", desired, tmp_path)
     assert result.recorded == {"cirdan": from_node}
-    assert result.reports[0].detail == "applied 2026-10-30T12:00:00 (before git tracking)"
-    assert result.untracked == {"cirdan"}  # apply records a commit there, even with no changes
-    assert not result.drift
+    assert only(result).detail == "applied 2026-10-30T12:00:00"
+    assert not only(result).drift and not only(result).untracked
 
     on_node = OnNode(RECORD_DOC, {**RECORD_DOC.manifest, "apps/plex.yml": "edited"})
-    result = Collected(desired={"cirdan": desired}, recorded={})
+    result = Collected.of({"cirdan": desired})
     _collect_remote(result, settings, "cirdan", desired, tmp_path / "again")
-    assert result.drift
+    assert only(result).drift
 
 
 def test_changed_deploy_dir_is_found_through_the_node_pointer(
@@ -252,12 +249,12 @@ def test_changed_deploy_dir_is_found_through_the_node_pointer(
     monkeypatch.setattr(collect_module, "read_node", read_node)
     desired = desired_for(Path("/unused"), home=new)
 
-    result = Collected(desired={"cirdan": desired}, recorded={})
+    result = Collected.of({"cirdan": desired})
     _collect_remote(result, settings, "cirdan", desired, tmp_path)
     assert reads == [new, HOME]
     assert result.recorded == {"cirdan": from_node}
     assert result.recorded_dirs["cirdan"] == Dirs(HOME, APPDATA)
-    assert "at the old DEPLOY_DIR /home/paul/docker" in result.reports[0].detail
+    assert "at the old DEPLOY_DIR /home/paul/docker" in only(result).detail
 
 
 def test_the_pointer_is_not_followed_to_another_nodes_record(
@@ -275,18 +272,17 @@ def test_the_pointer_is_not_followed_to_another_nodes_record(
 
     monkeypatch.setattr(collect_module, "read_node", read_node)
     desired = replace(desired_for(Path("/unused"), home="/home/paul/docker-ghost"), node="ghost")
-    result = Collected(desired={"ghost": desired}, recorded={})
+    result = Collected.of({"ghost": desired})
     _collect_remote(result, settings, "ghost", desired, tmp_path)
     assert result.recorded["ghost"] == NodeState.of("ghost")
     assert result.recorded_dirs["ghost"] == desired.dirs  # no move
-    assert result.reports[0].source == "first"
+    assert only(result).source == "first"
 
-    # Its own record (by its node field, or its tag; or an older record that does not say) is.
-    for own in (replace(palantirs, node="ghost", tag=""), replace(RECORD_DOC, tag="")):
-        palantirs = own
-        result = Collected(desired={"ghost": desired}, recorded={})
-        _collect_remote(result, settings, "ghost", desired, tmp_path / own.node)
-        assert result.recorded_dirs["ghost"] == Dirs(HOME, APPDATA)
+    # Its own record is.
+    palantirs = replace(palantirs, node="ghost")
+    result = Collected.of({"ghost": desired})
+    _collect_remote(result, settings, "ghost", desired, tmp_path / "own")
+    assert result.recorded_dirs["ghost"] == Dirs(HOME, APPDATA)
 
 
 def test_never_applied_is_what_is_there_now(
@@ -296,18 +292,18 @@ def test_never_applied_is_what_is_there_now(
     does not exist; a first apply is an ordinary apply."""
     monkeypatch.setattr(collect_module, "read_node", lambda r, h, n, d: OnNode(None, {}, {}))
     desired = desired_for(Path("/unused"))
-    result = Collected(desired={"cirdan": desired}, recorded={})
+    result = Collected.of({"cirdan": desired})
     _collect_remote(result, settings, "cirdan", desired, tmp_path)
     assert result.recorded["cirdan"] == from_node
-    assert result.reports[0].source == "first"
-    assert "1 services in /home/paul/docker" in result.reports[0].detail
+    assert only(result).source == "first"
+    assert "1 services in /home/paul/docker" in only(result).detail
 
     absent = OnNode(None, {}, exists=False)
     monkeypatch.setattr(collect_module, "read_node", lambda r, h, n, d: absent)
-    result = Collected(desired={"cirdan": desired}, recorded={})
+    result = Collected.of({"cirdan": desired})
     _collect_remote(result, settings, "cirdan", desired, tmp_path / "again")
     assert result.recorded["cirdan"] == NodeState.of("cirdan")
-    assert result.reports[0].source == "first"
+    assert only(result).source == "first"
 
 
 def test_an_unreachable_named_node_is_an_error(
@@ -358,10 +354,10 @@ def test_a_missing_apply_tag_is_recreated_from_the_record(
     )
     monkeypatch.setattr(collect_module, "read_node", lambda r, h, n, d: on_node)
     desired = desired_for(Path("/unused"))
-    result = Collected(desired={"cirdan": desired}, recorded={})
+    result = Collected.of({"cirdan": desired})
     _collect_remote(result, settings, "cirdan", desired, tmp_path, repo=repo, base=head)
-    assert result.reports[0].detail == f"applied 2026-10-30T12:00:00 from {head[:7]}"
-    assert result.repo_notices == [] and result.untracked == set()
+    assert only(result).detail == f"applied 2026-10-30T12:00:00 from {head[:7]}"
+    assert result.repo_notices == [] and not only(result).untracked
     latest = repo.last_applied("cirdan")
     assert latest is not None and (latest.tag, latest.commit) == (TRACKED.tag, head)
     assert latest.info is not None and latest.info.stacks_up == ("stack1",)
@@ -385,11 +381,11 @@ def test_the_nodes_commit_is_checked_against_the_repo(
     def notices(commit: str) -> list[str]:
         on_node = OnNode(replace(TRACKED, commit=commit), dict(RECORD_DOC.manifest))
         monkeypatch.setattr(collect_module, "read_node", lambda r, h, n, d: on_node)
-        result = Collected(desired={"cirdan": desired}, recorded={})
+        result = Collected.of({"cirdan": desired})
         _collect_remote(
             result, settings, "cirdan", desired, tmp_path / commit, repo=repo, base=first
         )
-        untracked[:] = sorted(result.untracked)
+        untracked[:] = [node for node, view in result.nodes.items() if view.untracked]
         return result.repo_notices
 
     untracked: list[str] = []
@@ -438,7 +434,8 @@ def test_a_node_not_named_is_planned_as_of_its_apply_tag(
 
     monkeypatch.setattr(collect_module, "resolve_desired", resolve)
     monkeypatch.setattr(collect_module, "reduce_stacks", lambda n, r, a, running: running)
-    result = Collected(desired={}, recorded={}, base=repo.head())
+    result = Collected.of({"frodo": desired_for(Path("/unused"))})
+    result.base = repo.head()
     _collect_baseline(result, settings, "frodo", repo, tmp_path, "not named", today)
     assert result.errors == []
     assert result.recorded["frodo"] == ("stack1",)  # running: the tag's Stacks-Up
@@ -446,8 +443,8 @@ def test_a_node_not_named_is_planned_as_of_its_apply_tag(
     ((node, tree, baseline),) = built
     assert baseline and tree is not None
     assert (tree / "nodes/frodo/docker-compose.yml").is_file() and not (tree / "later.txt").exists()
-    assert result.reports[0].source == "tag"
-    assert result.reports[0].detail == (
+    assert only(result).source == "tag"
+    assert only(result).detail == (
         f"not named; as of applied/frodo/20261101-100000 ({applied_at[:7]}, 1 commit behind); "
         "drift not checked"
     )
@@ -482,8 +479,6 @@ def test_data_names_come_from_the_repo(tmp_path: Path) -> None:
 
 # ── Reading stacks from a node's files (real compose) ─────────────────────────
 
-docker = pytest.mark.skipif(shutil.which("docker") is None, reason="needs the docker CLI")
-
 
 def write_tree(root: Path, files: dict[str, str]) -> None:
     for path, text in files.items():
@@ -499,7 +494,7 @@ STACK1 = "name: homelab-cirdan-stack1\ninclude:\n  - apps/dozzle.yml\n"
 STACK2 = "name: homelab-cirdan-stack2\ninclude:\n  - apps/fileflows.yml\n"
 
 
-@docker
+@needs_docker
 def test_every_stack_file_in_deploy_dir_is_a_stack(settings: Settings, tmp_path: Path) -> None:
     """Stacks started by hand, before labctl: each file is a stack, running or not."""
     folder = tmp_path / "docker"
@@ -518,9 +513,9 @@ def test_every_stack_file_in_deploy_dir_is_a_stack(settings: Settings, tmp_path:
     assert set(state.stacks) == {"homelab-cirdan-stack1", "homelab-cirdan-stack2"}
 
 
-@docker
+@needs_docker
 def test_a_running_stack_without_its_file_is_left_out(settings: Settings, tmp_path: Path) -> None:
-    """It is trash: Collected.gone lists it, and apply takes it down by name."""
+    """It is trash: NodeView.gone lists it, and apply takes it down by name."""
     folder = tmp_path / "docker"
     write_tree(folder, APPS)
     state = current_state(settings, "cirdan", folder, Dirs(HOME, APPDATA), {"x": ("gone.yml",)})
@@ -545,12 +540,12 @@ def test_a_node_not_named_is_read_but_only_looked_at(
     monkeypatch.setattr(collect_module, "read_node", lambda r, h, n, d: on_node)
     desired = desired_for(Path("/unused"))
 
-    result = Collected(desired={"cirdan": desired}, recorded={})
+    result = Collected.of({"cirdan": desired})
     why = _collect_remote(result, settings, "cirdan", desired, tmp_path, named=False)
     assert why == "" and result.errors == []
     assert result.recorded == {"cirdan": from_node}
-    assert not result.drift and not result.untracked
-    assert result.reports[0].detail == "not named; applied 2026-10-30T12:00:00"
+    assert not only(result).drift and not only(result).untracked
+    assert only(result).detail == "not named; applied 2026-10-30T12:00:00"
 
 
 def test_a_node_not_named_that_cannot_be_read_is_not_an_error(
@@ -561,10 +556,10 @@ def test_a_node_not_named_that_cannot_be_read_is_not_an_error(
 
     monkeypatch.setattr(collect_module, "read_node", broken)
     desired = desired_for(Path("/unused"))
-    result = Collected(desired={"cirdan": desired}, recorded={})
+    result = Collected.of({"cirdan": desired})
     why = _collect_remote(result, settings, "cirdan", desired, tmp_path, named=False)
     assert why == "cirdan: remote script failed (1): oops"
-    assert result.errors == [] and result.recorded == {}
+    assert result.errors == [] and only(result).recorded is None
 
 
 def test_nodes_not_named_fall_back_to_their_tag_when_unreachable(
@@ -588,9 +583,9 @@ def test_nodes_not_named_fall_back_to_their_tag_when_unreachable(
 
     with collect(settings, Scope(frozenset({"frodo"})), Secrets(), None, repo) as result:
         assert result.errors == []
-        assert result.unread == {"frodo": "unreachable: Connection timed out"}
-        report = next(report for report in result.reports if report.node == "frodo")
-        assert (report.source, report.detail) == ("none", "not named, not read; no apply tag")
+        assert result.nodes["frodo"].unread == "unreachable: Connection timed out"
+        frodo = result.nodes["frodo"]
+        assert (frodo.source, frodo.detail) == ("none", "not named, not read; no apply tag")
 
 
 def test_nodes_are_read_together_and_those_not_named_get_less_time(
