@@ -16,22 +16,49 @@ compiled .env, whose other lines the repo shows.
 
 from __future__ import annotations
 
+import getpass
 import shutil
+import socket
 import subprocess
 import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from git_wrap import CommandError, GitRepo, NotARepoError, StatusEntry
 
+from labctl import __version__
 from labctl.state import Dirs
 
 TAG_PREFIX = "applied"
 _TAGS = f"refs/tags/{TAG_PREFIX}/*"
 FETCH_TIMEOUT = 15  # seconds
 PUSH_TIMEOUT = 60
+ORIGIN = "origin"
+
+GITIGNORE = """\
+# compiled env (holds secrets) and secrets files
+.env
+*.env.secrets
+secrets.toml
+# a node's DEPLOY_DIR bookkeeping, should one be copied here
+.labctl/
+# editors and OS
+*.swp
+*.swo
+*~
+.#*
+.DS_Store
+Thumbs.db
+desktop.ini
+*:Zone.Identifier
+.vscode/
+.idea/
+"""
+
+GITATTRIBUTES = "* text=auto eol=lf\n"
 
 
 class RepoError(Exception):
@@ -410,6 +437,20 @@ class ConfigRepo:
         with _errors("git stash"):
             self.git.run("stash", "push", "--include-untracked", "--message", message)
 
+    def discard(self) -> str:
+        """Stash every uncommitted change as ``labctl discard <timestamp>``; returns that name."""
+        name = f"labctl discard {datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        self.stash(name)
+        return name
+
+    def check_nothing_pending(self) -> None:
+        """RepoError when the lab config has changes no apply committed."""
+        if self.changes():
+            raise RepoError(
+                "The lab config has changes no apply committed; apply them, or `labctl discard` "
+                "them, first"
+            )
+
     # History
 
     def applies(self) -> list[Apply]:
@@ -477,6 +518,68 @@ class ConfigRepo:
         removed (the index is left alone)."""
         with _errors(f"git restore {rev}"):
             self.git.run("restore", f"--source={rev}", "--worktree", "--", ".")
+
+    def go_back(self, commit: str) -> list[str]:
+        """The working tree as ``commit`` has it, uncommitted: the paths that now differ from
+        HEAD."""
+        self.restore_tree(commit)
+        return [change.path for change in self.changes()]
+
+    def commit_files(self, commit: str) -> list[str]:
+        """The paths ``commit`` changed (none for the first commit)."""
+        try:
+            return self.changed_paths(f"{commit}^", commit)
+        except RepoError:
+            return []
+
+    def apply_files(self, apply: Apply, applies: Sequence[Apply]) -> tuple[Apply | None, list[str]]:
+        """The apply before ``apply`` and the paths changed since it; with none before, None and
+        the paths its commit changed."""
+        older = next((other for other in applies if other.stamp < apply.stamp), None)
+        if older is None:
+            return None, self.commit_files(apply.commit)
+        if older.commit == apply.commit:
+            return older, []
+        try:
+            return older, self.changed_paths(older.commit, apply.commit)
+        except RepoError:
+            return older, []
+
+    def node_pathspecs(self, commit: str, nodes_dir: Path, nodes: Sequence[str]) -> list[str]:
+        """Pathspecs for the files that build the bundles of ``nodes`` (none: no limit): all but
+        the folders of the other nodes, those ``commit`` had included."""
+        if not nodes:
+            return []
+        folder = nodes_dir.relative_to(self.root).as_posix()
+        here = {path.name for path in nodes_dir.iterdir() if path.is_dir()}
+        others = (here | set(self.path_names(commit, folder))) - set(nodes) - {"_shared"}
+        return [".", *(f":(exclude){folder}/{other}" for other in sorted(others))]
+
+    def standing(self, node: str) -> tuple[Applied | None, int]:
+        """The node's latest apply (None: never applied), and how many commits the lab config
+        has moved on since."""
+        last = self.last_applied(node)
+        if last is None:
+            return None, 0
+        head = self.head()
+        # Commits that change nothing in the end (an edit and its undo) are not "behind".
+        changed = bool(head) and bool(self.changed_paths(last.commit, head))
+        return last, self.count_between(last.commit, head) if changed else 0
+
+    def forget(self, node: str, dirs: Dirs) -> tuple[str, str | None]:
+        """Tag the node retired on HEAD, its last dirs kept, without contacting it, and push
+        the tag: (the tag, why it was not pushed or None)."""
+        now = datetime.now()
+        info = TagInfo(
+            now.isoformat(timespec="seconds"),
+            f"{getpass.getuser()}@{socket.gethostname()}",
+            __version__,
+            (),
+            dirs,
+            retired=True,
+        )
+        tag = self.tag_applied(node, now.strftime("%Y%m%d-%H%M%S"), self.head(), info)
+        return tag, self.publish()
 
     def diff(self, rev: str, pathspecs: Sequence[str]) -> int:
         """`git diff rev -- pathspecs` straight to the terminal (git's colour and pager)."""
@@ -568,3 +671,176 @@ class ConfigRepo:
         """
         proc = self.git.run("merge", "--ff-only", "--quiet", upstream, check=False)
         return None if proc.returncode == 0 else (proc.stderr or proc.stdout).strip()
+
+
+#############################################################################
+# labctl remove
+
+
+@dataclass
+class Removable:
+    """
+    A node that may be removed.
+
+    Attributes:
+        path (str):
+            Its folder, relative to the lab config's root.
+        folder (bool):
+            Whether the folder is there to delete.
+        last (Applied | None):
+            Its latest apply, when it is to be forgotten and has one to forget.
+    """
+
+    path: str
+    folder: bool
+    last: Applied | None = None
+
+
+def check_removable(
+    repo: ConfigRepo, nodes_dir: Path, defined: Sequence[str], name: str, forget: bool
+) -> Removable:
+    """
+    Whether the node can be taken out of the lab config.
+
+    Raises:
+        RepoError:
+            The lab config has no such node (nor, with ``forget``, a retiring one), or its
+            folder has changes no apply committed.
+    """
+    path = f"{nodes_dir.relative_to(repo.root).as_posix()}/{name}"
+    pending = [
+        change.path
+        for change in repo.changes()
+        if change.path == path or change.path.startswith(path + "/")
+    ]
+    tracked = name in defined or name in repo.retiring(defined)
+    if name not in defined and not (forget and tracked):
+        raise RepoError(f"The lab config has no node '{name}'")
+    if pending:
+        raise RepoError(
+            f"{path} has changes no apply has committed ({', '.join(pending)}); apply them, or "
+            "`labctl discard` them, first"
+        )
+    last = repo.last_applied(name) if forget else None
+    if last is not None and last.info is None:
+        last = None
+    return Removable(path, name in defined, last)
+
+
+def delete_node_folder(nodes_dir: Path, name: str) -> None:
+    shutil.rmtree(nodes_dir / name)
+
+
+#############################################################################
+# labctl init
+
+
+@dataclass
+class Initialized:
+    """
+    A lab config set up, or completed.
+
+    Attributes:
+        repo (ConfigRepo):
+            Its repository.
+        steps (list[tuple[bool, str]]):
+            Each part in order: whether it was made (False: already there), and what it is.
+        commit (str):
+            The commit made, or "" when there was nothing to commit.
+        first (bool):
+            Whether that is the repository's first commit.
+        files (list[str]):
+            The first commit: every file in it. Otherwise: the names committed.
+    """
+
+    repo: ConfigRepo
+    steps: list[tuple[bool, str]] = field(default_factory=list)
+    commit: str = ""
+    first: bool = False
+    files: list[str] = field(default_factory=list)
+
+
+def init_lab_config(root: Path) -> Initialized:
+    """
+    Set up a lab config in ``root``, or add what one is missing: the folder, a git repository
+    (branch main), nodes/ and nodes/_shared/, a .gitignore and .gitattributes, and a commit of
+    what was written (the first commit takes every file there). Files already there are kept.
+
+    Raises:
+        RepoError:
+            A name it needs is not a directory, or git failed.
+    """
+    if root.exists() and not root.is_dir():
+        raise RepoError(f"Not a directory: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    repo, created = ConfigRepo.init(root)
+    done = Initialized(repo, [(created, f"git repository {root} (branch main)")])
+
+    written: list[Path] = []
+    for folder in (root / "nodes", root / "nodes" / "_shared"):
+        if folder.exists() and not folder.is_dir():
+            raise RepoError(f"Not a directory: {folder}")
+        new = not folder.exists()
+        if new:
+            folder.mkdir()
+        done.steps.append((new, f"{folder.relative_to(root).as_posix()}/"))
+    shared = root / "nodes" / "_shared"
+    if not any(shared.iterdir()):
+        (shared / ".gitkeep").touch()  # git keeps no empty folders
+        written.append(shared / ".gitkeep")
+    for name, text in ((".gitignore", GITIGNORE), (".gitattributes", GITATTRIBUTES)):
+        path = root / name
+        if not path.exists():
+            path.write_text(text, encoding="utf-8")
+            written.append(path)
+        done.steps.append((path in written, name))
+
+    if not repo.has_commits():
+        done.commit, done.first = repo.commit("labctl init"), True
+        done.files = list(repo.git.list_files())
+    elif written:
+        done.commit = repo.commit("labctl init", written)
+        done.files = [path.name for path in written]
+    return done
+
+
+def connect_origin(repo: ConfigRepo, url: str) -> bool:
+    """Make ``url`` the repository's origin: False when it already is.
+
+    Raises:
+        RepoError:
+            origin is another URL.
+    """
+    current = repo.remote_url(ORIGIN)
+    if current is None:
+        repo.add_remote(ORIGIN, url)
+        return True
+    if current != url:
+        raise RepoError(f"{ORIGIN} is already {current}")
+    return False
+
+
+def create_on_github(repo: ConfigRepo, name: str) -> None:
+    """Create the private GitHub repository ``name`` with gh, as the repository's origin.
+
+    Raises:
+        RepoError:
+            There is an origin already, gh is missing or not logged in, or it failed.
+    """
+    root = repo.root
+    if repo.remote_url(ORIGIN) is not None:
+        raise RepoError(f"{root} already has {ORIGIN}; --github creates it")
+    if shutil.which("gh") is None:
+        raise RepoError(
+            "gh (the GitHub CLI) is not installed; create the repository yourself and use --remote"
+        )
+    if run_gh("auth", "status", cwd=root, quiet=True) != 0:
+        raise RepoError("gh is not logged in (gh auth login)")
+    # gh adds origin; the push follows, with the tags.
+    if run_gh("repo", "create", name, "--private", "--source", ".", "--remote", ORIGIN, cwd=root):
+        raise RepoError(f"gh repo create {name} failed")
+
+
+def run_gh(*args: str, cwd: Path, quiet: bool = False) -> int:
+    output = subprocess.DEVNULL if quiet else None
+    return subprocess.run(["gh", *args], cwd=cwd, stdout=output, stderr=output).returncode

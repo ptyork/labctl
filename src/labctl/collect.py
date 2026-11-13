@@ -81,6 +81,7 @@ from labctl.runtime import (
 )
 from labctl.settings import Secrets, Settings, node_names
 from labctl.state import Dirs, NodeState, Scope, Stack
+from labctl.text import plural
 
 RECORD_VERSION = 2
 # A file listed but not read (not one apply writes): its digest in OnNode.files.
@@ -558,8 +559,8 @@ def _collect_remote(
         count, stacks = len(state.services), len(state.stacks)
         view.source = "first"
         view.detail = (
-            f"never applied; what is there now: {count} services in {home} ({stacks} "
-            f"stack{'' if stacks == 1 else 's'})"
+            f"never applied; what is there now: {count} services in {home} "
+            f"({plural(stacks, 'stack')})"
         )
         return ""
     where = f" at the old DEPLOY_DIR {found.moved_from}" if found.moved_from else ""
@@ -585,7 +586,7 @@ def _behind(repo: ConfigRepo, commit: str, base: str) -> str:
     if not repo.has_commit(commit):
         return ""
     count = repo.count_between(commit, base)
-    return f", {count} commit{'' if count == 1 else 's'} behind" if count else ""
+    return f", {plural(count, 'commit')} behind" if count else ""
 
 
 def _check_commit(
@@ -792,6 +793,12 @@ def drift_changes(applied: Record, on_node: OnNode) -> tuple[str, ...]:
     return tuple(changes)
 
 
+def compose_may_need(name: str, kind: str) -> bool:
+    """A top-level name of DEPLOY_DIR that is downloaded before any stack is resolved: a dot
+    file, a compose file or an env file."""
+    return kind == "file" and (name.startswith(".") or name.endswith((".yml", ".yaml", ".env")))
+
+
 def fetch_stack_files(
     remote: Remote, deploy_dir: str, on_node: OnNode, bundle_names: Sequence[str], folder: Path
 ) -> None:
@@ -803,9 +810,7 @@ def fetch_stack_files(
     first = {
         name
         for name, kind in kinds.items()
-        if name in bundle_names
-        or name in managed
-        or (kind == "file" and (name.startswith(".") or name.endswith((".yml", ".yaml", ".env"))))
+        if name in bundle_names or name in managed or compose_may_need(name, kind)
     }
     first |= {path.split("/", 1)[0] for files in on_node.projects.values() for path in files}
     first &= kinds.keys()

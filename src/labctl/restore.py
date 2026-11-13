@@ -25,7 +25,7 @@ from labctl.layout import ARCHIVE_DIR
 from labctl.planner import Add, Plan, Restore
 from labctl.remote import Remote, RemoteError
 from labctl.state import NodeState, is_volume, under
-from labctl.text import human_size
+from labctl.text import human_size, plural
 
 # $1: APPDATA_DIR. Each sidecar whose entry is still there: entry, size, then the JSON on one line.
 _LIST = f"""\
@@ -269,8 +269,8 @@ def plan_restores(
             )
         if copy is None:
             starting_fresh.append(op.service)
-            notes.append(f"{name}: starts empty ({len(copies)} archived cop"
-                         f"{'y' if len(copies) == 1 else 'ies'} kept)")  # fmt: skip
+            kept = plural(len(copies), "archived copy", "archived copies")
+            notes.append(f"{name}: starts empty ({kept} kept)")
             continue
         chosen.append(f"{op.service}@{copy.stamp}")
         operations.append(

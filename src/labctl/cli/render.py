@@ -45,7 +45,7 @@ from labctl.ports import PortMove
 from labctl.rollout import Applied
 from labctl.runtime import DEFER, Conflict, Port, Runtime, TakeDown
 from labctl.state import NodeState, Scope, Service, is_volume, key_label
-from labctl.text import human_size
+from labctl.text import human_size, plural
 from labctl.validate import Checked
 
 
@@ -174,8 +174,7 @@ def render_checked(checked: Checked) -> None:
     if desired is not None and checked.valid:
         stacks, services = len(desired.configs), len(desired.state.services)
         console.print(
-            f"[green]✓[/] {node}: {stacks} stack{'' if stacks == 1 else 's'}, "
-            f"{services} service{'' if services == 1 else 's'}"
+            f"[green]✓[/] {node}: {plural(stacks, 'stack')}, {plural(services, 'service')}"
         )
 
 
@@ -238,7 +237,7 @@ def render_files(collected: Collected, scope: Scope, verbose: bool) -> int:
             if not entries:
                 continue
             shown = ", ".join(
-                f"{escape(top)} ({len(paths)} file{'s' if len(paths) != 1 else ''})"
+                f"{escape(top)} ({plural(len(paths), 'file')})"
                 if top.endswith("/") and paths
                 else escape(top)
                 for top, paths in entries
@@ -798,10 +797,10 @@ def render_summary(plan: Plan, files_changed: int, reasons: Sequence[str], confl
     parts = [f"{n} {kind}" for kind, n in counts.items() if n] or ["no service changes"]
     real_moves = [move for move in plan.moves if not move.carried]
     if real_moves:
-        parts.insert(0, f"{len(real_moves)} move{'s' if len(real_moves) > 1 else ''}")
+        parts.insert(0, f"{plural(len(real_moves), 'move')}")
     parts.append(f"{len(plan.unchanged)} unchanged")
     if files_changed:
-        parts.append(f"files differ on {files_changed} node{'s' if files_changed > 1 else ''}")
+        parts.append(f"files differ on {plural(files_changed, 'node')}")
     if conflicts:
         parts.append(f"{conflicts} in the way")
     blocked = f" — [bold red]blocked:[/] {'; '.join(reasons)}" if reasons else ""

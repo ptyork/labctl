@@ -14,8 +14,7 @@ from labctl import __version__
 from labctl.click import DebugOptions
 from labctl.console import console
 from labctl.envfile import HOST_IP, preview_env
-from labctl.hostip import local_ip, ssh_address
-from labctl.remote import node_remote
+from labctl.hostip import node_address
 from labctl.repo import ConfigRepo, RepoError
 from labctl.settings import Settings, SettingsError, config_file
 
@@ -62,24 +61,20 @@ def status_cmd(**kwargs: Any) -> None:
         return
     try:
         repo: ConfigRepo | None = ConfigRepo.open(settings.lab_config)
-        head = repo.head() if repo else ""
     except RepoError:
-        repo, head = None, ""
+        repo = None
     node_rows = []
     notes = []
     for node in nodes:
         values = preview_env(settings.nodes_dir, node)
-        if node_remote(node).local:
-            host, ip = "local", local_ip()
-        else:
-            host, ip = ssh_address(node)
+        host, ip = node_address(node)
         node_rows.append(
             [
                 node,
                 escape(host),
                 ip or "[red]does not resolve[/]",
                 *(escape(values[var]) if values.get(var) else _NOT_SET for var in _NODE_VARS),
-                _last_applied(repo, node, head),
+                _last_applied(repo, node),
             ]
         )
         server_ip = values.get("SERVER_IP")
@@ -105,19 +100,16 @@ def status_cmd(**kwargs: Any) -> None:
         console.print(note)
 
 
-def _last_applied(repo: ConfigRepo | None, node: str, head: str) -> str:
+def _last_applied(repo: ConfigRepo | None, node: str) -> str:
     """The node's latest apply: its stamp and commit, and how far the lab config has moved on."""
     if repo is None:
         return "?"
     try:
-        last = repo.last_applied(node)
-        if last is None:
-            return "[yellow]never[/]"
-        # Commits that change nothing in the end (an edit and its undo) are not "behind".
-        changed = bool(head) and bool(repo.changed_paths(last.commit, head))
-        behind = repo.count_between(last.commit, head) if changed else 0
+        last, behind = repo.standing(node)
     except RepoError:
         return "?"
+    if last is None:
+        return "[yellow]never[/]"
     moved = f", [yellow]{behind} behind[/]" if behind else ""
     return f"{last.stamp} {last.commit[:7]}{moved}"
 

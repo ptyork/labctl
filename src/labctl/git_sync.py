@@ -11,6 +11,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from labctl.repo import ConfigRepo, RepoError, TagInfo
+from labctl.text import plural
 
 #############################################################################
 # Before planning
@@ -68,7 +69,7 @@ def catch_up(
         return CaughtUp()
     upstream, ahead, behind = state
     branch, root = repo.branch() or "HEAD", repo.root
-    count = f"{behind} commit{'s' if behind > 1 else ''}"
+    count = f"{plural(behind, 'commit')}"
     if ahead:
         message = (
             f"{branch} has diverged from {upstream} ({ahead} ahead, {behind} behind): no "
@@ -114,7 +115,7 @@ def branch_notices(repo: ConfigRepo, fetched: str | None) -> list[str]:
     if state and state[2]:
         upstream, _, behind = state
         notices.append(
-            f"{repo.branch()} is {behind} commit{'s' if behind > 1 else ''} behind {upstream}: "
+            f"{repo.branch()} is {plural(behind, 'commit')} behind {upstream}: "
             "this plan undoes what was applied from there (--ff fast-forwards first)"
         )
     return notices

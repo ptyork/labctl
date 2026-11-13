@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
 import click
@@ -12,6 +11,7 @@ from labctl.cli.common import confirm_or_yes, load_settings
 from labctl.click import DebugOptions
 from labctl.console import console
 from labctl.repo import ConfigRepo, RepoError
+from labctl.text import plural
 
 
 @click.command(name="discard")
@@ -46,10 +46,8 @@ def discard_cmd(dry_run: bool, yes: bool, **kwargs: Any) -> None:
     if dry_run:
         return
     confirm_or_yes("Discard these changes?", yes, "Not discarded")
-    name = f"labctl discard {datetime.now().strftime('%Y%m%d-%H%M%S')}"
     try:
-        repo.stash(name)
+        name = repo.discard()
     except RepoError as exc:
         raise click.ClickException(str(exc)) from exc
-    n = len(changes)
-    console.print(f"[green]✓[/] discarded {n} change{'' if n == 1 else 's'} (git stash: {name})")
+    console.print(f"[green]✓[/] discarded {plural(len(changes), 'change')} (git stash: {name})")

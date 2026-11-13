@@ -404,13 +404,12 @@ def _move_findings(
                 )
             elif dst is not None and dst.has_data:
                 found.append(
-                    Finding(
-                        Level.INFO if replace_stale else Level.BLOCK,
+                    _stale(
+                        replace_stale,
                         move.node,
                         label,
                         f"{key_label(move.new)} already has data ({describe(dst)}); it will be "
                         f"archived to {archive_path(root, move.new)}-<timestamp> before the copy",
-                        flag="" if replace_stale else "--replace-stale",
                     )
                 )
             continue
@@ -430,13 +429,12 @@ def _move_findings(
             # Archived inside the (post-move) APPDATA_DIR the rename runs in.
             archived = archive_path(move.target.removesuffix("/" + move.new), move.new)
             found.append(
-                Finding(
-                    Level.INFO if replace_stale else Level.BLOCK,
+                _stale(
+                    replace_stale,
                     move.node,
                     label,
                     f"{target} already exists ({describe(dst)}); it will be archived to "
                     f"{archived}-<timestamp> before the move",
-                    flag="" if replace_stale else "--replace-stale",
                 )
             )
         elif dst.has_data:
@@ -597,15 +595,14 @@ def _findings_for(
                         continue
                     seen.add(key)
                     found.append(
-                        Finding(
-                            Level.INFO if replace_stale else Level.BLOCK,
+                        _stale(
+                            replace_stale,
                             target,
                             service,
                             f"{key_label(key)} already exists on the target ({describe(p)}); it "
                             f"will be archived to "
                             f"{archive_path(desired[target].dirs.appdata_dir, key)}-<timestamp> "
                             "before the copy",
-                            flag="" if replace_stale else "--replace-stale",
                         )
                     )
             targets = [
@@ -626,14 +623,13 @@ def _findings_for(
                     )
                 elif p.has_data:
                     found.append(
-                        Finding(
-                            Level.INFO if replace_stale else Level.BLOCK,
+                        _stale(
+                            replace_stale,
                             target,
                             service,
                             f"{path} already exists on the target ({describe(p)}); it will be "
                             f"archived to {_archive_prefix(desired[target], path)}-<timestamp> "
                             "before the copy",
-                            flag="" if replace_stale else "--replace-stale",
                         )
                     )
         case Restore(service, node, entries=entries):
@@ -642,19 +638,30 @@ def _findings_for(
                 p = info(node, data_spec(root, key))
                 if p and p.has_data:
                     found.append(
-                        Finding(
-                            Level.INFO if replace_stale else Level.BLOCK,
+                        _stale(
+                            replace_stale,
                             node,
                             service,
                             f"{key_label(key)} already has data ({describe(p)}); it will be "
                             f"archived to {archive_path(root, key)}-<timestamp> before the "
                             f"restore (or --fresh {service} uses it as it is)",
-                            flag="" if replace_stale else "--replace-stale",
                         )
                     )
         case Remove():
             pass
     return found
+
+
+def _stale(replace_stale: bool, node: str, label: str, message: str) -> Finding:
+    """Data already where a copy, move or restore puts its own: archived first, which
+    --replace-stale has to allow."""
+    return Finding(
+        Level.INFO if replace_stale else Level.BLOCK,
+        node,
+        label,
+        message,
+        flag="" if replace_stale else "--replace-stale",
+    )
 
 
 def describe(p: PathInfo) -> str:

@@ -7,8 +7,8 @@ import pytest
 from click.testing import CliRunner, Result
 from conftest import MakeRepo, git, write_files
 
+from labctl import repo as init_module
 from labctl.cli import cli
-from labctl.cli.commands import init as init_module
 from labctl.repo import ConfigRepo
 from labctl.settings import LAB_CONFIG_ENV, Settings, read_config, write_config
 

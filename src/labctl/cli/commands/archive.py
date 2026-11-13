@@ -29,7 +29,7 @@ from labctl.console import console
 from labctl.node import NodeError
 from labctl.remote import Remote, RemoteError
 from labctl.settings import SettingsError
-from labctl.text import human_size
+from labctl.text import human_size, plural
 
 _FAILURES = (NodeError, ComposeError, RemoteError, SettingsError)
 
@@ -234,7 +234,7 @@ def _delete(archives: Sequence[NodeArchive], doomed: dict[str, frozenset[Entry]]
 
 
 def _count(entries: Collection[Entry]) -> str:
-    return f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'}"
+    return plural(len(entries), "entry", "entries")
 
 
 def _size(entries: Iterable[Entry]) -> str:
@@ -242,7 +242,7 @@ def _size(entries: Iterable[Entry]) -> str:
 
 
 def _nodes(count: int) -> str:
-    return f"{count} node{'' if count == 1 else 's'}"
+    return f"{plural(count, 'node')}"
 
 
 def _finish(failed: Sequence[str]) -> None:

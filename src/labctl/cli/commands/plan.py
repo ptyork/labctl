@@ -36,6 +36,7 @@ from labctl.rollout import roll_out
 from labctl.runtime import STOP
 from labctl.settings import Secrets, SettingsError
 from labctl.state import Scope
+from labctl.text import plural
 
 
 @click.command(name="plan")
@@ -233,7 +234,7 @@ def _answer_conflicts(planned: Planned, terminal: bool) -> tuple[Planned, bool]:
     if not terminal:
         n = len(unresolved)
         raise click.ClickException(
-            f"The plan has {n} conflict{'s' if n > 1 else ''} with what labctl does not manage "
+            f"The plan has {plural(n, 'conflict')} with what labctl does not manage "
             "(listed above): answer in a terminal, or pass --stop-unmanaged or --defer-blocked"
         )
     stop: list[str] = []

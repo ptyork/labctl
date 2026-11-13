@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
-import getpass
-import shutil
-import socket
-from datetime import datetime
 from typing import Any
 
 import click
 from rich.markup import escape
 
-from labctl import __version__
 from labctl.cli.common import confirm_or_yes, load_settings
 from labctl.click import DebugOptions
 from labctl.console import console
-from labctl.repo import ConfigRepo, RepoError, TagInfo
+from labctl.repo import ConfigRepo, RepoError, check_removable, delete_node_folder
 from labctl.settings import SettingsError
 
 
@@ -42,54 +37,22 @@ def remove_cmd(name: str, forget: bool, yes: bool, **kwargs: Any) -> None:
     """
     settings = load_settings()
     try:
-        defined = settings.node_names()
         repo = ConfigRepo.open(settings.lab_config)
-        path = f"{settings.nodes_dir.relative_to(repo.root).as_posix()}/{name}"
-        pending = [
-            change.path
-            for change in repo.changes()
-            if change.path == path or change.path.startswith(path + "/")
-        ]
-        tracked = name in defined or name in repo.retiring(defined)
+        node = check_removable(repo, settings.nodes_dir, settings.node_names(), name, forget)
     except (SettingsError, RepoError) as exc:
         raise click.ClickException(str(exc)) from exc
-    if name not in defined and not (forget and tracked):
-        raise click.ClickException(f"The lab config has no node '{name}'")
-    if pending:
-        raise click.ClickException(
-            f"{path} has changes no apply has committed ({', '.join(pending)}); apply them, or "
-            "`labctl discard` them, first"
+    if node.last is not None and node.last.info is not None:
+        about = (
+            f"labctl stops tracking {escape(name)}. Nothing on it changes: what labctl put there "
+            "stays, unmanaged."
         )
-    if forget:
-        _forget(repo, name, yes)
-    if name in defined:
-        shutil.rmtree(settings.nodes_dir / name)
-        console.print(f"[green]✓[/] removed {escape(path)}")
-
-
-def _forget(repo: ConfigRepo, name: str, yes: bool) -> None:
-    """Tag the node retired on HEAD (its last dirs kept), and push the tag."""
-    last = repo.last_applied(name)
-    if last is None or last.info is None:
-        return  # never applied: there is nothing to forget, only the folder
-    about = (
-        f"labctl stops tracking {escape(name)}. Nothing on it changes: what labctl put there "
-        "stays, unmanaged."
-    )
-    confirm_or_yes(f"Forget {name}?", yes, "Not forgotten", about)
-    now = datetime.now()
-    info = TagInfo(
-        now.isoformat(timespec="seconds"),
-        f"{getpass.getuser()}@{socket.gethostname()}",
-        __version__,
-        (),
-        last.info.dirs,
-        retired=True,
-    )
-    try:
-        tag = repo.tag_applied(name, now.strftime("%Y%m%d-%H%M%S"), repo.head(), info)
-    except RepoError as exc:
-        raise click.ClickException(str(exc)) from exc
-    failed = repo.publish()
-    pushed = "" if failed == "no remote" else (" (not pushed)" if failed else ", pushed")
-    console.print(f"[green]✓[/] forgot {escape(name)}: tagged {escape(tag)}{pushed}")
+        confirm_or_yes(f"Forget {name}?", yes, "Not forgotten", about)
+        try:
+            tag, failed = repo.forget(name, node.last.info.dirs)
+        except RepoError as exc:
+            raise click.ClickException(str(exc)) from exc
+        pushed = "" if failed == "no remote" else (" (not pushed)" if failed else ", pushed")
+        console.print(f"[green]✓[/] forgot {escape(name)}: tagged {escape(tag)}{pushed}")
+    if node.folder:
+        delete_node_folder(settings.nodes_dir, name)
+        console.print(f"[green]✓[/] removed {escape(node.path)}")

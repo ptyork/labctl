@@ -26,6 +26,7 @@ from labctl.remote import node_remote
 from labctl.restore import Ask, Restores, find_archives, plan_restores
 from labctl.runtime import Answers, Runtime, analyse, resolve
 from labctl.state import Dirs, NodeState
+from labctl.text import plural
 
 
 class PlanError(Exception):
@@ -248,7 +249,7 @@ def _assessed(planned: Planned, collected: Collected) -> Planned:
         reasons.append("problems above")
     blocking = sum(finding.level is Level.BLOCK for finding in planned.findings)
     if blocking:
-        reasons.append(f"{blocking} check{'s' if blocking > 1 else ''} failed")
+        reasons.append(f"{plural(blocking, 'check')} failed")
     if planned.runtime.blocked:
         reasons.append("conflicts apply cannot resolve")
     if planned.works is None:
@@ -257,12 +258,12 @@ def _assessed(planned: Planned, collected: Collected) -> Planned:
     confirm = []
     removed = sum(isinstance(op, Remove) for op in plan.operations)
     if removed:
-        confirm.append(f"{removed} service{'s' if removed > 1 else ''} removed")
+        confirm.append(f"{plural(removed, 'service')} removed")
     if planned.findings:
         checks = len(planned.findings)
-        confirm.append(f"{checks} check{'s' if checks > 1 else ''}")
+        confirm.append(f"{plural(checks, 'check')}")
     if plan.notices:
-        confirm.append(f"{len(plan.notices)} notice{'s' if len(plan.notices) > 1 else ''}")
+        confirm.append(f"{plural(len(plan.notices), 'notice')}")
     if shared:
         confirm.append("remote storage newly shared between nodes")
     if any(view.drift for view in collected.nodes.values()):
@@ -277,7 +278,7 @@ def _assessed(planned: Planned, collected: Collected) -> Planned:
         confirm.append(f"{', '.join(retiring)} retired")
     if planned.repo_notices:
         count = len(planned.repo_notices)
-        confirm.append(f"{count} repo notice{'s' if count > 1 else ''}")
+        confirm.append(f"{plural(count, 'repo notice')}")
     return replace(
         planned,
         placeholders=placeholders,

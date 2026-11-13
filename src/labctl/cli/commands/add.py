@@ -32,6 +32,7 @@ from labctl.console import console
 from labctl.remote import Remote, RemoteError
 from labctl.repo import Applied, ConfigRepo, RepoError
 from labctl.settings import Settings, SettingsError
+from labctl.text import plural
 from labctl.validate import check_new_node
 
 
@@ -187,7 +188,7 @@ def _report(name: str, added: Added) -> None:
     if imported is not None and imported.stacks:
         n = len(imported.stacks)
         console.print(
-            f"[green]✓[/] added {escape(str(added.folder))}: {n} stack{'' if n == 1 else 's'} "
+            f"[green]✓[/] added {escape(str(added.folder))}: {plural(n, 'stack')} "
             f"imported ({len(imported.files)} files)"
         )
     else:

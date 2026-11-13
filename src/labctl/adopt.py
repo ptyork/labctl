@@ -36,7 +36,7 @@ from labctl.bundle import (
     stack_candidates,
 )
 from labctl.changes import SECRET_NAME
-from labctl.collect import read_node
+from labctl.collect import compose_may_need, read_node
 from labctl.compose import ComposeError
 from labctl.envfile import SECRET, node_env_file, parse_env, read_sources
 from labctl.layout import HOME_POINTER
@@ -248,11 +248,7 @@ def read_stacks(
             remote.download(deploy_dir, wanted, folder)
             fetched.update(wanted)
 
-    fetch(
-        name
-        for name, kind in kinds.items()
-        if kind == "file" and (name.startswith(".") or name.endswith((".yml", ".yaml", ".env")))
-    )
+    fetch(name for name, kind in kinds.items() if compose_may_need(name, kind))
     skipped: list[str] = []
     # What the top-level compose files refer to, until nothing new is reached.
     pending = [name for name in sorted(fetched) if name.endswith((".yml", ".yaml"))]

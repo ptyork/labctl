@@ -23,6 +23,7 @@ from labctl.click import AliasedGroup, DebugOptions
 from labctl.console import console
 from labctl.repo import Apply, ConfigRepo, RepoError
 from labctl.settings import Settings, SettingsError
+from labctl.text import plural
 
 # How many applies the picker offers.
 PICK = 20
@@ -67,7 +68,7 @@ def show_cmd(ref: str | None, **kwargs: Any) -> None:
     commit, apply = _pick(repo, applies, ref)
     if apply is None:
         console.print(f"[bold]Commit {commit[:7]}[/] (no apply)")
-        _files(repo, f"{commit}^", commit)
+        _files(repo.commit_files(commit))
         return
     info = apply.info
     console.print(f"[bold]Apply {apply.stamp}[/]  commit {apply.commit[:7]}")
@@ -84,13 +85,13 @@ def show_cmd(ref: str | None, **kwargs: Any) -> None:
         else:
             up = ", ".join(applied.info.stacks_up) or "nothing up"
         console.print(f"  {escape(node):<8} {up}", highlight=False)
-    older = next((a for a in applies if a.stamp < apply.stamp), None)
+    older, paths = repo.apply_files(apply, applies)
     if older is None:
-        _files(repo, f"{apply.commit}^", apply.commit)
+        _files(paths)
     elif older.commit == apply.commit:
         console.print("No lab config changes since the apply before it")
     else:
-        _files(repo, older.commit, apply.commit, f"Changed since {older.stamp}")
+        _files(paths, f"Changed since {older.stamp}")
 
 
 @history_cmd.command(name="restore")
@@ -105,27 +106,20 @@ def restore_cmd(ref: str | None, **kwargs: Any) -> None:
     """
     _, repo, applies = _open()
     try:
-        pending = repo.changes()
+        repo.check_nothing_pending()
     except RepoError as exc:
         raise click.ClickException(str(exc)) from exc
-    if pending:
-        raise click.ClickException(
-            "The lab config has changes no apply committed; apply them, or `labctl discard` "
-            "them, first"
-        )
     commit, apply = _pick(repo, applies, ref)
     where = f"{apply.stamp} ({commit[:7]})" if apply else commit[:7]
     try:
-        repo.restore_tree(commit)
-        changed = [change.path for change in repo.changes()]
+        changed = repo.go_back(commit)
     except RepoError as exc:
         raise click.ClickException(str(exc)) from exc
     if not changed:
         console.print(f"The lab config is already as at {where}")
         return
-    n = len(changed)
     console.print(
-        f"[green]✓[/] the lab config is as at {where}: {n} file{'' if n == 1 else 's'} differ "
+        f"[green]✓[/] the lab config is as at {where}: {plural(len(changed), 'file')} differ "
         "from the last commit; nothing applied"
     )
 
@@ -149,13 +143,7 @@ def diff_cmd(args: tuple[str, ...], **kwargs: Any) -> None:
     if unknown:
         raise click.ClickException(f"Unknown node(s): {', '.join(unknown)}")
     commit, _ = _pick(repo, applies, ref)
-    pathspecs: list[str] = []
-    if nodes:
-        folder = settings.nodes_dir.relative_to(repo.root).as_posix()
-        here = {path.name for path in settings.nodes_dir.iterdir() if path.is_dir()}
-        others = (here | set(repo.path_names(commit, folder))) - set(nodes) - {"_shared"}
-        pathspecs = [".", *(f":(exclude){folder}/{other}" for other in sorted(others))]
-    sys.exit(repo.diff(commit, pathspecs))
+    sys.exit(repo.diff(commit, repo.node_pathspecs(commit, settings.nodes_dir, nodes)))
 
 
 #############################################################################
@@ -216,11 +204,7 @@ def _rows(applies: Sequence[Apply]) -> list[str]:
     ]
 
 
-def _files(repo: ConfigRepo, old: str, new: str, title: str = "Files its commit changed") -> None:
-    try:
-        paths = repo.changed_paths(old, new)
-    except RepoError:
-        paths = []  # the first commit: no parent
+def _files(paths: Sequence[str], title: str = "Files its commit changed") -> None:
     if not paths:
         return
     console.print(f"[bold]{title}[/]")

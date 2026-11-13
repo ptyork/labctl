@@ -17,7 +17,7 @@ import subprocess
 from pathlib import Path
 
 from labctl.envfile import EnvError
-from labctl.remote import Remote
+from labctl.remote import Remote, node_remote
 
 # Windows: the IPv4 address of the interface holding the lowest-metric default route.
 _WINDOWS_DEFAULT_ROUTE = (
@@ -39,6 +39,14 @@ def host_ip(remote: Remote) -> str:
             f"variable in nodes/{remote.host}/node.env instead"
         )
     return address
+
+
+def node_address(node: str) -> tuple[str, str]:
+    """(ssh host name, address) the node is reached at ("" when it does not resolve); the node
+    labctl runs on is ``local``, with its own address."""
+    if node_remote(node).local:
+        return "local", local_ip()
+    return ssh_address(node)
 
 
 def ssh_address(node: str) -> tuple[str, str]:
