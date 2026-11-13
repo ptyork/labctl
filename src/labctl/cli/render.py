@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 from craftable import get_table
 from rich.markup import escape
@@ -41,6 +42,7 @@ from labctl.planner import (
 )
 from labctl.planning import Planned, gone
 from labctl.ports import PortMove
+from labctl.rollout import Applied
 from labctl.runtime import DEFER, Conflict, Port, Runtime, TakeDown
 from labctl.state import NodeState, Scope, Service, is_volume, key_label
 from labctl.text import human_size
@@ -493,6 +495,40 @@ def render_port_moves(moves: Sequence[PortMove], heading: str) -> None:
             postprocessors=[lambda value, text, row, col: escape(text)] * 3,
         )
     )
+
+
+def render_applied(applied: Applied, root: Path) -> None:
+    """What became of the commit applied, in one line; what did not work is a warning (it is
+    applied all the same)."""
+    published = applied.published
+    commit = published.commit
+    if not applied.advanced:
+        console.print(
+            f"[yellow]! {applied.branch} moved during the apply: the commit applied, "
+            f"{commit[:7]}, is not on it (its tags name it). Merge it:\n"
+            f"  git -C {root} merge {commit[:12]}[/]"
+        )
+    for node, why in published.untagged:
+        console.print(f"[yellow]![/] {node}: applied, not tagged: {escape(why)}")
+    if published.subject:  # the message was asked for, and the prompt is gone once answered
+        done = f'Committed {commit[:7]} "{escape(published.subject)}"'
+    elif published.committed:
+        done = f"Committed {commit[:7]}"
+    else:
+        done = f"Nothing to commit ({commit[:7]})"
+    if published.tagged:
+        done += ", tagged"
+    if published.push_error:
+        console.print(f"[green]✓[/] {done}")
+        console.print(
+            f"[yellow]![/] Not pushed ({escape(published.push_error)}). The next apply pushes; or "
+            f"catch up and push now:\n  git -C {root} pull --rebase\n"
+            f"  git -C {root} push --follow-tags"
+        )
+    elif published.remote is None:
+        console.print(f"[green]✓[/] {done}; no remote, so it stays in this clone")
+    else:
+        console.print(f"[green]✓[/] {done} and pushed to {published.remote}")
 
 
 def render_gone(collected: Collected) -> None:

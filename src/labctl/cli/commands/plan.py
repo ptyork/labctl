@@ -2,42 +2,39 @@
 
 from __future__ import annotations
 
-import getpass
-import socket
 import sys
-from collections.abc import Callable, Sequence
-from datetime import datetime
-from functools import partial
+from collections.abc import Sequence
 from typing import Any
 
 import click
+from rich.markup import escape
 
-from labctl import __version__
-from labctl.apply import ApplyError, Executor, RollbackFailed
 from labctl.cli import menu
 from labctl.cli.common import load_settings
-from labctl.cli.git_sync import (
-    branch_notices,
-    catch_up,
-    commit_applied,
-    commit_message,
-    publish_applied,
-)
 from labctl.cli.prompts import ask_restore, prompt_value
-from labctl.cli.render import choice_label, describe, render_nodes, render_plan, render_port_moves
+from labctl.cli.render import (
+    choice_label,
+    describe,
+    render_applied,
+    render_nodes,
+    render_plan,
+    render_port_moves,
+)
 from labctl.click import DebugOptions, PlanOptions
 from labctl.collect import Collected, collect
 from labctl.compose import ComposeError
 from labctl.console import console
 from labctl.envfile import EnvError
-from labctl.node import Node, NodeError, lock, unlock
+from labctl.git_sync import branch_notices, catch_up, default_message
+from labctl.node import NodeError
 from labctl.planning import Options, PlanError, Planned, answered, make_planned
 from labctl.progress import Progress
-from labctl.remote import Remote, RemoteError, node_remote
-from labctl.repo import ConfigRepo, RepoError, TagInfo
+from labctl.remote import Remote, RemoteError
+from labctl.repo import ConfigRepo, RepoError
 from labctl.restore import Ask
+from labctl.rollout import roll_out
 from labctl.runtime import STOP
-from labctl.settings import Secrets, Settings, SettingsError
+from labctl.settings import Secrets, SettingsError
 from labctl.state import Scope
 
 
@@ -131,7 +128,12 @@ def _run(
     prompt = prompt_value if sys.stdin.isatty() else None
     try:
         fetched = repo.fetch()
-        catch_up(repo, options, ask=sys.stdin.isatty() and not yes, applying=not dry_run)
+        ask_ff = _ask_fast_forward if sys.stdin.isatty() and not yes else None
+        caught_up = catch_up(repo, options.ff, applying=not dry_run, ask=ask_ff)
+        if caught_up.warning:
+            console.print(f"[yellow]![/] {escape(caught_up.warning)}")
+        if caught_up.forwarded:
+            console.print(f"[green]✓[/] {caught_up.forwarded}")
         notices = branch_notices(repo, fetched)
         # apply pins the working tree as it is now: what it plans, ships, and commits once applied
         tree = None if dry_run else repo.snapshot()
@@ -149,26 +151,61 @@ def _run(
         planned, asked = _answer_conflicts(planned, sys.stdin.isatty())
         if (planned.confirm or asked) and not yes:
             _confirm(planned.confirm)
-        assert planned.options is not None
-        _apply(
+        assert planned.tree is not None
+        default = default_message(repo, planned.base, planned.tree, options.nodes)
+        applied = roll_out(
             settings,
             scope,
             secrets,
-            planned.options,
             planned,
             targets,
             wait,
             repo,
-            partial(
-                commit_message, repo, planned.base, planned.tree, options.nodes, message, not yes
-            ),
+            lambda: _commit_message(default, message, ask=not yes),
+            console.print,
+            Progress(console.print, console),
         )
+        render_applied(applied, repo.root)
         render_port_moves(planned.port_moves, "Published ports that changed")
         return False
     except (ComposeError, EnvError, NodeError, PlanError, RemoteError, RepoError) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
         Remote.close_all(nodes)
+
+
+def _ask_fast_forward(question: str, commits: str) -> bool:
+    """Whether to fast-forward the lab config before planning (Esc: no)."""
+    return bool(menu.confirm(escape(question), default=True, header=escape(commits)))
+
+
+def _commit_message(default: str, given: str | None, ask: bool) -> str:
+    """
+    The message for the commit of what was just applied.
+
+    Args:
+        default (str):
+            The message offered.
+        given (str | None):
+            The message given with ``-m``.
+        ask (bool):
+            Whether it may be asked in a terminal (not with ``--yes``).
+
+    Returns:
+        str:
+            ``-m``, else the answer in a terminal (Esc takes the default: it is applied either
+            way), else the default.
+    """
+    if given:
+        return given
+    if not (ask and sys.stdin.isatty()):
+        return default
+    answer = menu.edit_text(
+        "Enter commit message",
+        default,
+        validators=[lambda v: None if v.strip() else "A message is required"],
+    )
+    return (answer or default).strip()
 
 
 def _answer_conflicts(planned: Planned, terminal: bool) -> tuple[Planned, bool]:
@@ -221,106 +258,6 @@ def _confirm(reasons: Sequence[str]) -> None:
     console.print()
     if not menu.confirm("Apply plan?"):
         raise click.ClickException("Not applied")
-
-
-def _apply(
-    settings: Settings,
-    scope: Scope,
-    secrets: Secrets,
-    options: Options,
-    planned: Planned,
-    targets: list[str],
-    wait: int,
-    repo: ConfigRepo,
-    message: Callable[[], str] = lambda: "labctl apply",
-) -> None:
-    """Lock the nodes, plan again (the nodes and the lab config must not have changed), apply node
-    by node; once everything is up, commit what was applied (``message`` gives the message) and
-    record it; unlock; then move the branch to the commit, tag each node recorded and push the
-    tags."""
-    assert planned.tree is not None  # apply plans a snapshot, never the working tree itself
-    remotes = {node: node_remote(node) for node in targets}
-    by = f"{getpass.getuser()}@{socket.gethostname()}"
-    owner = f"{by} {datetime.now().isoformat(timespec='seconds')}"
-    locked: list[str] = []
-    stuck = False  # the rollback failed: the locks stay
-    executor: Executor | None = None
-    tags: list[tuple[str, TagInfo]] = []
-    try:
-        for node in targets:
-            lock(remotes[node], owner)
-            locked.append(node)
-        head = repo.head()
-        if head != planned.base:
-            raise ApplyError(
-                f"HEAD moved from {planned.base[:7]} to {head[:7]} since the plan; run apply again"
-            )
-        if repo.snapshot() != planned.tree:
-            raise ApplyError("The lab config changed since the plan; run apply again")
-        with collect(settings, scope, secrets, None, repo, planned.tree, locked=True) as again:
-            if again.errors:
-                raise ApplyError(
-                    "Cannot plan again under the lock:\n  " + "\n  ".join(again.errors)
-                )
-            computed = make_planned(again, options)
-            if computed.works is None:
-                raise ApplyError(computed.work_error)
-            if not computed.same_as(planned):
-                raise ApplyError("The homelab changed since it was planned; run apply again")
-            tree, base = planned.tree, planned.base
-            executor = Executor(
-                console.print,
-                wait,
-                options.replace_stale,
-                tree=tree,
-                commit_with=lambda: commit_applied(repo, tree, base, message),
-                progress=Progress(console.print, console),
-            )
-            console.print()
-            try:
-                executor.run(
-                    {node: Node(remote) for node, remote in remotes.items()},
-                    computed.works,
-                    computed.plan,
-                )
-            except RollbackFailed:
-                stuck = True
-                raise
-            except NodeError as exc:  # already shown, with the rollback
-                raise click.ClickException("Not applied: everything was rolled back") from exc
-            when = executor.when.isoformat(timespec="seconds")
-            for work in computed.works:
-                if work.node not in executor.recorded:
-                    continue
-                up = (
-                    computed.runtime.running.get(work.node, frozenset())
-                    if work.record_only
-                    else work.runtime.start
-                )
-                info = TagInfo(
-                    when,
-                    by,
-                    __version__,
-                    tuple(sorted(up)),
-                    work.desired.dirs,
-                    work.desired.env.host_ip,
-                    retired=again.nodes[work.node].retiring,
-                )
-                tags.append((work.node, info))
-    finally:
-        if not stuck:
-            for node in locked:
-                unlock(remotes[node])
-    if executor is not None:
-        advanced = repo.advance(executor.commit, planned.base)
-        if not advanced:
-            console.print(
-                f"[yellow]! {repo.branch() or 'HEAD'} moved during the apply: the commit applied, "
-                f"{executor.commit[:7]}, is not on it (its tags name it). Merge it:\n"
-                f"  git -C {repo.root} merge {executor.commit[:12]}[/]"
-            )
-        committed = executor.commit != planned.base
-        publish_applied(repo, executor.commit, executor.stamp, tags, advanced, committed)
 
 
 def _plan_and_render(

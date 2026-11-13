@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -12,13 +12,14 @@ from click.testing import CliRunner
 from conftest import MakeRepo, git
 
 from labctl import collect as collect_module
-from labctl import planning
+from labctl import git_sync, planning, rollout
 from labctl.apply import ApplyError
 from labctl.bundle import Desired
-from labctl.cli import cli, git_sync
+from labctl.cli import cli, render
 from labctl.cli.commands import plan as plan_module
 from labctl.collect import collect
 from labctl.envfile import CompiledEnv
+from labctl.git_sync import CaughtUp
 from labctl.repo import ConfigRepo, RepoError
 from labctl.settings import LAB_CONFIG_ENV, Secrets, Settings
 from labctl.state import NodeState, Scope, Service
@@ -97,15 +98,15 @@ def test_apply_stops_when_the_lab_config_changed_since_the_plan(
     root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     locks: list[str] = []
-    monkeypatch.setattr(plan_module, "lock", lambda remote, owner: locks.append(remote.host))
-    monkeypatch.setattr(plan_module, "unlock", lambda remote: locks.remove(remote.host))
+    monkeypatch.setattr(rollout, "lock", lambda remote, owner: locks.append(remote.host))
+    monkeypatch.setattr(rollout, "unlock", lambda remote: locks.remove(remote.host))
     repo = ConfigRepo.open(root)
     settings = Settings(lab_config=root, config_dir=tmp_path / "config")
-    options = plan_module.Options((), False, (), False)
+    options = planning.Options((), False, (), False)
 
     def apply(tree: str, base: str) -> None:
-        planned = plan_module.Planned(tree=tree, base=base)
-        plan_module._apply(settings, Scope(), Secrets(), options, planned, ["cirdan"], 5, repo)
+        planned = planning.Planned(tree=tree, base=base, options=options)
+        rollout.roll_out(settings, Scope(), Secrets(), planned, ["cirdan"], 5, repo)
 
     with pytest.raises(ApplyError, match="HEAD moved from 0000000 to"):
         apply(repo.snapshot(), "0" * 40)
@@ -128,12 +129,36 @@ def test_once_applied_the_snapshot_is_committed_and_the_branch_moves(root: Path)
 
     assert git_sync.commit_applied(repo, repo.tree_of(head), head, message) == head  # nothing new
     assert asked == []
-    made = git_sync.commit_applied(repo, tree, head, message)
+    said: list[str] = []
+    made = git_sync.commit_applied(repo, tree, head, message, said.append)
+    assert said == ["All nodes successfully applied. Committing changes."]
     assert repo.head() == head  # a commit, no branch moved yet
     assert repo.advance(made, head)
     assert git(root, "log", "-1", "--format=%s") == "add new.yml"
     assert repo.subjects(f"{made}^!") == ["add new.yml"]  # what the committed line shows
     assert git(root, "status", "--porcelain") == ""  # the index follows; the file is committed
+
+
+def test_what_became_of_the_commit_is_returned_and_worded(
+    root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = ConfigRepo.open(root)
+    head = repo.head()
+    (root / "new.yml").write_text("x\n")
+    made = git_sync.commit_applied(repo, repo.snapshot(), head, lambda: "add new.yml\n\nbody")
+    advanced = repo.advance(made, head)
+
+    published = git_sync.publish_applied(repo, made, "20261112-120000", [], advanced, True)
+    assert published == git_sync.Published(made, committed=True, subject="add new.yml")
+    render.render_applied(rollout.Applied(published, "main"), root)
+    assert f'Committed {made[:7]} "add new.yml"; no remote' in capsys.readouterr().out
+
+    # Nothing changed since: the commit planned on, and the branch moved meanwhile
+    published = git_sync.publish_applied(repo, made, "20261112-120001", [], False, False)
+    assert not published.committed and published.subject == ""
+    render.render_applied(rollout.Applied(published, "main", advanced=False), root)
+    output = capsys.readouterr().out
+    assert "main moved during the apply" in output and f"Nothing to commit ({made[:7]})" in output
 
 
 def test_remote_storage_newly_shared_between_nodes_is_pointed_out() -> None:
@@ -186,12 +211,17 @@ def test_in_a_terminal_the_fast_forward_is_offered(
 ) -> None:
     repo = ConfigRepo.open(behind)
     repo.fetch()
-    options = plan_module.Options((), False, (), False)
-    answers = [False, True]  # plan as it is, then fast-forward first
-    monkeypatch.setattr(git_sync.menu, "confirm", lambda *args, **kwargs: answers.pop(0))
-    git_sync.catch_up(repo, options, ask=True, applying=True)
-    assert git(behind, "log", "-1", "--format=%s") == "first"  # goes on behind, asked first
-    git_sync.catch_up(repo, options, ask=True, applying=True)
+    asked: list[tuple[str, str]] = []
+
+    def answer(reply: bool) -> Callable[[str, str], bool]:
+        return lambda question, commits: asked.append((question, commits)) or reply
+
+    # plan as it is: goes on behind, asked first
+    assert git_sync.catch_up(repo, False, applying=True, ask=answer(False)) == CaughtUp()
+    assert git(behind, "log", "-1", "--format=%s") == "first"
+    assert asked == [("main is 1 commit behind origin/main. Fast-forward first?", "theirs")]
+    done = git_sync.catch_up(repo, False, applying=True, ask=answer(True))
+    assert done.forwarded == "fast-forwarded main to origin/main (1 commit)"
     assert git(behind, "log", "-1", "--format=%s") == "theirs"
 
 
