@@ -89,7 +89,7 @@ def status_cmd(**kwargs: Any) -> None:
                 node_rows,
                 header_row=["Node", "SSH Host", "IP Address", *_NODE_VARS, "Last Applied"],
                 # Name, host, IP and last apply sized to their data; the paths share the rest.
-                col_defs=["", "", "", *["A"] * len(_NODE_VARS), ""],
+                col_defs=["", "", "", *[""] * len(_NODE_VARS), ""],
                 table_width=width,
             ),
             title="Nodes (paths from node.env; missing values are asked for by plan)",
